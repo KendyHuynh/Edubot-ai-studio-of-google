@@ -1,4 +1,42 @@
-import { Lesson, Question } from '../shared/types';
+import {
+  ActivityLog,
+  AnswerSubmission,
+  Lesson,
+  Question,
+} from '../shared/types';
+import { getCompetencyById } from '../shared/competencies';
+
+/**
+ * Default school-wide public workspace ID published by the primary Teacher/Admin
+ * so students opening the root URL (without ?ws=...) always receive real synced data.
+ */
+export const DEFAULT_PUBLIC_WORKSPACE_ID = 'default';
+
+/**
+ * Fallback live teacher workspace ID used only if `publicWorkspaces/default`
+ * has not been published yet (ensures instant zero-login sync for existing deployments).
+ */
+export const LEGACY_FALLBACK_WORKSPACE_ID = 'WS-LHH4MPLJSIV8';
+
+const WORKSPACE_ID_RE = /^[A-Za-z0-9_-]{2,64}$/;
+
+/**
+ * Resolves ordered candidate public workspace IDs to try when hydrating student/tablet data.
+ */
+export function resolveCandidateWorkspaceIds(requestedWs?: string | null): string[] {
+  const candidates: string[] = [];
+  const clean = (requestedWs ?? '').trim();
+  if (clean && WORKSPACE_ID_RE.test(clean)) {
+    candidates.push(clean);
+  }
+  if (!candidates.includes(DEFAULT_PUBLIC_WORKSPACE_ID)) {
+    candidates.push(DEFAULT_PUBLIC_WORKSPACE_ID);
+  }
+  if (!candidates.includes(LEGACY_FALLBACK_WORKSPACE_ID)) {
+    candidates.push(LEGACY_FALLBACK_WORKSPACE_ID);
+  }
+  return candidates;
+}
 
 /**
  * Converts arbitrary IDs (including legacy Vietnamese class codes like "LỚP-8A")
@@ -95,3 +133,169 @@ export function fromFirestoreRestValue(val: FirestoreRestValue | undefined): unk
   return null;
 }
 
+/**
+ * Encodes plain JS values into Firestore REST API v1 typed value objects.
+ */
+export function toFirestoreRestValue(value: unknown): FirestoreRestValue {
+  if (value === null || value === undefined) return { nullValue: null };
+  if (typeof value === 'boolean') return { booleanValue: value };
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return { integerValue: '0' };
+    if (Number.isInteger(value)) return { integerValue: String(value) };
+    return { doubleValue: value };
+  }
+  if (typeof value === 'string') return { stringValue: value };
+  if (Array.isArray(value)) {
+    return {
+      arrayValue: {
+        values: value.map((item) => toFirestoreRestValue(item)),
+      },
+    };
+  }
+  if (typeof value === 'object') {
+    const fields: Record<string, FirestoreRestValue> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== undefined) {
+        fields[k] = toFirestoreRestValue(v);
+      }
+    }
+    return { mapValue: { fields } };
+  }
+  return { stringValue: String(value) };
+}
+
+/**
+ * Builds sanitized Firestore REST fields matching `isValidPublicSubmission` in firestore.rules
+ * (excluding `createdAt`, which is injected server-side via `REQUEST_TIME` updateTransform).
+ */
+export function buildPublicSubmissionRestFields(
+  workspaceId: string,
+  sub: AnswerSubmission,
+): { docId: string; fields: Record<string, FirestoreRestValue> } {
+  const cleanWs = toFirestoreDocId(workspaceId || DEFAULT_PUBLIC_WORKSPACE_ID, 64);
+  const docId = toFirestoreDocId(
+    sub.id || `sub-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    128,
+  );
+  const compId = (sub.competencyId || '1.1').slice(0, 16);
+  const compIds = (
+    Array.isArray(sub.competencyIds) && sub.competencyIds.length > 0
+      ? sub.competencyIds
+      : [compId]
+  )
+    .slice(0, 10)
+    .map((c) => String(c).slice(0, 16));
+
+  const plain: Record<string, unknown> = {
+    id: docId,
+    workspaceId: cleanWs,
+    classId: (sub.classId || 'LOP-8A').slice(0, 64),
+    groupId: (sub.groupId || 'Máy-01 · Nhóm 1').slice(0, 120),
+    tabletNumber: Math.max(1, Math.min(10, Math.round(Number(sub.tabletNumber) || 1))),
+    groupName: (sub.groupName || 'Nhóm 1').slice(0, 80),
+    lessonId: toFirestoreDocId(sub.lessonId || 'lesson', 80),
+    lessonTitle: (sub.lessonTitle || 'Bài học').slice(0, 240),
+    questionId: toFirestoreDocId(sub.questionId || 'q1', 80),
+    competencyId: compId,
+    competencyIds: compIds,
+    userAnswer: (sub.userAnswer ?? '').slice(0, 1000),
+    isCorrect: Boolean(sub.isCorrect),
+    basePoints: Math.max(0, Math.min(1000, Math.round(Number(sub.basePoints) || 0))),
+    speedBonus: Math.max(0, Math.min(1000, Math.round(Number(sub.speedBonus) || 0))),
+    totalPoints: Math.max(0, Math.min(2000, Math.round(Number(sub.totalPoints) || 0))),
+    elapsedMs: Math.max(0, Math.min(3600000, Math.round(Number(sub.elapsedMs) || 0))),
+    submittedAt: (sub.submittedAt || new Date().toISOString()).slice(0, 64),
+    feedbackText: (sub.feedbackText ?? '').slice(0, 500),
+    explanation: (sub.explanation ?? '').slice(0, 1200),
+    syncedFromOffline: Boolean(sub.syncedFromOffline),
+  };
+
+  const fields: Record<string, FirestoreRestValue> = {};
+  for (const [k, v] of Object.entries(plain)) {
+    fields[k] = toFirestoreRestValue(v);
+  }
+  return { docId, fields };
+}
+
+/**
+ * Deduplicates submissions by (classId, groupId, lessonId, questionId), keeping the newest submittedAt.
+ */
+export function mergeLatestSubmissions(
+  existing: AnswerSubmission[],
+  incoming: AnswerSubmission[],
+): AnswerSubmission[] {
+  const map = new Map<string, AnswerSubmission>();
+  const keyOf = (s: AnswerSubmission) =>
+    `${s.classId}::${s.groupId}::${s.lessonId}::${s.questionId}`;
+
+  const insert = (s: AnswerSubmission) => {
+    if (!s || !s.classId || !s.lessonId || !s.questionId) return;
+    const key = keyOf(s);
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, s);
+      return;
+    }
+    const prevTime = new Date(prev.submittedAt || 0).getTime();
+    const nextTime = new Date(s.submittedAt || 0).getTime();
+    if (nextTime >= prevTime) {
+      map.set(key, s);
+    }
+  };
+
+  for (const s of existing) insert(s);
+  for (const s of incoming) insert(s);
+
+  return Array.from(map.values()).sort(
+    (a, b) => new Date(b.submittedAt || 0).getTime() - new Date(a.submittedAt || 0).getTime(),
+  );
+}
+
+/**
+ * Synthesizes activity log entries for cloud-synced student submissions that don't yet have a log row.
+ */
+export function mergeSubmissionActivityLogs(
+  existingLogs: ActivityLog[],
+  submissions: AnswerSubmission[],
+): ActivityLog[] {
+  const byId = new Map<string, ActivityLog>();
+  for (const log of existingLogs) {
+    if (log?.id) byId.set(log.id, log);
+  }
+
+  for (const sub of submissions) {
+    const syntheticId = `log-sub-${toFirestoreDocId(sub.id, 64)}`;
+    const alreadyLogged =
+      byId.has(syntheticId) ||
+      existingLogs.some(
+        (l) =>
+          l.classId === sub.classId &&
+          l.groupId === sub.groupId &&
+          l.timestamp === sub.submittedAt &&
+          l.competencyId === sub.competencyId,
+      );
+    if (!alreadyLogged) {
+      const comp = getCompetencyById(sub.competencyId);
+      byId.set(syntheticId, {
+        id: syntheticId,
+        classId: sub.classId,
+        groupId: sub.groupId,
+        action: sub.syncedFromOffline
+          ? sub.isCorrect
+            ? 'Đồng bộ ngoại tuyến · Đúng'
+            : 'Đồng bộ ngoại tuyến · Chưa đúng'
+          : sub.isCorrect
+            ? 'Trả lời đúng'
+            : 'Trả lời chưa đúng',
+        detail: `Năng lực ${comp.id} (${comp.nameVi}) · ${(sub.elapsedMs / 1000).toFixed(1)}s`,
+        competencyId: sub.competencyId,
+        pointsDelta: sub.totalPoints,
+        timestamp: sub.submittedAt,
+      });
+    }
+  }
+
+  return Array.from(byId.values())
+    .sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
+    .slice(0, 200);
+}

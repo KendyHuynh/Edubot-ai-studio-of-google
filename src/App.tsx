@@ -115,7 +115,7 @@ export default function App() {
     }
     return window.localStorage.getItem(WORKSPACE_CODE_KEY);
   });
-  const [honorClassId, setHonorClassId] = useState<string>('LOP-5A');
+  const [honorClassId, setHonorClassId] = useState<string>('');
   const [selectedLessonId, setSelectedLessonId] = useState<string | null>(null);
 
   const [browserOnline, setBrowserOnline] = useState<boolean>(
@@ -143,74 +143,89 @@ export default function App() {
 
   const activeClassId =
     activeTab === 'honor'
-      ? honorClassId
-      : session?.classId || entryParams.classId || classes[0]?.id || 'LOP-5A';
+      ? honorClassId || classes[0]?.id || ''
+      : session?.classId || entryParams.classId || classes[0]?.id || '';
 
-  const fetchBootstrap = useCallback(async () => {
-    if (isOfflineEffective) return;
-    try {
-      const roleParam =
-        portal === 'teacher' && teacherUnlocked ? 'teacher' : 'student';
-      const wsQuery = workspaceCode
-        ? `&ws=${encodeURIComponent(workspaceCode)}`
-        : '';
-      const url = `/api/bootstrap?classId=${encodeURIComponent(
-        activeClassId,
-      )}&lang=${lang}&role=${roleParam}${wsQuery}`;
-      const res = await apiRequestJson<BootstrapResponse>(url, {}, lang);
-      if (!res.ok) return;
-      const data = res.data;
+  const fetchBootstrap = useCallback(
+    async (forceRefresh = false) => {
+      if (isOfflineEffective) return;
+      try {
+        const roleParam =
+          portal === 'teacher' && teacherUnlocked ? 'teacher' : 'student';
+        const wsQuery = workspaceCode
+          ? `&ws=${encodeURIComponent(workspaceCode)}`
+          : '';
+        const refreshQuery = forceRefresh ? '&refresh=1' : '';
+        const url = `/api/bootstrap?classId=${encodeURIComponent(
+          activeClassId,
+        )}&lang=${lang}&role=${roleParam}${wsQuery}${refreshQuery}`;
+        const res = await apiRequestJson<BootstrapResponse>(url, {}, lang);
+        if (!res.ok) return;
+        const data = res.data;
 
-      setClasses(data.classes);
-      setLessons(data.lessons);
-      cacheLessonsOffline(data.lessons);
-      setLeaderboard(data.leaderboard);
-      setDomainChampions(data.domainChampions ?? []);
-      setCompetencyMatrix(data.competencyMatrix);
-      setNotifications(data.notifications);
-      setActivityLogs(data.activityLogs);
-      if (data.sharedAppUrl) {
-        setSharedAppUrl(data.sharedAppUrl);
-      }
-      if (data.submissions) {
-        setSubmissions(data.submissions);
-      }
+        setClasses(data.classes);
+        if (data.classes.length > 0) {
+          setHonorClassId((prev) =>
+            prev && data.classes.some((c) => c.id === prev) ? prev : data.classes[0].id,
+          );
+        }
+        setLessons(data.lessons);
+        cacheLessonsOffline(data.lessons);
+        setLeaderboard(data.leaderboard);
+        setDomainChampions(data.domainChampions ?? []);
+        setCompetencyMatrix(data.competencyMatrix);
+        setNotifications(data.notifications);
+        setActivityLogs(data.activityLogs);
+        if (data.sharedAppUrl) {
+          setSharedAppUrl(data.sharedAppUrl);
+        }
+        if (data.submissions) {
+          setSubmissions(data.submissions);
+        }
 
-      if (
-        session &&
-        browserPermission === 'granted' &&
-        typeof window !== 'undefined' &&
-        'Notification' in window
-      ) {
-        for (const n of data.notifications) {
-          if (
-            n.classId === session.classId &&
-            !n.readByGroupIds.includes(session.groupId) &&
-            !seenNotifIds.has(n.id)
-          ) {
-            new Notification(n.title, { body: n.message });
-            setSeenNotifIds((prev) => new Set(prev).add(n.id));
+        if (
+          session &&
+          browserPermission === 'granted' &&
+          typeof window !== 'undefined' &&
+          'Notification' in window
+        ) {
+          for (const n of data.notifications) {
+            if (
+              n.classId === session.classId &&
+              !n.readByGroupIds.includes(session.groupId) &&
+              !seenNotifIds.has(n.id)
+            ) {
+              new Notification(n.title, { body: n.message });
+              setSeenNotifIds((prev) => new Set(prev).add(n.id));
+            }
           }
         }
+      } catch {
+        // Keep cached lessons intact when network flickers
       }
-    } catch {
-      // Keep cached lessons intact when network flickers
-    }
-  }, [
-    activeClassId,
-    browserPermission,
-    isOfflineEffective,
-    lang,
-    portal,
-    seenNotifIds,
-    session,
-    teacherUnlocked,
-    workspaceCode,
-  ]);
+    },
+    [
+      activeClassId,
+      browserPermission,
+      isOfflineEffective,
+      lang,
+      portal,
+      seenNotifIds,
+      session,
+      teacherUnlocked,
+      workspaceCode,
+    ],
+  );
 
   useEffect(() => {
-    fetchBootstrap();
+    fetchBootstrap(false);
   }, [fetchBootstrap]);
+
+  useEffect(() => {
+    if (activeTab === 'honor' || activeTab === 'teacher') {
+      fetchBootstrap(true);
+    }
+  }, [activeTab, fetchBootstrap]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -539,12 +554,12 @@ export default function App() {
               notifications={notifications}
               sharedAppUrl={sharedAppUrl}
               selectedClassId={activeClassId}
-              onRefreshData={fetchBootstrap}
+              onRefreshData={() => fetchBootstrap(true)}
               onLockTeacherPortal={handleLockTeacherPortal}
               onSelectLessonForPlay={(lid) => {
                 if (!session) {
                   setSession({
-                    classId: classes[0]?.id || 'LOP-5A',
+                    classId: classes[0]?.id || 'LOP-8A',
                     tabletNumber: 1,
                     groupName: 'Sao Xanh',
                     groupId: 'Máy-01 · Sao Xanh',
@@ -589,7 +604,7 @@ export default function App() {
                 }}
                 isOfflineEffective={isOfflineEffective}
                 onOnlineSubmission={() => {
-                  fetchBootstrap();
+                  fetchBootstrap(true);
                 }}
                 onQueueOffline={handleQueueOffline}
                 copy={copy}

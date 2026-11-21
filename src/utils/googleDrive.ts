@@ -2,7 +2,9 @@ import { getApp, getApps, initializeApp } from 'firebase/app';
 import {
   GoogleAuthProvider,
   User,
+  browserPopupRedirectResolver,
   getAuth,
+  getRedirectResult,
   onAuthStateChanged,
   signInWithPopup,
 } from 'firebase/auth';
@@ -20,18 +22,50 @@ import { readJsonSafe } from './safeJson';
 export const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 
-const firestoreProvider = new GoogleAuthProvider();
-firestoreProvider.setCustomParameters({ prompt: 'select_account' });
-
-const provider = new GoogleAuthProvider();
-for (const scope of SCOPES) {
-  provider.addScope(scope);
+function createFirebaseAuthProvider(): GoogleAuthProvider {
+  const p = new GoogleAuthProvider();
+  p.setCustomParameters({ prompt: 'select_account' });
+  return p;
 }
-provider.setCustomParameters({ prompt: 'select_account' });
+
+function createDriveAuthProvider(): GoogleAuthProvider {
+  const p = new GoogleAuthProvider();
+  for (const scope of SCOPES) {
+    p.addScope(scope);
+  }
+  p.setCustomParameters({ prompt: 'select_account' });
+  return p;
+}
 
 let isSigningIn = false;
+let inFlightFirebaseSignIn: Promise<{ user: User }> | null = null;
+let inFlightDriveSignIn: Promise<{ user: User; accessToken: string }> | null = null;
 // Keep OAuth access token strictly in memory (never localStorage/sessionStorage).
 let cachedAccessToken: string | null = null;
+
+/**
+ * Waits for Firebase Auth persistence to hydrate and resolves any pending redirect result.
+ */
+export async function waitForAuthReady(): Promise<User | null> {
+  try {
+    await auth.authStateReady();
+  } catch {
+    // Non-fatal if persistence is restricted in a sandboxed iframe
+  }
+  try {
+    const redirectResult = await getRedirectResult(auth, browserPopupRedirectResolver);
+    if (redirectResult?.user) {
+      const credential = GoogleAuthProvider.credentialFromResult(redirectResult);
+      if (credential?.accessToken) {
+        cachedAccessToken = credential.accessToken;
+      }
+      return redirectResult.user;
+    }
+  } catch {
+    // Ignore unrelated redirect errors during passive mount check
+  }
+  return auth.currentUser;
+}
 
 export function initAuth(
   onAuthSuccess?: (user: User, token: string) => void,
@@ -53,39 +87,53 @@ export function initAuth(
 }
 
 /**
- * Lightweight Google Sign-In for Firebase Firestore cloud storage (no Drive scopes).
+ * Lightweight Google Sign-In for Firebase Auth & Cloud Firestore (no Drive scopes).
+ * Must be invoked directly from a user click handler so browsers keep the popup open.
  */
 export async function firebaseGoogleSignIn(): Promise<{ user: User } | null> {
-  if (isSigningIn) return null;
-  try {
-    isSigningIn = true;
-    const result = await signInWithPopup(auth, firestoreProvider);
-    return { user: result.user };
-  } finally {
-    isSigningIn = false;
+  if (inFlightFirebaseSignIn) {
+    return inFlightFirebaseSignIn;
   }
+  isSigningIn = true;
+  const authProvider = createFirebaseAuthProvider();
+  const promise = signInWithPopup(auth, authProvider, browserPopupRedirectResolver)
+    .then((result) => ({ user: result.user }))
+    .finally(() => {
+      isSigningIn = false;
+      inFlightFirebaseSignIn = null;
+    });
+  inFlightFirebaseSignIn = promise;
+  return promise;
 }
 
 /**
  * Full Google Sign-In requesting Google Drive OAuth scopes.
+ * Must be invoked directly from a user click handler so browsers keep the popup open.
  */
 export async function googleSignIn(): Promise<{
   user: User;
   accessToken: string;
 } | null> {
-  if (isSigningIn) return null;
-  try {
-    isSigningIn = true;
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    if (!credential?.accessToken) {
-      throw new Error('Không nhận được mã truy cập Google Drive từ phiên đăng nhập.');
-    }
-    cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
-  } finally {
-    isSigningIn = false;
+  if (inFlightDriveSignIn) {
+    return inFlightDriveSignIn;
   }
+  isSigningIn = true;
+  const driveProvider = createDriveAuthProvider();
+  const promise = signInWithPopup(auth, driveProvider, browserPopupRedirectResolver)
+    .then((result) => {
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      if (!credential?.accessToken) {
+        throw new Error('Không nhận được mã truy cập Google Drive từ phiên đăng nhập.');
+      }
+      cachedAccessToken = credential.accessToken;
+      return { user: result.user, accessToken: cachedAccessToken };
+    })
+    .finally(() => {
+      isSigningIn = false;
+      inFlightDriveSignIn = null;
+    });
+  inFlightDriveSignIn = promise;
+  return promise;
 }
 
 export async function getAccessToken(): Promise<string | null> {

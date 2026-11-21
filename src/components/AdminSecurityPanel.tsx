@@ -289,8 +289,8 @@ export function AdminSecurityPanel({ lang }: AdminSecurityPanelProps) {
             </p>
             <p className="text-xs text-slate-600 leading-relaxed">
               {lang === 'vi'
-                ? 'Khi BẬT chế độ này, ô nhập mã PIN sẽ bị tắt hoàn toàn. Dù học sinh biết đường dẫn /teacher hay /?role=teacher cũng KHÔNG thể nhập PIN — chỉ email Admin Google bên dưới mới vào được.'
-                : 'When enabled, the PIN login form is completely disabled. Only authorized Admin Google emails below can access the Teacher Portal.'}
+                ? 'Khi BẬT chế độ này, ô nhập mã PIN sẽ bị tắt hoàn toàn. Dù học sinh biết đường dẫn /teacher hay /?role=teacher cũng KHÔNG thể nhập PIN — chỉ email Admin Google bên dưới mới vào được. (Lưu ý: đảm bảo tên miền web đã được thêm vào Firebase Authentication → Settings → Authorized domains).'
+                : 'When enabled, the PIN login form is completely disabled. Only authorized Admin Google emails below can access the Teacher Portal. (Ensure your hosting domain is added in Firebase Authentication → Settings → Authorized domains).'}
             </p>
           </div>
           <button

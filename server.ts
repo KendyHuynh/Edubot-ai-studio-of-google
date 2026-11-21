@@ -4,9 +4,16 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import {
-  FirestoreRestValue,
-  fromFirestoreRestValue,
+  DEFAULT_PUBLIC_WORKSPACE_ID,
+  LEGACY_FALLBACK_WORKSPACE_ID,
+  mergeLatestSubmissions,
+  mergeSubmissionActivityLogs,
 } from './src/utils/firestoreHelpers';
+import {
+  fetchPublicSubmissionsViaRest,
+  fetchPublicWorkspaceSnapshot,
+  writePublicSubmissionViaRest,
+} from './src/utils/publicFirestoreRest';
 import { getCompetencyById } from './src/shared/competencies';
 import {
   buildCompetencyMatrix,
@@ -63,7 +70,11 @@ function normalizeClassCode(raw: string): string {
 
 function readFirebaseConfig(): {
   projectId?: string;
+  appId?: string;
+  authDomain?: string;
   firestoreDatabaseId?: string;
+  storageBucket?: string;
+  messagingSenderId?: string;
   apiKey?: string;
 } {
   try {
@@ -75,76 +86,93 @@ function readFirebaseConfig(): {
   }
 }
 
-const hydratedWorkspaceCache = new Map<string, number>();
+function resolveAppletUrls(): { devAppUrl: string; sharedAppUrl: string } {
+  const rawAppUrl = (process.env.APP_URL || '').trim().replace(/\/+$/, '');
+  const sharedAppUrl = rawAppUrl.includes('ais-dev-')
+    ? rawAppUrl.replace('ais-dev-', 'ais-pre-')
+    : rawAppUrl;
+  return { devAppUrl: rawAppUrl, sharedAppUrl };
+}
 
-async function hydrateFromPublicWorkspace(workspaceCode: string): Promise<void> {
-  const cleanCode = workspaceCode.trim();
-  if (!/^[A-Za-z0-9_-]{2,64}$/.test(cleanCode)) return;
-  const lastFetched = hydratedWorkspaceCache.get(cleanCode) ?? 0;
-  if (Date.now() - lastFetched < 30_000) return;
+const hydratedWorkspaceCache = new Map<string, number>();
+let activePublicWorkspaceId: string = DEFAULT_PUBLIC_WORKSPACE_ID;
+
+async function hydrateFromPublicWorkspace(
+  workspaceCode: string,
+  options: { replaceContent: boolean; forceRefresh?: boolean } = { replaceContent: true },
+): Promise<string> {
+  const cacheKey = `${workspaceCode.trim() || '__default__'}::${options.replaceContent ? 'full' : 'subs'}`;
+  const lastFetched = hydratedWorkspaceCache.get(cacheKey) ?? 0;
+  if (!options.forceRefresh && Date.now() - lastFetched < 5_000) {
+    return activePublicWorkspaceId;
+  }
 
   const cfg = readFirebaseConfig();
-  if (!cfg.projectId || !cfg.firestoreDatabaseId || !cfg.apiKey) return;
+  if (!cfg.projectId || !cfg.firestoreDatabaseId || !cfg.apiKey) {
+    return activePublicWorkspaceId;
+  }
 
   try {
-    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
-      cfg.projectId,
-    )}/databases/${encodeURIComponent(
-      cfg.firestoreDatabaseId,
-    )}/documents/publicWorkspaces/${encodeURIComponent(
-      cleanCode,
-    )}?key=${encodeURIComponent(cfg.apiKey)}`;
-
-    const res = await fetch(url);
-    if (!res.ok) return;
-    const doc = (await res.json()) as {
-      fields?: Record<string, FirestoreRestValue>;
-    };
-    if (!doc.fields) return;
-
-    const decoded = fromFirestoreRestValue({
-      mapValue: { fields: doc.fields },
-    }) as {
-      classes?: ClassRoom[];
-      lessons?: Lesson[];
-    };
+    const snapshot = await fetchPublicWorkspaceSnapshot(cfg, workspaceCode || null);
+    const resolvedWsId = snapshot?.workspaceId || workspaceCode.trim() || activePublicWorkspaceId;
+    if (snapshot) {
+      activePublicWorkspaceId = snapshot.workspaceId;
+    }
 
     const store = loadStore();
     let changed = false;
 
-    if (Array.isArray(decoded.classes) && decoded.classes.length > 0) {
-      const classMap = new Map(store.classes.map((c) => [c.id, c]));
-      for (const cls of decoded.classes) {
-        if (cls?.id && cls?.name) {
-          classMap.set(cls.id, cls);
-          changed = true;
-        }
+    if (snapshot && options.replaceContent) {
+      if (snapshot.classes.length > 0) {
+        store.classes = snapshot.classes;
+        changed = true;
       }
-      store.classes = Array.from(classMap.values());
+      if (snapshot.lessons.length > 0) {
+        store.lessons = snapshot.lessons;
+        changed = true;
+      }
+      if (snapshot.notifications && snapshot.notifications.length > 0) {
+        const readMap = new Map(
+          store.notifications.map((n) => [n.id, new Set(n.readByGroupIds ?? [])]),
+        );
+        store.notifications = snapshot.notifications.map((n) => {
+          const existingRead = readMap.get(n.id);
+          const mergedRead = Array.from(
+            new Set([...(n.readByGroupIds ?? []), ...(existingRead ? Array.from(existingRead) : [])]),
+          );
+          return { ...n, readByGroupIds: mergedRead };
+        });
+        changed = true;
+      }
     }
 
-    if (Array.isArray(decoded.lessons) && decoded.lessons.length > 0) {
-      const lessonMap = new Map(store.lessons.map((l) => [l.id, l]));
-      for (const lesson of decoded.lessons) {
-        if (
-          lesson?.id &&
-          lesson?.title &&
-          Array.isArray(lesson.questions) &&
-          lesson.questions.length > 0
-        ) {
-          lessonMap.set(lesson.id, lesson);
-          changed = true;
-        }
-      }
-      store.lessons = Array.from(lessonMap.values());
+    const subSources = Array.from(
+      new Set(
+        resolvedWsId === DEFAULT_PUBLIC_WORKSPACE_ID
+          ? [DEFAULT_PUBLIC_WORKSPACE_ID, LEGACY_FALLBACK_WORKSPACE_ID]
+          : [resolvedWsId],
+      ),
+    );
+    const cloudSubs: AnswerSubmission[] = [];
+    for (const wsId of subSources) {
+      const rows = await fetchPublicSubmissionsViaRest(cfg, wsId);
+      if (rows.length > 0) cloudSubs.push(...rows);
+    }
+
+    if (cloudSubs.length > 0) {
+      store.submissions = mergeLatestSubmissions(store.submissions, cloudSubs);
+      store.activityLogs = mergeSubmissionActivityLogs(store.activityLogs, store.submissions);
+      changed = true;
     }
 
     if (changed) {
       saveStore(store);
     }
-    hydratedWorkspaceCache.set(cleanCode, Date.now());
+    hydratedWorkspaceCache.set(cacheKey, Date.now());
+    return resolvedWsId;
   } catch {
     // Non-fatal: continue with current server store
+    return activePublicWorkspaceId;
   }
 }
 
@@ -154,8 +182,95 @@ async function startServer() {
 
   app.use(express.json({ limit: '25mb' }));
 
+  // Preserve window.opener communication across Google OAuth / Firebase signInWithPopup flows
+  app.use((_req, res, next) => {
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    next();
+  });
+
+  // Serve Firebase Web App init JSON so auth handler / SDK lookups on this origin never 404 with HTML
+  app.get('/__/firebase/init.json', (_req, res) => {
+    const cfg = readFirebaseConfig();
+    if (!cfg.apiKey || !cfg.projectId) {
+      res.status(404).json({ error: 'Firebase configuration not found.' });
+      return;
+    }
+    res.json({
+      apiKey: cfg.apiKey,
+      authDomain: cfg.authDomain,
+      projectId: cfg.projectId,
+      storageBucket: cfg.storageBucket,
+      messagingSenderId: cfg.messagingSenderId,
+      appId: cfg.appId,
+    });
+  });
+
+  // Reverse-proxy Firebase Auth callback routes (/__/auth/handler, /__/auth/iframe, etc.)
+  // so callbacks hitting any applet domain (ais-dev, ais-pre, ais-mob) resolve properly instead of SPA HTML
+  app.all('/__/auth/*', async (req, res) => {
+    const cfg = readFirebaseConfig();
+    const authDomain = (cfg.authDomain || '').trim();
+    if (!authDomain || !/^[a-z0-9.-]+$/i.test(authDomain)) {
+      res.status(503).send('Firebase authDomain is not configured.');
+      return;
+    }
+    try {
+      const upstreamUrl = `https://${authDomain}${req.originalUrl}`;
+      const upstreamHeaders: Record<string, string> = {};
+      if (typeof req.headers['content-type'] === 'string') {
+        upstreamHeaders['content-type'] = req.headers['content-type'];
+      }
+      if (typeof req.headers.accept === 'string') {
+        upstreamHeaders.accept = req.headers.accept;
+      }
+
+      const upstreamRes = await fetch(upstreamUrl, {
+        method: req.method,
+        headers: upstreamHeaders,
+        body:
+          req.method !== 'GET' && req.method !== 'HEAD' && req.body
+            ? typeof req.body === 'string'
+              ? req.body
+              : JSON.stringify(req.body)
+            : undefined,
+        redirect: 'manual',
+      });
+
+      const contentType = upstreamRes.headers.get('content-type');
+      const location = upstreamRes.headers.get('location');
+      if (contentType) res.setHeader('Content-Type', contentType);
+      if (location) res.setHeader('Location', location);
+      res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+      res.status(upstreamRes.status);
+      const buffer = Buffer.from(await upstreamRes.arrayBuffer());
+      res.send(buffer);
+    } catch {
+      res.status(502).send('Failed to proxy Firebase Auth handler.');
+    }
+  });
+
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'EduBot Digital Citizen' });
+  });
+
+  app.get('/api/auth/domains', (_req, res) => {
+    const cfg = readFirebaseConfig();
+    const { devAppUrl, sharedAppUrl } = resolveAppletUrls();
+    const callbackUrls = [
+      cfg.authDomain ? `https://${cfg.authDomain}/__/auth/handler` : null,
+      devAppUrl ? `${devAppUrl}/__/auth/handler` : null,
+      sharedAppUrl && sharedAppUrl !== devAppUrl
+        ? `${sharedAppUrl}/__/auth/handler`
+        : null,
+    ].filter((u): u is string => Boolean(u));
+
+    res.json({
+      projectId: cfg.projectId || '',
+      authDomain: cfg.authDomain || '',
+      devAppUrl,
+      sharedAppUrl,
+      callbackUrls,
+    });
   });
 
   function getAuthenticatedTeacher(req: express.Request): AdminTokenPayload | null {
@@ -188,6 +303,8 @@ async function startServer() {
     const authPayload = getAuthenticatedTeacher(req);
     const pinConfigured = Boolean(envPin) || Boolean(security.pinHash);
 
+    const { devAppUrl, sharedAppUrl } = resolveAppletUrls();
+
     res.json({
       pinConfigured,
       pinLockedByEnv: Boolean(envPin),
@@ -198,6 +315,8 @@ async function startServer() {
       isAuthenticated: Boolean(authPayload),
       authMethod: authPayload?.method ?? null,
       adminEmail: authPayload?.email ?? null,
+      devAppUrl,
+      sharedAppUrl,
     });
   });
 
@@ -414,18 +533,21 @@ async function startServer() {
     });
   });
 
-  // Bootstrap state for a class & role (also hydrates server store if ?ws= share code is passed)
+  // Bootstrap state for a class & role (automatically hydrates teacher's published Firestore workspace + live student submissions)
   app.get('/api/bootstrap', async (req, res) => {
     const ws = typeof req.query.ws === 'string' ? req.query.ws : '';
-    if (ws) {
-      await hydrateFromPublicWorkspace(ws);
-    }
+    const forceRefresh = req.query.refresh === '1';
+    const teacherAuth = getAuthenticatedTeacher(req);
+    const includeAnswers = req.query.role === 'teacher' && Boolean(teacherAuth);
+
+    const resolvedWsId = await hydrateFromPublicWorkspace(ws, {
+      replaceContent: !includeAnswers,
+      forceRefresh,
+    });
 
     const store = loadStore();
     const classId = typeof req.query.classId === 'string' ? req.query.classId : '';
     const lang = (req.query.lang === 'en' ? 'en' : 'vi') as Language;
-    const teacherAuth = getAuthenticatedTeacher(req);
-    const includeAnswers = req.query.role === 'teacher' && Boolean(teacherAuth);
 
     const sanitizedLessons = store.lessons.map((lesson) => ({
       ...lesson,
@@ -434,7 +556,10 @@ async function startServer() {
       ),
     }));
 
-    const targetClassId = classId || store.classes[0]?.id || 'LOP-5A';
+    const targetClassId =
+      classId && store.classes.some((c) => c.id === classId)
+        ? classId
+        : store.classes[0]?.id || 'LOP-8A';
     const leaderboard = buildLeaderboard(targetClassId, store.submissions, lang);
     const domainChampions = buildDomainChampions(targetClassId, store.submissions, lang);
     const competencyMatrix = buildCompetencyMatrix(
@@ -465,6 +590,7 @@ async function startServer() {
       notifications,
       activityLogs,
       submissionsCount: store.submissions.length,
+      activeWorkspaceId: resolvedWsId,
       sharedAppUrl,
       ...(includeAnswers ? { submissions: store.submissions } : {}),
     });
@@ -808,7 +934,7 @@ async function startServer() {
     res.json({ lesson });
   });
 
-  // Merge cloud Firestore state into local server store for 10 shared student tablets
+  // Hydrate cloud Firestore state into local server store (replaces seed classes/lessons with authoritative cloud data)
   app.post('/api/sync/cloud-hydrate', requireTeacherAuth, (req, res) => {
     const payload = req.body as {
       classes?: ClassRoom[];
@@ -821,33 +947,23 @@ async function startServer() {
     const store = loadStore();
 
     if (Array.isArray(payload.classes) && payload.classes.length > 0) {
-      const classMap = new Map(store.classes.map((c) => [c.id, c]));
-      for (const cls of payload.classes) {
-        if (cls?.id && cls?.name) {
-          classMap.set(cls.id, cls);
-        }
+      const validClasses = payload.classes.filter((c) => Boolean(c?.id && c?.name));
+      if (validClasses.length > 0) {
+        store.classes = validClasses;
       }
-      store.classes = Array.from(classMap.values());
     }
 
     if (Array.isArray(payload.lessons) && payload.lessons.length > 0) {
-      const lessonMap = new Map(store.lessons.map((l) => [l.id, l]));
-      for (const lesson of payload.lessons) {
-        if (lesson?.id && lesson?.title && Array.isArray(lesson.questions) && lesson.questions.length > 0) {
-          lessonMap.set(lesson.id, lesson);
-        }
+      const validLessons = payload.lessons.filter(
+        (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
+      );
+      if (validLessons.length > 0) {
+        store.lessons = validLessons;
       }
-      store.lessons = Array.from(lessonMap.values());
     }
 
     if (Array.isArray(payload.submissions) && payload.submissions.length > 0) {
-      const subMap = new Map(store.submissions.map((s) => [s.id, s]));
-      for (const sub of payload.submissions) {
-        if (sub?.id) {
-          subMap.set(sub.id, sub);
-        }
-      }
-      store.submissions = Array.from(subMap.values());
+      store.submissions = mergeLatestSubmissions(store.submissions, payload.submissions);
     }
 
     if (Array.isArray(payload.notifications) && payload.notifications.length > 0) {
@@ -867,9 +983,12 @@ async function startServer() {
           logMap.set(log.id, log);
         }
       }
-      store.activityLogs = Array.from(logMap.values())
-        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-        .slice(0, 200);
+      store.activityLogs = mergeSubmissionActivityLogs(
+        Array.from(logMap.values()),
+        store.submissions,
+      );
+    } else if (store.submissions.length > 0) {
+      store.activityLogs = mergeSubmissionActivityLogs(store.activityLogs, store.submissions);
     }
 
     saveStore(store);
@@ -1081,6 +1200,13 @@ async function startServer() {
       return;
     }
 
+    // Mirror graded submission to Firestore publicSubmissions so GitHub Pages / other devices & teacher see it live
+    const cfg = readFirebaseConfig();
+    const written = await writePublicSubmissionViaRest(cfg, activePublicWorkspaceId, submission);
+    if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
+      await writePublicSubmissionViaRest(cfg, LEGACY_FALLBACK_WORKSPACE_ID, submission);
+    }
+
     const store = loadStore();
     const leaderboard = buildLeaderboard(
       body.classId,
@@ -1098,6 +1224,7 @@ async function startServer() {
       lang?: Language;
     };
 
+    const cfg = readFirebaseConfig();
     const synced: AnswerSubmission[] = [];
     for (const item of items ?? []) {
       const result = await gradeSubmissionItem(
@@ -1107,11 +1234,15 @@ async function startServer() {
       );
       if (result) {
         synced.push(result);
+        const written = await writePublicSubmissionViaRest(cfg, activePublicWorkspaceId, result);
+        if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
+          await writePublicSubmissionViaRest(cfg, LEGACY_FALLBACK_WORKSPACE_ID, result);
+        }
       }
     }
 
     const store = loadStore();
-    const classId = items?.[0]?.classId || store.classes[0]?.id || 'LOP-5A';
+    const classId = items?.[0]?.classId || store.classes[0]?.id || 'LOP-8A';
     const leaderboard = buildLeaderboard(
       classId,
       store.submissions,

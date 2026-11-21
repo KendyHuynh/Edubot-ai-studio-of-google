@@ -23,3 +23,21 @@ test('formatFirebaseAuthError translates auth/popup-closed-by-user into helpful 
   assert.equal(formatted.suggestNewTab, true);
   assert.match(formatted.message, /Cửa sổ đăng nhập Google đã đóng/);
 });
+
+test('formatFirebaseAuthError translates auth/unauthorized-domain with Authorized domains instructions', () => {
+  const viResult = formatFirebaseAuthError(
+    { code: 'auth/unauthorized-domain', message: 'Domain not authorized' },
+    'vi',
+  );
+  assert.equal(viResult.code, 'auth/unauthorized-domain');
+  assert.equal(viResult.suggestNewTab, true);
+  assert.match(viResult.message, /Authorized domains/);
+
+  const enResult = formatFirebaseAuthError(
+    new Error('Firebase: Error (auth/unauthorized-domain).'),
+    'en',
+  );
+  assert.equal(enResult.code, 'auth/unauthorized-domain');
+  assert.match(enResult.message, /Authorized domains/);
+});
+

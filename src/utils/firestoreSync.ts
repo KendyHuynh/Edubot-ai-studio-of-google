@@ -7,6 +7,7 @@ import {
   getDocFromServer,
   getDocs,
   getFirestore,
+  limit,
   query,
   serverTimestamp,
   setDoc,
@@ -22,6 +23,9 @@ import {
   PushNotification,
 } from '../shared/types';
 import {
+  DEFAULT_PUBLIC_WORKSPACE_ID,
+  mergeLatestSubmissions,
+  mergeSubmissionActivityLogs,
   sanitizeLessonFieldsForFirestore,
   toFirestoreDocId,
 } from './firestoreHelpers';
@@ -459,7 +463,58 @@ export async function fetchTeacherCloudData(ownerUid: string): Promise<{
       };
     });
 
-    return { classes, lessons, submissions, notifications, activityLogs };
+    const shareCode = defaultShareCodeForUid(ownerUid);
+    const publicSubSources = Array.from(new Set([DEFAULT_PUBLIC_WORKSPACE_ID, shareCode]));
+    const publicSubmissions: AnswerSubmission[] = [];
+    for (const wsId of publicSubSources) {
+      try {
+        const pubSnap = await getDocs(
+          query(
+            collection(db, 'publicWorkspaces', wsId, 'submissions'),
+            where('workspaceId', '==', wsId),
+            limit(300),
+          ),
+        );
+        for (const d of pubSnap.docs) {
+          const data = d.data();
+          publicSubmissions.push({
+            id: String(data.id),
+            classId: String(data.classId),
+            groupId: String(data.groupId),
+            tabletNumber: Number(data.tabletNumber ?? 1),
+            groupName: String(data.groupName ?? ''),
+            lessonId: String(data.lessonId),
+            lessonTitle: String(data.lessonTitle ?? ''),
+            questionId: String(data.questionId),
+            competencyId: String(data.competencyId ?? '1.1'),
+            competencyIds: Array.isArray(data.competencyIds) ? data.competencyIds : undefined,
+            userAnswer: String(data.userAnswer ?? ''),
+            isCorrect: Boolean(data.isCorrect),
+            basePoints: Number(data.basePoints ?? 0),
+            speedBonus: Number(data.speedBonus ?? 0),
+            totalPoints: Number(data.totalPoints ?? 0),
+            elapsedMs: Number(data.elapsedMs ?? 0),
+            submittedAt: String(data.submittedAt ?? normalizeTimestampToIso(data.createdAt)),
+            feedbackText: String(data.feedbackText ?? ''),
+            explanation: String(data.explanation ?? ''),
+            syncedFromOffline: Boolean(data.syncedFromOffline),
+          });
+        }
+      } catch {
+        // Non-fatal if a workspace doc or subcollection doesn't exist yet
+      }
+    }
+
+    const mergedSubmissions = mergeLatestSubmissions(submissions, publicSubmissions);
+    const mergedActivityLogs = mergeSubmissionActivityLogs(activityLogs, mergedSubmissions);
+
+    return {
+      classes,
+      lessons,
+      submissions: mergedSubmissions,
+      notifications,
+      activityLogs: mergedActivityLogs,
+    };
   } catch (error) {
     if (!isActiveOwner(ownerUid)) {
       return { classes: [], lessons: [], submissions: [], notifications: [], activityLogs: [] };
@@ -507,19 +562,47 @@ export function defaultShareCodeForUid(uid: string): string {
   return `WS-${toFirestoreDocId(uid, 12).toUpperCase()}`;
 }
 
+async function writeSinglePublicWorkspaceDoc(
+  docId: string,
+  ownerUid: string,
+  cleanClasses: Array<Record<string, unknown>>,
+  cleanLessons: Array<Record<string, unknown>>,
+  cleanNotifications: Array<Record<string, unknown>>,
+): Promise<void> {
+  const ref = doc(db, 'publicWorkspaces', docId);
+  const snap = await getDoc(ref);
+  if (!isActiveOwner(ownerUid)) return;
+  if (!snap.exists()) {
+    await setDoc(ref, {
+      id: docId,
+      ownerUid,
+      classes: cleanClasses,
+      lessons: cleanLessons,
+      notifications: cleanNotifications,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } else {
+    await updateDoc(ref, {
+      classes: cleanClasses,
+      lessons: cleanLessons,
+      notifications: cleanNotifications,
+      updatedAt: serverTimestamp(),
+    });
+  }
+}
+
 export async function publishPublicWorkspace(
   workspaceCode: string,
   ownerUid: string,
   classes: ClassRoom[],
   lessons: Lesson[],
+  notifications: PushNotification[] = [],
 ): Promise<string> {
   const docId = toFirestoreDocId(workspaceCode, 64);
   if (!isActiveOwner(ownerUid)) return docId;
   const path = `publicWorkspaces/${docId}`;
   try {
-    const ref = doc(db, 'publicWorkspaces', docId);
-    const snap = await getDoc(ref);
-    if (!isActiveOwner(ownerUid)) return docId;
     const cleanClasses = classes.slice(0, 100).map((c) => ({
       id: String(c.id).slice(0, 64),
       name: String(c.name || c.id).slice(0, 160),
@@ -535,23 +618,40 @@ export async function publishPublicWorkspace(
         ...sanitizeLessonFieldsForFirestore(l, lid),
       };
     });
+    const cleanNotifications = notifications.slice(0, 50).map((n) => ({
+      id: toFirestoreDocId(n.id || 'notif', 80),
+      classId: String(n.classId || '').slice(0, 64),
+      lessonId: toFirestoreDocId(n.lessonId || 'lesson', 80),
+      title: String(n.title || 'Thông báo').slice(0, 240),
+      message: String(n.message || '').slice(0, 1000),
+      createdAt: String(n.createdAt || new Date().toISOString()).slice(0, 64),
+      readByGroupIds: (n.readByGroupIds ?? []).slice(0, 100).map((g) => String(g).slice(0, 120)),
+    }));
 
-    if (!snap.exists()) {
-      await setDoc(ref, {
-        id: docId,
-        ownerUid,
-        classes: cleanClasses,
-        lessons: cleanLessons,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      await updateDoc(ref, {
-        classes: cleanClasses,
-        lessons: cleanLessons,
-        updatedAt: serverTimestamp(),
-      });
+    await writeSinglePublicWorkspaceDoc(
+      docId,
+      ownerUid,
+      cleanClasses,
+      cleanLessons,
+      cleanNotifications,
+    );
+
+    // Also update the school-wide `default` public workspace so students opening the root URL
+    // (without ?ws=...) automatically receive the teacher's latest classes, lessons & alerts.
+    if (docId !== DEFAULT_PUBLIC_WORKSPACE_ID && isActiveOwner(ownerUid)) {
+      try {
+        await writeSinglePublicWorkspaceDoc(
+          DEFAULT_PUBLIC_WORKSPACE_ID,
+          ownerUid,
+          cleanClasses,
+          cleanLessons,
+          cleanNotifications,
+        );
+      } catch {
+        // Non-admin secondary teachers only write their own WS-<code> doc; ignore permission denial on `default`.
+      }
     }
+
     return docId;
   } catch (error) {
     if (!isActiveOwner(ownerUid)) return docId;

@@ -69,13 +69,17 @@ export function formatFirebaseAuthError(err: unknown, lang: Language): Formatted
   }
 
   if (code === 'auth/unauthorized-domain') {
+    const host =
+      typeof window !== 'undefined' && window.location?.hostname
+        ? window.location.hostname
+        : 'ten-mien-cua-ban.github.io';
     return {
       code,
       suggestNewTab: true,
       message:
         lang === 'vi'
-          ? 'Tên miền hiện tại chưa được cấp phép đăng nhập Google. Vui lòng mở bằng URL triển khai chính thức hoặc kiểm tra Firebase Auth.'
-          : 'This domain is not authorized for Firebase Google Sign-In. Please open the official app URL.',
+          ? `Tên miền "${host}" chưa có trong danh sách Authorized domains của Firebase Auth. Hãy thêm "${host}" vào Firebase Console -> Authentication -> Settings -> Authorized domains rồi đăng nhập lại.`
+          : `Domain "${host}" is not listed in Firebase Auth Authorized domains. Add "${host}" in Firebase Console -> Authentication -> Settings -> Authorized domains and try again.`,
     };
   }
 

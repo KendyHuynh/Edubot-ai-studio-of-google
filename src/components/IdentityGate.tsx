@@ -42,7 +42,7 @@ export function IdentityGate({
 }: IdentityGateProps) {
   const defaultTablet = activeSession?.tabletNumber || initialTabletNumber || 3;
   const [selectedClassId, setSelectedClassId] = useState(
-    activeSession?.classId || initialClassId || classes[0]?.id || 'LOP-5A',
+    activeSession?.classId || initialClassId || classes[0]?.id || '',
   );
   const [tabletNumber, setTabletNumber] = useState<number>(defaultTablet);
   const [groupName, setGroupName] = useState<string>(
@@ -57,6 +57,14 @@ export function IdentityGate({
       setSelectedClassId(initialClassId);
     }
   }, [initialClassId, activeSession]);
+
+  useEffect(() => {
+    if (!activeSession && !initialClassId && classes.length > 0) {
+      setSelectedClassId((prev) =>
+        prev && classes.some((c) => c.id === prev) ? prev : classes[0].id,
+      );
+    }
+  }, [classes, activeSession, initialClassId]);
 
   useEffect(() => {
     if (
@@ -157,36 +165,44 @@ export function IdentityGate({
               <span>{copy.classCodeLabel}</span>
             </label>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              {classes.map((cls) => {
-                const selected = selectedClassId === cls.id;
-                return (
-                  <button
-                    key={cls.id}
-                    type="button"
-                    onClick={() => setSelectedClassId(cls.id)}
-                    className={`text-left p-4 rounded-xl border transition-colors cursor-pointer min-h-[56px] ${
-                      selected
-                        ? 'border-sky-600 bg-sky-50/70 text-slate-900'
-                        : 'border-slate-200 bg-white hover:border-slate-300 text-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-mono-num text-sm font-bold text-sky-700">
-                        {cls.id}
-                      </span>
-                      {selected && <Check className="w-4 h-4 text-sky-600" />}
-                    </div>
-                    <p className="text-sm font-medium text-slate-900 mt-1 truncate">
-                      {cls.name}
-                    </p>
-                    <p className="text-xs text-slate-500 mt-0.5 truncate">
-                      {cls.grade} · {cls.teacherName}
-                    </p>
-                  </button>
-                );
-              })}
-            </div>
+            {classes.length === 0 ? (
+              <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 text-xs sm:text-sm text-slate-500">
+                {lang === 'vi'
+                  ? 'Đang đồng bộ danh sách lớp học mới nhất từ giáo viên...'
+                  : 'Loading latest classes from your teacher...'}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {classes.map((cls) => {
+                  const selected = selectedClassId === cls.id;
+                  return (
+                    <button
+                      key={cls.id}
+                      type="button"
+                      onClick={() => setSelectedClassId(cls.id)}
+                      className={`text-left p-4 rounded-xl border transition-colors cursor-pointer min-h-[56px] ${
+                        selected
+                          ? 'border-sky-600 bg-sky-50/70 text-slate-900'
+                          : 'border-slate-200 bg-white hover:border-slate-300 text-slate-700'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-mono-num text-sm font-bold text-sky-700">
+                          {cls.id}
+                        </span>
+                        {selected && <Check className="w-4 h-4 text-sky-600" />}
+                      </div>
+                      <p className="text-sm font-medium text-slate-900 mt-1 truncate">
+                        {cls.name}
+                      </p>
+                      <p className="text-xs text-slate-500 mt-0.5 truncate">
+                        {cls.grade} · {cls.teacherName}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
 
             <div className="pt-1 flex flex-wrap items-center gap-3">
               <input
@@ -194,7 +210,7 @@ export function IdentityGate({
                 type="text"
                 value={selectedClassId}
                 onChange={(e) => setSelectedClassId(e.target.value.toUpperCase())}
-                placeholder="LOP-5A"
+                placeholder={classes[0]?.id || 'LOP-8A'}
                 className="w-full sm:w-64 px-3.5 py-2.5 text-sm font-mono-num font-semibold border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-sky-500"
               />
               <span className="text-xs text-slate-500">

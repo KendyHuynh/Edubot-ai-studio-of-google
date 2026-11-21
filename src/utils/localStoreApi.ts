@@ -27,10 +27,17 @@ import {
   QuestionType,
 } from '../shared/types';
 import {
-  FirestoreRestValue,
-  fromFirestoreRestValue,
+  DEFAULT_PUBLIC_WORKSPACE_ID,
+  LEGACY_FALLBACK_WORKSPACE_ID,
+  mergeLatestSubmissions,
+  mergeSubmissionActivityLogs,
   normalizeClassCode,
 } from './firestoreHelpers';
+import {
+  fetchPublicSubmissionsViaRest,
+  fetchPublicWorkspaceSnapshot,
+  writePublicSubmissionViaRest,
+} from './publicFirestoreRest';
 import {
   hashPinWebCrypto,
   validateTeacherPin,
@@ -158,6 +165,12 @@ const defaultStorage: StorageLike = {
 };
 
 const hydratedWorkspaceCache = new Map<string, number>();
+let activePublicWorkspaceId: string = DEFAULT_PUBLIC_WORKSPACE_ID;
+
+export function resetLocalHydrationCache(): void {
+  hydratedWorkspaceCache.clear();
+  activePublicWorkspaceId = DEFAULT_PUBLIC_WORKSPACE_ID;
+}
 
 export function loadLocalStore(storage: StorageLike = defaultStorage): StoreData {
   try {
@@ -190,79 +203,75 @@ export function saveLocalStore(
 async function hydrateLocalFromPublicWorkspace(
   workspaceCode: string,
   storage: StorageLike,
-): Promise<void> {
-  const cleanCode = workspaceCode.trim();
-  if (!/^[A-Za-z0-9_-]{2,64}$/.test(cleanCode)) return;
-  const lastFetched = hydratedWorkspaceCache.get(cleanCode) ?? 0;
-  if (Date.now() - lastFetched < 30_000) return;
-
-  if (
-    !firebaseConfig?.projectId ||
-    !firebaseConfig?.firestoreDatabaseId ||
-    !firebaseConfig?.apiKey
-  ) {
-    return;
+  options: { replaceContent: boolean; forceRefresh?: boolean } = { replaceContent: true },
+): Promise<string | null> {
+  const cacheKey = `${workspaceCode.trim() || '__default__'}::${options.replaceContent ? 'full' : 'subs'}`;
+  const lastFetched = hydratedWorkspaceCache.get(cacheKey) ?? 0;
+  if (!options.forceRefresh && Date.now() - lastFetched < 5_000) {
+    return activePublicWorkspaceId;
   }
 
   try {
-    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
-      firebaseConfig.projectId,
-    )}/databases/${encodeURIComponent(
-      firebaseConfig.firestoreDatabaseId,
-    )}/documents/publicWorkspaces/${encodeURIComponent(
-      cleanCode,
-    )}?key=${encodeURIComponent(firebaseConfig.apiKey)}`;
-
-    const res = await fetch(url);
-    if (!res.ok) return;
-    const doc = (await res.json()) as {
-      fields?: Record<string, FirestoreRestValue>;
-    };
-    if (!doc.fields) return;
-
-    const decoded = fromFirestoreRestValue({
-      mapValue: { fields: doc.fields },
-    }) as {
-      classes?: ClassRoom[];
-      lessons?: Lesson[];
-    };
+    const snapshot = await fetchPublicWorkspaceSnapshot(firebaseConfig, workspaceCode || null);
+    const resolvedWsId = snapshot?.workspaceId || workspaceCode.trim() || activePublicWorkspaceId;
+    if (snapshot) {
+      activePublicWorkspaceId = snapshot.workspaceId;
+    }
 
     const store = loadLocalStore(storage);
     let changed = false;
 
-    if (Array.isArray(decoded.classes) && decoded.classes.length > 0) {
-      const classMap = new Map(store.classes.map((c) => [c.id, c]));
-      for (const cls of decoded.classes) {
-        if (cls?.id && cls?.name) {
-          classMap.set(cls.id, cls);
-          changed = true;
-        }
+    if (snapshot && options.replaceContent) {
+      if (snapshot.classes.length > 0) {
+        store.classes = snapshot.classes;
+        changed = true;
       }
-      store.classes = Array.from(classMap.values());
+      if (snapshot.lessons.length > 0) {
+        store.lessons = snapshot.lessons;
+        changed = true;
+      }
+      if (snapshot.notifications && snapshot.notifications.length > 0) {
+        const readMap = new Map(
+          store.notifications.map((n) => [n.id, new Set(n.readByGroupIds ?? [])]),
+        );
+        store.notifications = snapshot.notifications.map((n) => {
+          const existingRead = readMap.get(n.id);
+          const mergedRead = Array.from(
+            new Set([...(n.readByGroupIds ?? []), ...(existingRead ? Array.from(existingRead) : [])]),
+          );
+          return { ...n, readByGroupIds: mergedRead };
+        });
+        changed = true;
+      }
     }
 
-    if (Array.isArray(decoded.lessons) && decoded.lessons.length > 0) {
-      const lessonMap = new Map(store.lessons.map((l) => [l.id, l]));
-      for (const lesson of decoded.lessons) {
-        if (
-          lesson?.id &&
-          lesson?.title &&
-          Array.isArray(lesson.questions) &&
-          lesson.questions.length > 0
-        ) {
-          lessonMap.set(lesson.id, lesson);
-          changed = true;
-        }
-      }
-      store.lessons = Array.from(lessonMap.values());
+    // Fetch live student submissions from the resolved workspace (and legacy fallback if active is default)
+    const subSources = Array.from(
+      new Set(
+        resolvedWsId === DEFAULT_PUBLIC_WORKSPACE_ID
+          ? [DEFAULT_PUBLIC_WORKSPACE_ID, LEGACY_FALLBACK_WORKSPACE_ID]
+          : [resolvedWsId],
+      ),
+    );
+    const cloudSubs: AnswerSubmission[] = [];
+    for (const wsId of subSources) {
+      const rows = await fetchPublicSubmissionsViaRest(firebaseConfig, wsId);
+      if (rows.length > 0) cloudSubs.push(...rows);
+    }
+
+    if (cloudSubs.length > 0) {
+      store.submissions = mergeLatestSubmissions(store.submissions, cloudSubs);
+      store.activityLogs = mergeSubmissionActivityLogs(store.activityLogs, store.submissions);
+      changed = true;
     }
 
     if (changed) {
       saveLocalStore(store, storage);
     }
-    hydratedWorkspaceCache.set(cleanCode, Date.now());
+    hydratedWorkspaceCache.set(cacheKey, Date.now());
+    return resolvedWsId;
   } catch {
-    // Non-fatal on offline / blocked network
+    return activePublicWorkspaceId;
   }
 }
 
@@ -387,6 +396,23 @@ export async function handleLocalApi(
     return verifyLocalToken(options.authToken, sec.tokenVersion);
   };
 
+  // GET /api/auth/domains
+  if (pathname === '/api/auth/domains' && method === 'GET') {
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        projectId: firebaseConfig?.projectId || '',
+        authDomain: firebaseConfig?.authDomain || '',
+        devAppUrl: '',
+        sharedAppUrl: '',
+        callbackUrls: firebaseConfig?.authDomain
+          ? [`https://${firebaseConfig.authDomain}/__/auth/handler`]
+          : [],
+      },
+    };
+  }
+
   // GET /api/teacher/auth-status
   if (pathname === '/api/teacher/auth-status' && method === 'GET') {
     const store = loadLocalStore(storage);
@@ -406,6 +432,8 @@ export async function handleLocalApi(
         isAuthenticated: Boolean(auth),
         authMethod: auth?.method ?? null,
         adminEmail: auth?.email ?? null,
+        devAppUrl: '',
+        sharedAppUrl: '',
       },
     };
   }
@@ -615,15 +643,22 @@ export async function handleLocalApi(
   // GET /api/bootstrap
   if (pathname === '/api/bootstrap' && method === 'GET') {
     const ws = parsedUrl.searchParams.get('ws') || '';
-    if (ws) {
-      await hydrateLocalFromPublicWorkspace(ws, storage);
-    }
+    const forceRefresh = parsedUrl.searchParams.get('refresh') === '1';
+    const preStore = loadLocalStore(storage);
+    const includeAnswers =
+      parsedUrl.searchParams.get('role') === 'teacher' && Boolean(getLocalAuth(preStore));
+
+    // Student / unauthenticated requests ALWAYS hydrate authoritative teacher classes, lessons,
+    // notifications & live submissions from Firestore (no Google/Firebase login required!).
+    // Authenticated teacher requests only pull live student submissions here so unsaved local edits aren't clobbered.
+    const resolvedWsId = await hydrateLocalFromPublicWorkspace(ws, storage, {
+      replaceContent: !includeAnswers,
+      forceRefresh,
+    });
 
     const store = loadLocalStore(storage);
     const classId = parsedUrl.searchParams.get('classId') || '';
     const lang = (parsedUrl.searchParams.get('lang') === 'en' ? 'en' : 'vi') as Language;
-    const includeAnswers =
-      parsedUrl.searchParams.get('role') === 'teacher' && Boolean(getLocalAuth(store));
 
     const sanitizedLessons = store.lessons.map((lesson) => ({
       ...lesson,
@@ -632,7 +667,10 @@ export async function handleLocalApi(
       ),
     }));
 
-    const targetClassId = classId || store.classes[0]?.id || 'LOP-5A';
+    const targetClassId =
+      classId && store.classes.some((c) => c.id === classId)
+        ? classId
+        : store.classes[0]?.id || 'LOP-8A';
     const leaderboard = buildLeaderboard(targetClassId, store.submissions, lang);
     const domainChampions = buildDomainChampions(targetClassId, store.submissions, lang);
     const competencyMatrix = buildCompetencyMatrix(
@@ -661,6 +699,7 @@ export async function handleLocalApi(
         notifications,
         activityLogs,
         submissionsCount: store.submissions.length,
+        activeWorkspaceId: resolvedWsId || activePublicWorkspaceId,
         ...(includeAnswers ? { submissions: store.submissions } : {}),
       },
     };
@@ -745,24 +784,23 @@ export async function handleLocalApi(
   if (pathname === '/api/sync/cloud-hydrate' && method === 'POST') {
     const payload = body as Partial<StoreData>;
     const store = loadLocalStore(storage);
+    // Replace classes & lessons with authoritative teacher Firestore records (avoid keeping deleted seed items)
     if (Array.isArray(payload.classes) && payload.classes.length > 0) {
-      const map = new Map(store.classes.map((c) => [c.id, c]));
-      for (const c of payload.classes) if (c?.id && c?.name) map.set(c.id, c);
-      store.classes = Array.from(map.values());
+      const validClasses = payload.classes.filter((c) => Boolean(c?.id && c?.name));
+      if (validClasses.length > 0) {
+        store.classes = validClasses;
+      }
     }
     if (Array.isArray(payload.lessons) && payload.lessons.length > 0) {
-      const map = new Map(store.lessons.map((l) => [l.id, l]));
-      for (const l of payload.lessons) {
-        if (l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0) {
-          map.set(l.id, l);
-        }
+      const validLessons = payload.lessons.filter(
+        (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
+      );
+      if (validLessons.length > 0) {
+        store.lessons = validLessons;
       }
-      store.lessons = Array.from(map.values());
     }
     if (Array.isArray(payload.submissions) && payload.submissions.length > 0) {
-      const map = new Map(store.submissions.map((s) => [s.id, s]));
-      for (const s of payload.submissions) if (s?.id) map.set(s.id, s);
-      store.submissions = Array.from(map.values());
+      store.submissions = mergeLatestSubmissions(store.submissions, payload.submissions);
     }
     if (Array.isArray(payload.notifications) && payload.notifications.length > 0) {
       const map = new Map(store.notifications.map((n) => [n.id, n]));
@@ -772,9 +810,12 @@ export async function handleLocalApi(
     if (Array.isArray(payload.activityLogs) && payload.activityLogs.length > 0) {
       const map = new Map(store.activityLogs.map((l) => [l.id, l]));
       for (const l of payload.activityLogs) if (l?.id) map.set(l.id, l);
-      store.activityLogs = Array.from(map.values())
-        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-        .slice(0, 200);
+      store.activityLogs = mergeSubmissionActivityLogs(
+        Array.from(map.values()),
+        store.submissions,
+      );
+    } else if (store.submissions.length > 0) {
+      store.activityLogs = mergeSubmissionActivityLogs(store.activityLogs, store.submissions);
     }
     saveLocalStore(store, storage);
     return { ok: true, status: 200, data: { ok: true } };
@@ -1013,6 +1054,19 @@ export async function handleLocalApi(
       return { ok: false, status: 404, data: { error: 'Không tìm thấy câu hỏi tương ứng.' } };
     }
     saveLocalStore(store, storage);
+    // Sync graded submission to Firestore publicSubmissions (zero-login) so all tablets & teacher see it live
+    const written = await writePublicSubmissionViaRest(
+      firebaseConfig,
+      activePublicWorkspaceId,
+      submission,
+    );
+    if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
+      await writePublicSubmissionViaRest(
+        firebaseConfig,
+        LEGACY_FALLBACK_WORKSPACE_ID,
+        submission,
+      );
+    }
     const leaderboard = buildLeaderboard(item.classId, store.submissions, lang);
     return { ok: true, status: 200, data: { submission, leaderboard } };
   }
@@ -1025,10 +1079,24 @@ export async function handleLocalApi(
     const synced: AnswerSubmission[] = [];
     for (const item of items ?? []) {
       const sub = gradeOneLocally(store, item, resolvedLang, true);
-      if (sub) synced.push(sub);
+      if (sub) {
+        synced.push(sub);
+        const written = await writePublicSubmissionViaRest(
+          firebaseConfig,
+          activePublicWorkspaceId,
+          sub,
+        );
+        if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
+          await writePublicSubmissionViaRest(
+            firebaseConfig,
+            LEGACY_FALLBACK_WORKSPACE_ID,
+            sub,
+          );
+        }
+      }
     }
     saveLocalStore(store, storage);
-    const classId = items?.[0]?.classId || store.classes[0]?.id || 'LOP-5A';
+    const classId = items?.[0]?.classId || store.classes[0]?.id || 'LOP-8A';
     const leaderboard = buildLeaderboard(classId, store.submissions, resolvedLang);
     return { ok: true, status: 200, data: { synced, leaderboard } };
   }

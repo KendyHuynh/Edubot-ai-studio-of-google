@@ -1,11 +1,26 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, KeyRound, Lock, ShieldCheck, UserCheck } from 'lucide-react';
+import {
+  ArrowLeft,
+  KeyRound,
+  Lock,
+  ShieldCheck,
+  UserCheck,
+} from 'lucide-react';
 import { Language } from '../shared/types';
 import { apiRequestJson } from '../utils/apiClient';
-import { setAdminSession } from '../utils/authSession';
+import {
+  checkCurrentDomainAuthorization,
+  getAuthorizedFallbackPortalUrl,
+} from '../utils/authDomains';
 import { formatFirebaseAuthError } from '../utils/authErrors';
-import { auth, firebaseGoogleSignIn, logoutGoogle } from '../utils/googleDrive';
+import { setAdminSession } from '../utils/authSession';
+import {
+  firebaseGoogleSignIn,
+  logoutGoogle,
+  waitForAuthReady,
+} from '../utils/googleDrive';
 import { validateTeacherPin } from '../utils/pinCrypto';
+import { AuthErrorBanner } from './AuthErrorBanner';
 
 interface AuthStatusResponse {
   pinConfigured: boolean;
@@ -16,6 +31,8 @@ interface AuthStatusResponse {
   isAuthenticated: boolean;
   authMethod: 'pin' | 'google' | null;
   adminEmail: string | null;
+  devAppUrl?: string;
+  sharedAppUrl?: string;
 }
 
 interface TeacherPinGateProps {
@@ -37,17 +54,28 @@ export function TeacherPinGate({
   const [checking, setChecking] = useState(false);
   const [googleChecking, setGoogleChecking] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+  const [errorSuggestNewTab, setErrorSuggestNewTab] = useState(false);
+  const [unauthorizedHost, setUnauthorizedHost] = useState<string | null>(null);
+  const [domainCheck, setDomainCheck] = useState<{
+    checkedLive: boolean;
+    authorized: boolean;
+    hostname: string;
+    authorizedDomains: string[];
+  } | null>(null);
 
   useEffect(() => {
     let active = true;
     const loadStatus = async () => {
       try {
-        const res = await apiRequestJson<AuthStatusResponse>(
-          '/api/teacher/auth-status',
-          {},
-          lang,
-        );
+        const [res, domainInfo, currentUser] = await Promise.all([
+          apiRequestJson<AuthStatusResponse>('/api/teacher/auth-status', {}, lang),
+          checkCurrentDomainAuthorization(),
+          waitForAuthReady(),
+        ]);
         if (!active) return;
+
+        setDomainCheck(domainInfo);
+
         if (res.ok && res.data) {
           setStatus(res.data);
           if (res.data.isAuthenticated) {
@@ -55,8 +83,8 @@ export function TeacherPinGate({
             return;
           }
         }
-        // Silently verify if an authorized Admin Google user is already signed in
-        const currentUser = auth.currentUser;
+
+        // Silently verify if an authorized Admin Google user is already signed in (or returned from redirect)
         if (currentUser) {
           try {
             const idToken = await currentUser.getIdToken();
@@ -97,11 +125,27 @@ export function TeacherPinGate({
     };
   }, [lang, onUnlocked]);
 
+  const authorizedFallbackUrl =
+    typeof window !== 'undefined' && domainCheck
+      ? getAuthorizedFallbackPortalUrl(
+          window.location.origin,
+          domainCheck.authorizedDomains,
+          {
+            devAppUrl: status?.devAppUrl,
+            sharedAppUrl: status?.sharedAppUrl,
+          },
+          '/teacher',
+        )
+      : null;
+
   const handleGoogleAdminSignIn = async () => {
     if (googleChecking) return;
     setGoogleChecking(true);
     setErrorMsg('');
+    setErrorSuggestNewTab(false);
+    setUnauthorizedHost(null);
     try {
+      // Invoke signInWithPopup directly in the click gesture (no preceding awaits!)
       const signInResult = await firebaseGoogleSignIn();
       if (!signInResult?.user) {
         setErrorMsg(
@@ -142,7 +186,12 @@ export function TeacherPinGate({
       });
       onUnlocked();
     } catch (err) {
-      setErrorMsg(formatFirebaseAuthError(err, lang).message);
+      const formatted = formatFirebaseAuthError(err, lang);
+      if (formatted.code === 'auth/unauthorized-domain' && typeof window !== 'undefined') {
+        setUnauthorizedHost(window.location.hostname);
+      }
+      setErrorSuggestNewTab(formatted.suggestNewTab);
+      setErrorMsg(formatted.message);
     } finally {
       setGoogleChecking(false);
     }
@@ -421,14 +470,28 @@ export function TeacherPinGate({
               </>
             ) : null}
 
-            {errorMsg && (
-              <p
-                role="alert"
-                className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs font-medium text-rose-700 leading-relaxed"
-              >
-                {errorMsg}
-              </p>
-            )}
+            {errorMsg ? (
+              <AuthErrorBanner
+                message={errorMsg}
+                lang={lang}
+                unauthorizedHost={unauthorizedHost}
+                authorizedFallbackUrl={authorizedFallbackUrl}
+                suggestNewTab={errorSuggestNewTab}
+                tone="error"
+              />
+            ) : domainCheck?.checkedLive && !domainCheck.authorized ? (
+              <AuthErrorBanner
+                message={
+                  lang === 'vi'
+                    ? `Tên miền "${domainCheck.hostname}" hiện chưa có trong Firebase Authorized domains, nên cửa sổ đăng nhập Google sẽ tự đóng nếu bấm trực tiếp tại đây.`
+                    : `Domain "${domainCheck.hostname}" is not yet in Firebase Authorized domains, so the Google sign-in popup will close immediately on this host.`
+                }
+                lang={lang}
+                unauthorizedHost={domainCheck.hostname}
+                authorizedFallbackUrl={authorizedFallbackUrl}
+                tone="warning"
+              />
+            ) : null}
           </>
         )}
 

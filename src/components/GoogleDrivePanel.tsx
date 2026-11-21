@@ -24,6 +24,7 @@ import {
   readDriveFileContent,
   uploadJsonToDrive,
 } from '../utils/googleDrive';
+import { AuthErrorBanner } from './AuthErrorBanner';
 import { GoogleSignInButton } from './GoogleSignInButton';
 
 interface GoogleDrivePanelProps {
@@ -55,6 +56,7 @@ export function GoogleDrivePanel({
     type: 'ok' | 'err';
     text: string;
     suggestNewTab?: boolean;
+    unauthorizedHost?: string | null;
   } | null>(null);
 
   // Explicit confirmation modals for Drive mutations / deletions
@@ -118,6 +120,10 @@ export function GoogleDrivePanel({
         type: 'err',
         text: formatted.message,
         suggestNewTab: formatted.suggestNewTab,
+        unauthorizedHost:
+          formatted.code === 'auth/unauthorized-domain' && typeof window !== 'undefined'
+            ? window.location.hostname
+            : null,
       });
     } finally {
       setIsLoggingIn(false);
@@ -247,21 +253,14 @@ export function GoogleDrivePanel({
         </div>
 
         {statusMsg && (
-          <div
-            role="alert"
-            className="text-sm font-medium text-amber-900 bg-amber-50 border border-amber-200 rounded-xl p-3.5 space-y-2 text-left"
-          >
-            <p>{statusMsg.text}</p>
-            {statusMsg.suggestNewTab && typeof window !== 'undefined' && (
-              <a
-                href={window.location.href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-block text-xs font-semibold text-sky-700 hover:underline"
-              >
-                {lang === 'vi' ? 'Mở ứng dụng ở tab mới →' : 'Open in new tab →'}
-              </a>
-            )}
+          <div className="text-left">
+            <AuthErrorBanner
+              message={statusMsg.text}
+              lang={lang}
+              unauthorizedHost={statusMsg.unauthorizedHost}
+              suggestNewTab={statusMsg.suggestNewTab}
+              tone="warning"
+            />
           </div>
         )}
       </div>

@@ -62,6 +62,7 @@ import {
 } from '../utils/routing';
 import { parseJsonTextSafe } from '../utils/safeJson';
 import { AdminSecurityPanel } from './AdminSecurityPanel';
+import { AuthErrorBanner } from './AuthErrorBanner';
 import { GoogleDrivePanel } from './GoogleDrivePanel';
 import { LessonEditorModal } from './LessonEditorModal';
 
@@ -149,6 +150,7 @@ export function TeacherStudio({
     type: 'ok' | 'err';
     text: string;
     suggestNewTab?: boolean;
+    unauthorizedHost?: string | null;
   } | null>(null);
   const cloudSyncingRef = useRef(false);
   const hydratedUidRef = useRef<string | null>(null);
@@ -168,14 +170,19 @@ export function TeacherStudio({
       try {
         let nextClasses = classes;
         let nextLessons = lessons;
+        let nextNotifications = notifications;
         try {
           const res = await apiRequestJson<{
             classes?: ClassRoom[];
             lessons?: Lesson[];
+            notifications?: PushNotification[];
           }>('/api/bootstrap?role=teacher', {}, lang);
           if (res.ok && res.data?.classes && res.data?.lessons) {
             nextClasses = res.data.classes;
             nextLessons = res.data.lessons;
+            if (Array.isArray(res.data.notifications)) {
+              nextNotifications = res.data.notifications;
+            }
           }
         } catch {
           // Fall back to current in-memory classes & lessons
@@ -185,12 +192,13 @@ export function TeacherStudio({
           uid,
           nextClasses,
           nextLessons,
+          nextNotifications,
         );
       } catch {
         // Non-fatal: private Firestore data still saved
       }
     },
-    [classes, lang, lessons],
+    [classes, lang, lessons, notifications],
   );
 
   const syncWithCloud = useCallback(
@@ -234,20 +242,53 @@ export function TeacherStudio({
           await onRefreshData();
         }
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
+
+        // Always read freshly hydrated teacher store so stale seed classes/lessons from React closure
+        // are NEVER pushed back over the teacher's authoritative cloud workspace!
+        let freshClasses = classes;
+        let freshLessons = lessons;
+        let freshSubmissions = submissions;
+        let freshNotifications = notifications;
+        let freshLogs = activityLogs;
+        try {
+          const freshRes = await apiRequestJson<{
+            classes?: ClassRoom[];
+            lessons?: Lesson[];
+            submissions?: AnswerSubmission[];
+            notifications?: PushNotification[];
+            activityLogs?: ActivityLog[];
+          }>('/api/bootstrap?role=teacher&refresh=1', {}, lang);
+          if (freshRes.ok && freshRes.data) {
+            if (Array.isArray(freshRes.data.classes)) freshClasses = freshRes.data.classes;
+            if (Array.isArray(freshRes.data.lessons)) freshLessons = freshRes.data.lessons;
+            if (Array.isArray(freshRes.data.submissions)) freshSubmissions = freshRes.data.submissions;
+            if (Array.isArray(freshRes.data.notifications)) freshNotifications = freshRes.data.notifications;
+            if (Array.isArray(freshRes.data.activityLogs)) freshLogs = freshRes.data.activityLogs;
+          }
+        } catch {
+          // Keep current state as fallback
+        }
+
         const existingLogIds = new Set(cloudData.activityLogs.map((l) => l.id));
         await pushWorkspaceToFirestore(
           user.uid,
           {
-            classes,
-            lessons,
-            submissions,
-            notifications,
-            activityLogs,
+            classes: freshClasses,
+            lessons: freshLessons,
+            submissions: freshSubmissions,
+            notifications: freshNotifications,
+            activityLogs: freshLogs,
           },
           existingLogIds,
         );
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
-        await publishLatestPublicSnapshot(user.uid);
+        await publishPublicWorkspace(
+          defaultShareCodeForUid(user.uid),
+          user.uid,
+          freshClasses,
+          freshLessons,
+          freshNotifications,
+        );
         hydratedUidRef.current = user.uid;
         if (manual) {
           const code = defaultShareCodeForUid(user.uid);
@@ -255,10 +296,10 @@ export function TeacherStudio({
             type: 'ok',
             text:
               lang === 'vi'
-                ? `Đã đồng bộ ${classes.length} lớp, ${lessons.length} bài học & xuất bản mã chia sẻ ${code} cho học sinh!`
-                : `Synced ${classes.length} classes, ${lessons.length} lessons & published share code ${code}!`,
+                ? `Đã đồng bộ 2 chiều: ${freshClasses.length} lớp, ${freshLessons.length} bài học, ${freshSubmissions.length} bài làm học sinh & xuất bản tự động (mặc định + mã ${code})!`
+                : `Two-way sync complete: ${freshClasses.length} classes, ${freshLessons.length} lessons, ${freshSubmissions.length} student answers published (default + ${code})!`,
           });
-          window.setTimeout(() => setCloudNotice(null), 5000);
+          window.setTimeout(() => setCloudNotice(null), 6000);
         }
       } catch (err) {
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) {
@@ -280,7 +321,6 @@ export function TeacherStudio({
       lessons,
       notifications,
       onRefreshData,
-      publishLatestPublicSnapshot,
       submissions,
     ],
   );
@@ -789,11 +829,11 @@ export function TeacherStudio({
               <p className="text-[11px] text-slate-500 mt-0.5">
                 {cloudUser && shareCode
                   ? lang === 'vi'
-                    ? `Mã đồng bộ Share App: ${shareCode} · Học sinh KHÔNG cần đăng nhập Google hay kết nối Firebase.`
-                    : `Share App Sync Code: ${shareCode} · Students NEVER need Google or Firebase login.`
+                    ? `Đã tự động xuất bản lên Cloud (mặc định + mã ${shareCode}) · Học sinh mở link chính hay link lớp đều tự tải bài mới nhất và gửi điểm về mà KHÔNG cần đăng nhập.`
+                    : `Auto-published to Cloud (default + ${shareCode}) · Students opening any link auto-load latest lessons & sync scores back with ZERO login.`
                   : lang === 'vi'
-                    ? 'Học sinh KHÔNG cần đăng nhập Google hay kết nối Firebase khi làm bài.'
-                    : 'Students NEVER need Firebase or Google login to join and play.'}
+                    ? 'Học sinh mở link web sẽ tự động tải bài giáo viên đã xuất bản trên Cloud và gửi điểm về mà KHÔNG cần đăng nhập Google.'
+                    : 'Students auto-load published cloud lessons and sync scores back without Google/Firebase login.'}
               </p>
             </div>
           </div>
@@ -850,6 +890,11 @@ export function TeacherStudio({
                       type: 'err',
                       text: formatted.message,
                       suggestNewTab: formatted.suggestNewTab,
+                      unauthorizedHost:
+                        formatted.code === 'auth/unauthorized-domain' &&
+                        typeof window !== 'undefined'
+                          ? window.location.hostname
+                          : null,
                     });
                   } finally {
                     setSigningInCloud(false);
@@ -872,28 +917,23 @@ export function TeacherStudio({
           </div>
         </div>
 
-        {cloudNotice && (
-          <div
-            role={cloudNotice.type === 'err' ? 'alert' : 'status'}
-            className={`px-3.5 py-2.5 rounded-xl border text-xs font-medium flex flex-wrap items-center justify-between gap-2 ${
-              cloudNotice.type === 'ok'
-                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                : 'bg-amber-50 border-amber-200 text-amber-900'
-            }`}
-          >
-            <span>{cloudNotice.text}</span>
-            {cloudNotice.suggestNewTab && typeof window !== 'undefined' && (
-              <a
-                href={window.location.href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="font-semibold text-sky-700 hover:underline whitespace-nowrap"
-              >
-                {lang === 'vi' ? 'Mở ở tab mới →' : 'Open in new tab →'}
-              </a>
-            )}
-          </div>
-        )}
+        {cloudNotice &&
+          (cloudNotice.type === 'ok' ? (
+            <div
+              role="status"
+              className="px-3.5 py-2.5 rounded-xl border text-xs font-medium bg-emerald-50 border-emerald-200 text-emerald-800"
+            >
+              <span>{cloudNotice.text}</span>
+            </div>
+          ) : (
+            <AuthErrorBanner
+              message={cloudNotice.text}
+              lang={lang}
+              unauthorizedHost={cloudNotice.unauthorizedHost}
+              suggestNewTab={cloudNotice.suggestNewTab}
+              tone="warning"
+            />
+          ))}
       </div>
 
       {/* TAB: Google Drive Lesson Import & Backup */}

@@ -113,17 +113,48 @@
     },
     "PublicWorkspace": {
       "title": "PublicWorkspace",
-      "description": "Published classroom and lesson bundle readable by share code on the server for zero-login student tablets.",
+      "description": "Published classroom, lesson, and notification bundle readable by workspace ID (default or share code) for zero-login student tablets.",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_\\-]+$" },
         "ownerUid": { "type": "string", "maxLength": 128 },
         "classes": { "type": "array", "description": "Published classrooms (max 100)." },
         "lessons": { "type": "array", "description": "Published lessons with questions (max 100)." },
+        "notifications": { "type": "array", "description": "Published assignment push notifications (max 50)." },
         "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
         "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
       "required": ["id", "ownerUid", "classes", "lessons", "createdAt", "updatedAt"]
+    },
+    "PublicSubmission": {
+      "title": "PublicSubmission",
+      "description": "Zero-login student team answer submission scoped to a published teacher workspace for live Honor Board and Teacher analytics sync.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9_\\-]+$" },
+        "workspaceId": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_\\-]+$" },
+        "classId": { "type": "string", "maxLength": 64 },
+        "groupId": { "type": "string", "maxLength": 120 },
+        "tabletNumber": { "type": "integer" },
+        "groupName": { "type": "string", "maxLength": 80 },
+        "lessonId": { "type": "string", "maxLength": 80 },
+        "lessonTitle": { "type": "string", "maxLength": 240 },
+        "questionId": { "type": "string", "maxLength": 80 },
+        "competencyId": { "type": "string", "maxLength": 16 },
+        "competencyIds": { "type": "array" },
+        "userAnswer": { "type": "string", "maxLength": 1000 },
+        "isCorrect": { "type": "boolean" },
+        "basePoints": { "type": "integer" },
+        "speedBonus": { "type": "integer" },
+        "totalPoints": { "type": "integer" },
+        "elapsedMs": { "type": "integer" },
+        "submittedAt": { "type": "string", "maxLength": 64 },
+        "feedbackText": { "type": "string", "maxLength": 500 },
+        "explanation": { "type": "string", "maxLength": 1200 },
+        "syncedFromOffline": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "workspaceId", "classId", "groupId", "tabletNumber", "groupName", "lessonId", "lessonTitle", "questionId", "competencyId", "userAnswer", "isCorrect", "basePoints", "speedBonus", "totalPoints", "elapsedMs", "submittedAt", "feedbackText", "explanation", "createdAt"]
     }
   },
   "firestore": {
@@ -153,7 +184,11 @@
     },
     "/publicWorkspaces/{workspaceId}": {
       "schema": { "$ref": "#/entities/PublicWorkspace" },
-      "description": "Published workspace snapshots fetched by the server via share code so student tablets need no Firebase login."
+      "description": "Published workspace snapshots (default + teacher share code) fetched without login so student tablets automatically receive teacher classes, lessons, and alerts."
+    },
+    "/publicWorkspaces/{workspaceId}/submissions/{submissionId}": {
+      "schema": { "$ref": "#/entities/PublicSubmission" },
+      "description": "Zero-login student team answer submissions under a published teacher workspace for live leaderboard and teacher analytics."
     }
   }
 }
