@@ -10,3 +10,5 @@ data/
 .env*
 !.env.example
 DRAFT_firestore.rules
+!docs/
+

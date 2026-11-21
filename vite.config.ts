@@ -8,37 +8,49 @@ export default defineConfig(({command}) => {
   const buildBase = process.env.VITE_BASE_PATH || './';
   return {
     base: command === 'build' ? buildBase : '/',
+    build: {
+      outDir: 'docs',
+      emptyOutDir: true,
+    },
     plugins: [
       react(),
       tailwindcss(),
-      // Copies src/assets into dist/ and prepares GitHub Pages SPA fallback (404.html + .nojekyll).
+      // Prepares GitHub Pages SPA fallback (404.html + .nojekyll) in docs/ and mirrors to dist/ for Express production mode.
       {
-        name: 'copy-unbundled-src-assets',
+        name: 'github-pages-docs-build',
         apply: 'build',
         closeBundle(error?: Error): void {
           if (error) {
             return;
           }
+          const docsDir = path.resolve(__dirname, 'docs');
           const distDir = path.resolve(__dirname, 'dist');
           const srcAssets = path.resolve(__dirname, 'src/assets');
-          const distAssets = path.resolve(distDir, 'src/assets');
-          if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
-            fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
+
+          // Remove AI Studio chat-uploaded preview images from the published static docs/ folder
+          const chatUploadsDir = path.join(docsDir, 'assets', 'aistudio');
+          if (fs.existsSync(chatUploadsDir)) {
+            fs.rmSync(chatUploadsDir, {recursive: true, force: true});
           }
-          const indexHtml = path.join(distDir, 'index.html');
+
+          if (fs.existsSync(docsDir) && fs.existsSync(srcAssets)) {
+            fs.cpSync(srcAssets, path.join(docsDir, 'src/assets'), {
+              recursive: true,
+              force: true,
+            });
+          }
+
+          const indexHtml = path.join(docsDir, 'index.html');
           if (fs.existsSync(indexHtml)) {
-            fs.copyFileSync(indexHtml, path.join(distDir, '404.html'));
-            fs.writeFileSync(path.join(distDir, '.nojekyll'), '');
+            fs.copyFileSync(indexHtml, path.join(docsDir, '404.html'));
+            fs.writeFileSync(path.join(docsDir, '.nojekyll'), '');
           }
-          // Mirror static output into /docs so GitHub Pages can deploy from `main /docs`
-          // without needing `.github/workflows` permissions during AI Studio GitHub push.
-          const docsDir = path.resolve(__dirname, 'docs');
-          fs.rmSync(docsDir, {recursive: true, force: true});
-          fs.cpSync(distDir, docsDir, {
-            recursive: true,
-            force: true,
-            filter: (src) => !src.includes(`${path.sep}assets${path.sep}aistudio`),
-          });
+
+          // Keep dist/ mirrored so `NODE_ENV=production npm start` (Express) works seamlessly too
+          if (fs.existsSync(docsDir)) {
+            fs.rmSync(distDir, {recursive: true, force: true});
+            fs.cpSync(docsDir, distDir, {recursive: true, force: true});
+          }
         },
       },
     ],
