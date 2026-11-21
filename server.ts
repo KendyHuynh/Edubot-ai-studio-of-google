@@ -29,6 +29,24 @@ import {
 } from './src/shared/types';
 import { generateLessonQuestions, evaluateShortAnswerWithAI } from './server/gemini';
 import { loadStore, saveStore } from './server/store';
+import {
+  AdminTokenPayload,
+  checkPinRateLimit,
+  clearPinRateLimit,
+  createAdminToken,
+  ensureAdminSecurity,
+  extractBearerToken,
+  hashPinScrypt,
+  isAuthorizedAdminEmail,
+  isPinStrengthValid,
+  normalizeAdminEmails,
+  recordFailedPinAttempt,
+  verifyAdminToken,
+  verifyEnvPinConstantTime,
+  verifyFirebaseIdTokenViaRest,
+  verifyPinScrypt,
+} from './server/auth';
+import { PRIMARY_ADMIN_EMAIL } from './src/shared/seedData';
 
 dotenv.config();
 
@@ -140,14 +158,260 @@ async function startServer() {
     res.json({ ok: true, service: 'EduBot Digital Citizen' });
   });
 
+  function getAuthenticatedTeacher(req: express.Request): AdminTokenPayload | null {
+    const store = loadStore();
+    const security = ensureAdminSecurity(store.adminSecurity);
+    const token = extractBearerToken(req.headers.authorization);
+    return verifyAdminToken(token, security.tokenVersion);
+  }
+
+  function requireTeacherAuth(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ): void {
+    const authPayload = getAuthenticatedTeacher(req);
+    if (!authPayload) {
+      res.status(401).json({
+        error: 'Phiên Giáo viên / Admin đã hết hạn hoặc chưa xác thực. Vui lòng đăng nhập lại.',
+      });
+      return;
+    }
+    (req as express.Request & { teacherAuth?: AdminTokenPayload }).teacherAuth = authPayload;
+    next();
+  }
+
+  app.get('/api/teacher/auth-status', (req, res) => {
+    const store = loadStore();
+    const security = ensureAdminSecurity(store.adminSecurity);
+    const envPin = (process.env.TEACHER_PIN || '').trim();
+    const authPayload = getAuthenticatedTeacher(req);
+    const pinConfigured = Boolean(envPin) || Boolean(security.pinHash);
+
+    res.json({
+      pinConfigured,
+      pinLockedByEnv: Boolean(envPin),
+      adminOnlyMode: security.adminOnlyMode,
+      adminEmails: authPayload ? normalizeAdminEmails(security.adminEmails) : [],
+      primaryAdminEmail: PRIMARY_ADMIN_EMAIL,
+      canFirstRunSetup: !pinConfigured && !security.adminOnlyMode,
+      isAuthenticated: Boolean(authPayload),
+      authMethod: authPayload?.method ?? null,
+      adminEmail: authPayload?.email ?? null,
+    });
+  });
+
+  // One-time first-run PIN setup (locks itself permanently once claimed or when TEACHER_PIN env is set)
+  app.post('/api/teacher/setup-pin', (req, res) => {
+    const envPin = (process.env.TEACHER_PIN || '').trim();
+    const store = loadStore();
+    const security = ensureAdminSecurity(store.adminSecurity);
+
+    if (envPin || security.pinHash || security.adminOnlyMode) {
+      res.status(409).json({
+        error: 'Mã PIN Giáo viên đã được thiết lập trước đó. Vui lòng đăng nhập để đổi mã PIN.',
+      });
+      return;
+    }
+
+    const { newPin } = req.body as { newPin?: string };
+    const cleanPin = String(newPin ?? '').trim();
+    const check = isPinStrengthValid(cleanPin);
+    if (!check.valid) {
+      res.status(400).json({ error: check.reason });
+      return;
+    }
+
+    security.pinHash = hashPinScrypt(cleanPin);
+    security.tokenVersion = (security.tokenVersion || 1) + 1;
+    security.updatedAt = new Date().toISOString();
+    store.adminSecurity = security;
+    saveStore(store);
+
+    const token = createAdminToken({
+      role: 'teacher',
+      method: 'pin',
+      tv: security.tokenVersion,
+    });
+    res.json({ ok: true, token, authMethod: 'pin' });
+  });
+
   app.post('/api/teacher/verify-pin', (req, res) => {
+    const clientKey = req.ip || 'unknown';
+    const rate = checkPinRateLimit(clientKey);
+    if (!rate.allowed) {
+      res.status(429).json({
+        error: `Nhập sai quá nhiều lần. Vui lòng thử lại sau ${rate.retryAfterSeconds} giây.`,
+      });
+      return;
+    }
+
+    const store = loadStore();
+    const security = ensureAdminSecurity(store.adminSecurity);
+    if (security.adminOnlyMode) {
+      res.status(403).json({
+        error: 'Chế độ Chỉ Admin Google đang bật. Vui lòng đăng nhập bằng tài khoản Google Admin.',
+      });
+      return;
+    }
+
+    const envPin = (process.env.TEACHER_PIN || '').trim();
+    if (!envPin && !security.pinHash) {
+      res.status(409).json({
+        error: 'Chưa thiết lập mã PIN Giáo viên. Vui lòng tạo mã PIN mới hoặc đăng nhập Google Admin.',
+      });
+      return;
+    }
+
     const { pin } = req.body as { pin?: string };
-    const expectedPin = process.env.TEACHER_PIN || '2025';
-    if (String(pin ?? '').trim() !== expectedPin) {
+    const cleanPin = String(pin ?? '').trim();
+    const matched = envPin
+      ? verifyEnvPinConstantTime(cleanPin, envPin)
+      : verifyPinScrypt(cleanPin, security.pinHash);
+
+    if (!matched) {
+      recordFailedPinAttempt(clientKey);
       res.status(401).json({ error: 'Mã PIN Giáo viên chưa đúng. Vui lòng thử lại.' });
       return;
     }
-    res.json({ ok: true });
+
+    clearPinRateLimit(clientKey);
+    const token = createAdminToken({
+      role: 'teacher',
+      method: 'pin',
+      tv: security.tokenVersion,
+    });
+    res.json({ ok: true, token, authMethod: 'pin' });
+  });
+
+  app.post('/api/teacher/verify-google', async (req, res) => {
+    const { idToken } = req.body as { idToken?: string };
+    if (!idToken || typeof idToken !== 'string') {
+      res.status(400).json({ error: 'Thiếu mã xác thực Google (ID token).' });
+      return;
+    }
+
+    const cfg = readFirebaseConfig();
+    if (!cfg.apiKey) {
+      res.status(503).json({ error: 'Chưa cấu hình Firebase Auth trên máy chủ.' });
+      return;
+    }
+
+    const verified = await verifyFirebaseIdTokenViaRest(idToken, cfg.apiKey);
+    if (!verified || !verified.emailVerified) {
+      res.status(401).json({
+        error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.',
+      });
+      return;
+    }
+
+    const store = loadStore();
+    const security = ensureAdminSecurity(store.adminSecurity);
+    if (!isAuthorizedAdminEmail(verified.email, security)) {
+      res.status(403).json({
+        error: `Tài khoản ${verified.email} không có quyền Quản trị / Giáo viên. Học sinh chỉ được truy cập Cổng Học sinh.`,
+      });
+      return;
+    }
+
+    const token = createAdminToken({
+      role: 'admin',
+      method: 'google',
+      email: verified.email.toLowerCase(),
+      tv: security.tokenVersion,
+    });
+    res.json({
+      ok: true,
+      token,
+      authMethod: 'google',
+      adminEmail: verified.email.toLowerCase(),
+    });
+  });
+
+  app.post('/api/teacher/change-pin', requireTeacherAuth, (req, res) => {
+    const envPin = (process.env.TEACHER_PIN || '').trim();
+    if (envPin) {
+      res.status(400).json({
+        error: 'Mã PIN đang được khóa bằng biến môi trường TEACHER_PIN trong Settings -> Secrets. Hãy đổi giá trị TEACHER_PIN tại đó.',
+      });
+      return;
+    }
+
+    const authPayload = (req as express.Request & { teacherAuth?: AdminTokenPayload }).teacherAuth;
+    const { currentPin, newPin } = req.body as { currentPin?: string; newPin?: string };
+    const store = loadStore();
+    const security = ensureAdminSecurity(store.adminSecurity);
+
+    // Require current PIN if signed in via PIN and a PIN already exists; Google Admin can reset directly
+    if (authPayload?.method !== 'google' && security.pinHash) {
+      const okCurrent = verifyPinScrypt(String(currentPin ?? '').trim(), security.pinHash);
+      if (!okCurrent) {
+        res.status(401).json({ error: 'Mã PIN hiện tại không chính xác.' });
+        return;
+      }
+    }
+
+    const cleanNewPin = String(newPin ?? '').trim();
+    const check = isPinStrengthValid(cleanNewPin);
+    if (!check.valid) {
+      res.status(400).json({ error: check.reason });
+      return;
+    }
+
+    security.pinHash = hashPinScrypt(cleanNewPin);
+    security.tokenVersion = (security.tokenVersion || 1) + 1;
+    security.updatedAt = new Date().toISOString();
+    store.adminSecurity = security;
+    saveStore(store);
+
+    const freshToken = createAdminToken({
+      role: authPayload?.role ?? 'teacher',
+      method: authPayload?.method ?? 'pin',
+      email: authPayload?.email,
+      tv: security.tokenVersion,
+    });
+
+    res.json({
+      ok: true,
+      token: freshToken,
+      message: 'Đã cập nhật mã PIN Giáo viên mới và vô hiệu hóa các phiên đăng nhập cũ.',
+    });
+  });
+
+  app.put('/api/teacher/security-settings', requireTeacherAuth, (req, res) => {
+    const authPayload = (req as express.Request & { teacherAuth?: AdminTokenPayload }).teacherAuth;
+    const { adminOnlyMode, adminEmails } = req.body as {
+      adminOnlyMode?: boolean;
+      adminEmails?: string[];
+    };
+    const store = loadStore();
+    const security = ensureAdminSecurity(store.adminSecurity);
+
+    if (typeof adminOnlyMode === 'boolean') {
+      security.adminOnlyMode = adminOnlyMode;
+    }
+    if (Array.isArray(adminEmails)) {
+      security.adminEmails = normalizeAdminEmails(adminEmails);
+    }
+    security.tokenVersion = (security.tokenVersion || 1) + 1;
+    security.updatedAt = new Date().toISOString();
+    store.adminSecurity = security;
+    saveStore(store);
+
+    const freshToken = createAdminToken({
+      role: authPayload?.role ?? 'admin',
+      method: authPayload?.method ?? 'google',
+      email: authPayload?.email,
+      tv: security.tokenVersion,
+    });
+
+    res.json({
+      ok: true,
+      token: freshToken,
+      adminOnlyMode: security.adminOnlyMode,
+      adminEmails: security.adminEmails,
+      primaryAdminEmail: PRIMARY_ADMIN_EMAIL,
+    });
   });
 
   // Bootstrap state for a class & role (also hydrates server store if ?ws= share code is passed)
@@ -160,7 +424,8 @@ async function startServer() {
     const store = loadStore();
     const classId = typeof req.query.classId === 'string' ? req.query.classId : '';
     const lang = (req.query.lang === 'en' ? 'en' : 'vi') as Language;
-    const includeAnswers = req.query.role === 'teacher';
+    const teacherAuth = getAuthenticatedTeacher(req);
+    const includeAnswers = req.query.role === 'teacher' && Boolean(teacherAuth);
 
     const sanitizedLessons = store.lessons.map((lesson) => ({
       ...lesson,
@@ -205,8 +470,8 @@ async function startServer() {
     });
   });
 
-  // Export/Import full classes + lessons package (zero-login transfer between Dev and Shared App)
-  app.get('/api/workspace/export', (_req, res) => {
+  // Export/Import full classes + lessons package (Teacher-authenticated only)
+  app.get('/api/workspace/export', requireTeacherAuth, (_req, res) => {
     const store = loadStore();
     res.json({
       exportedAt: new Date().toISOString(),
@@ -215,7 +480,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/workspace/import', (req, res) => {
+  app.post('/api/workspace/import', requireTeacherAuth, (req, res) => {
     const payload = req.body as {
       classes?: ClassRoom[];
       lessons?: Lesson[];
@@ -255,7 +520,7 @@ async function startServer() {
   });
 
   // Create or update a classroom
-  app.post('/api/classes', (req, res) => {
+  app.post('/api/classes', requireTeacherAuth, (req, res) => {
     const { id, name, grade, teacherName } = req.body as Partial<ClassRoom>;
     const cleanId = normalizeClassCode(id ?? '');
     if (!cleanId || !name?.trim()) {
@@ -286,7 +551,7 @@ async function startServer() {
   });
 
   // Update an existing classroom (with optional class code rename cascade)
-  app.put('/api/classes/:id', (req, res) => {
+  app.put('/api/classes/:id', requireTeacherAuth, (req, res) => {
     const oldId = decodeURIComponent(req.params.id);
     const { newId, name, grade, teacherName } = req.body as Partial<ClassRoom> & {
       newId?: string;
@@ -351,7 +616,7 @@ async function startServer() {
   });
 
   // Delete a classroom
-  app.delete('/api/classes/:id', (req, res) => {
+  app.delete('/api/classes/:id', requireTeacherAuth, (req, res) => {
     const classId = decodeURIComponent(req.params.id);
     const store = loadStore();
     const exists = store.classes.some((c) => c.id === classId);
@@ -374,7 +639,7 @@ async function startServer() {
   });
 
   // Step 2: Upload lesson text/file and generate 24-competency quiz with Gemini
-  app.post('/api/lessons/generate', async (req, res) => {
+  app.post('/api/lessons/generate', requireTeacherAuth, async (req, res) => {
     const {
       title,
       sourceFileName,
@@ -468,7 +733,7 @@ async function startServer() {
   });
 
   // Update an existing lesson and its full questions list
-  app.put('/api/lessons/:id', (req, res) => {
+  app.put('/api/lessons/:id', requireTeacherAuth, (req, res) => {
     const lessonId = req.params.id;
     const { title, topic, summary, assignedClassIds, questions } = req.body as Partial<Lesson>;
 
@@ -544,7 +809,7 @@ async function startServer() {
   });
 
   // Merge cloud Firestore state into local server store for 10 shared student tablets
-  app.post('/api/sync/cloud-hydrate', (req, res) => {
+  app.post('/api/sync/cloud-hydrate', requireTeacherAuth, (req, res) => {
     const payload = req.body as {
       classes?: ClassRoom[];
       lessons?: Lesson[];
@@ -619,7 +884,7 @@ async function startServer() {
   });
 
   // Reuse an existing lesson across additional classes + push notification
-  app.post('/api/lessons/:id/assign', (req, res) => {
+  app.post('/api/lessons/:id/assign', requireTeacherAuth, (req, res) => {
     const lessonId = req.params.id;
     const { classIds } = req.body as { classIds: string[] };
     const store = loadStore();
@@ -651,7 +916,7 @@ async function startServer() {
     res.json({ lesson });
   });
 
-  app.delete('/api/lessons/:id', (req, res) => {
+  app.delete('/api/lessons/:id', requireTeacherAuth, (req, res) => {
     const store = loadStore();
     store.lessons = store.lessons.filter((l) => l.id !== req.params.id);
     saveStore(store);

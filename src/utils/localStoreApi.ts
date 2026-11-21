@@ -8,7 +8,13 @@ import {
   formatGroupId,
   isAnswerMatch,
 } from '../shared/scoring';
-import { createSeedData, StoreData } from '../shared/seedData';
+import {
+  AdminSecurityConfig,
+  createDefaultAdminSecurity,
+  createSeedData,
+  PRIMARY_ADMIN_EMAIL,
+  StoreData,
+} from '../shared/seedData';
 import {
   ActivityLog,
   AnswerSubmission,
@@ -25,8 +31,101 @@ import {
   fromFirestoreRestValue,
   normalizeClassCode,
 } from './firestoreHelpers';
+import {
+  hashPinWebCrypto,
+  validateTeacherPin,
+  verifyPinWebCrypto,
+} from './pinCrypto';
 
 const STATIC_STORE_KEY = 'edubot_static_store_v1';
+
+interface LocalAdminSession {
+  role: 'admin' | 'teacher';
+  method: 'pin' | 'google';
+  email?: string;
+  tv: number;
+  exp: number;
+}
+
+const localSessions = new Map<string, LocalAdminSession>();
+let localFailedPinCount = 0;
+let localPinLockUntil = 0;
+
+function ensureLocalAdminSecurity(existing?: AdminSecurityConfig): AdminSecurityConfig {
+  // Static/GitHub Pages defaults to Admin-Only Google mode so students on shared tablets
+  // cannot hijack first-run PIN setup on a fresh browser.
+  const base = createDefaultAdminSecurity(true);
+  if (!existing) return base;
+  const emails = new Set<string>([PRIMARY_ADMIN_EMAIL.toLowerCase()]);
+  for (const e of existing.adminEmails ?? []) {
+    const clean = String(e || '').trim().toLowerCase();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean)) emails.add(clean);
+  }
+  return {
+    pinHash: existing.pinHash,
+    adminOnlyMode: Boolean(existing.adminOnlyMode),
+    adminEmails: Array.from(emails),
+    tokenVersion:
+      typeof existing.tokenVersion === 'number' && existing.tokenVersion >= 1
+        ? existing.tokenVersion
+        : 1,
+    updatedAt: existing.updatedAt,
+  };
+}
+
+function issueLocalToken(session: Omit<LocalAdminSession, 'exp'>): string {
+  const bytes = new Uint8Array(24);
+  globalThis.crypto.getRandomValues(bytes);
+  const token = `local_${Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')}`;
+  localSessions.set(token, {
+    ...session,
+    exp: Date.now() + 12 * 60 * 60 * 1000,
+  });
+  return token;
+}
+
+function verifyLocalToken(
+  token: string | undefined,
+  expectedTv: number,
+): LocalAdminSession | null {
+  if (!token) return null;
+  const rec = localSessions.get(token);
+  if (!rec) return null;
+  if (rec.exp < Date.now() || rec.tv !== expectedTv) {
+    localSessions.delete(token);
+    return null;
+  }
+  return rec;
+}
+
+async function verifyGoogleIdTokenStatic(
+  idToken: string,
+): Promise<{ email: string; emailVerified: boolean } | null> {
+  if (!idToken || !firebaseConfig?.apiKey) return null;
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
+        firebaseConfig.apiKey,
+      )}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      },
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      users?: Array<{ email?: string; emailVerified?: boolean }>;
+    };
+    const u = data.users?.[0];
+    if (!u?.email) return null;
+    return { email: u.email.toLowerCase(), emailVerified: Boolean(u.emailVerified) };
+  } catch {
+    return null;
+  }
+}
 
 export interface StorageLike {
   getItem(key: string): string | null;
@@ -272,7 +371,7 @@ export interface LocalApiResult {
 
 export async function handleLocalApi(
   url: string,
-  options: { method?: string; body?: unknown } = {},
+  options: { method?: string; body?: unknown; authToken?: string } = {},
   storage: StorageLike = defaultStorage,
 ): Promise<LocalApiResult> {
   const method = (options.method || 'GET').toUpperCase();
@@ -283,17 +382,234 @@ export async function handleLocalApi(
       ? JSON.parse(options.body || '{}')
       : (options.body ?? {});
 
+  const getLocalAuth = (store: StoreData): LocalAdminSession | null => {
+    const sec = ensureLocalAdminSecurity(store.adminSecurity);
+    return verifyLocalToken(options.authToken, sec.tokenVersion);
+  };
+
+  // GET /api/teacher/auth-status
+  if (pathname === '/api/teacher/auth-status' && method === 'GET') {
+    const store = loadLocalStore(storage);
+    const sec = ensureLocalAdminSecurity(store.adminSecurity);
+    const auth = verifyLocalToken(options.authToken, sec.tokenVersion);
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        pinConfigured: Boolean(sec.pinHash),
+        pinLockedByEnv: false,
+        adminOnlyMode: sec.adminOnlyMode,
+        adminEmails: auth ? sec.adminEmails : [],
+        primaryAdminEmail: PRIMARY_ADMIN_EMAIL,
+        // Never allow anonymous first-run PIN setup on static GitHub Pages browsers
+        canFirstRunSetup: false,
+        isAuthenticated: Boolean(auth),
+        authMethod: auth?.method ?? null,
+        adminEmail: auth?.email ?? null,
+      },
+    };
+  }
+
+  // POST /api/teacher/setup-pin (disabled on static host — require Google Admin first)
+  if (pathname === '/api/teacher/setup-pin' && method === 'POST') {
+    return {
+      ok: false,
+      status: 403,
+      data: {
+        error:
+          'Trên chế độ tĩnh (GitHub Pages), vui lòng đăng nhập bằng tài khoản Google Admin để thiết lập hoặc đổi mã PIN.',
+      },
+    };
+  }
+
   // POST /api/teacher/verify-pin
   if (pathname === '/api/teacher/verify-pin' && method === 'POST') {
+    if (localPinLockUntil > Date.now()) {
+      const wait = Math.ceil((localPinLockUntil - Date.now()) / 1000);
+      return {
+        ok: false,
+        status: 429,
+        data: { error: `Nhập sai quá nhiều lần. Vui lòng thử lại sau ${wait} giây.` },
+      };
+    }
+    const store = loadLocalStore(storage);
+    const sec = ensureLocalAdminSecurity(store.adminSecurity);
+    if (sec.adminOnlyMode || !sec.pinHash) {
+      return {
+        ok: false,
+        status: 403,
+        data: {
+          error:
+            'Chế độ Chỉ Admin Google đang bật. Vui lòng đăng nhập bằng tài khoản Google Admin.',
+        },
+      };
+    }
     const pin = String((body as { pin?: string }).pin ?? '').trim();
-    if (pin !== '2025') {
+    const ok = await verifyPinWebCrypto(pin, sec.pinHash);
+    if (!ok) {
+      localFailedPinCount += 1;
+      if (localFailedPinCount >= 5) {
+        localPinLockUntil = Date.now() + 60_000;
+      }
       return {
         ok: false,
         status: 401,
         data: { error: 'Mã PIN Giáo viên chưa đúng. Vui lòng thử lại.' },
       };
     }
-    return { ok: true, status: 200, data: { ok: true } };
+    localFailedPinCount = 0;
+    localPinLockUntil = 0;
+    const token = issueLocalToken({
+      role: 'teacher',
+      method: 'pin',
+      tv: sec.tokenVersion,
+    });
+    return { ok: true, status: 200, data: { ok: true, token, authMethod: 'pin' } };
+  }
+
+  // POST /api/teacher/verify-google
+  if (pathname === '/api/teacher/verify-google' && method === 'POST') {
+    const { idToken } = body as { idToken?: string };
+    if (!idToken) {
+      return {
+        ok: false,
+        status: 400,
+        data: { error: 'Thiếu mã xác thực Google.' },
+      };
+    }
+    const verified = await verifyGoogleIdTokenStatic(idToken);
+    if (!verified || !verified.emailVerified) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.' },
+      };
+    }
+    const store = loadLocalStore(storage);
+    const sec = ensureLocalAdminSecurity(store.adminSecurity);
+    if (!sec.adminEmails.includes(verified.email)) {
+      return {
+        ok: false,
+        status: 403,
+        data: {
+          error: `Tài khoản ${verified.email} không có quyền Quản trị / Giáo viên. Học sinh chỉ được truy cập Cổng Học sinh.`,
+        },
+      };
+    }
+    const token = issueLocalToken({
+      role: 'admin',
+      method: 'google',
+      email: verified.email,
+      tv: sec.tokenVersion,
+    });
+    return {
+      ok: true,
+      status: 200,
+      data: { ok: true, token, authMethod: 'google', adminEmail: verified.email },
+    };
+  }
+
+  // POST /api/teacher/change-pin
+  if (pathname === '/api/teacher/change-pin' && method === 'POST') {
+    const store = loadLocalStore(storage);
+    const sec = ensureLocalAdminSecurity(store.adminSecurity);
+    const auth = verifyLocalToken(options.authToken, sec.tokenVersion);
+    if (!auth) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Vui lòng đăng nhập Giáo viên / Admin trước.' },
+      };
+    }
+    const { currentPin, newPin } = body as { currentPin?: string; newPin?: string };
+    if (auth.method !== 'google' && sec.pinHash) {
+      const okCurrent = await verifyPinWebCrypto(
+        String(currentPin ?? '').trim(),
+        sec.pinHash,
+      );
+      if (!okCurrent) {
+        return {
+          ok: false,
+          status: 401,
+          data: { error: 'Mã PIN hiện tại không chính xác.' },
+        };
+      }
+    }
+    const cleanNewPin = String(newPin ?? '').trim();
+    const check = validateTeacherPin(cleanNewPin, 'vi');
+    if (!check.valid) {
+      return { ok: false, status: 400, data: { error: check.reason } };
+    }
+    sec.pinHash = await hashPinWebCrypto(cleanNewPin);
+    sec.tokenVersion += 1;
+    sec.updatedAt = new Date().toISOString();
+    store.adminSecurity = sec;
+    saveLocalStore(store, storage);
+    const freshToken = issueLocalToken({
+      role: auth.role,
+      method: auth.method,
+      email: auth.email,
+      tv: sec.tokenVersion,
+    });
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        ok: true,
+        token: freshToken,
+        message: 'Đã cập nhật mã PIN Giáo viên mới thành công.',
+      },
+    };
+  }
+
+  // PUT /api/teacher/security-settings
+  if (pathname === '/api/teacher/security-settings' && method === 'PUT') {
+    const store = loadLocalStore(storage);
+    const sec = ensureLocalAdminSecurity(store.adminSecurity);
+    const auth = verifyLocalToken(options.authToken, sec.tokenVersion);
+    if (!auth) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Vui lòng đăng nhập Giáo viên / Admin trước.' },
+      };
+    }
+    const { adminOnlyMode, adminEmails } = body as {
+      adminOnlyMode?: boolean;
+      adminEmails?: string[];
+    };
+    if (typeof adminOnlyMode === 'boolean') {
+      sec.adminOnlyMode = adminOnlyMode;
+    }
+    if (Array.isArray(adminEmails)) {
+      const set = new Set<string>([PRIMARY_ADMIN_EMAIL.toLowerCase()]);
+      for (const e of adminEmails) {
+        const clean = String(e || '').trim().toLowerCase();
+        if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean)) set.add(clean);
+      }
+      sec.adminEmails = Array.from(set);
+    }
+    sec.tokenVersion += 1;
+    sec.updatedAt = new Date().toISOString();
+    store.adminSecurity = sec;
+    saveLocalStore(store, storage);
+    const freshToken = issueLocalToken({
+      role: auth.role,
+      method: auth.method,
+      email: auth.email,
+      tv: sec.tokenVersion,
+    });
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        ok: true,
+        token: freshToken,
+        adminOnlyMode: sec.adminOnlyMode,
+        adminEmails: sec.adminEmails,
+        primaryAdminEmail: PRIMARY_ADMIN_EMAIL,
+      },
+    };
   }
 
   // GET /api/bootstrap
@@ -306,7 +622,8 @@ export async function handleLocalApi(
     const store = loadLocalStore(storage);
     const classId = parsedUrl.searchParams.get('classId') || '';
     const lang = (parsedUrl.searchParams.get('lang') === 'en' ? 'en' : 'vi') as Language;
-    const includeAnswers = parsedUrl.searchParams.get('role') === 'teacher';
+    const includeAnswers =
+      parsedUrl.searchParams.get('role') === 'teacher' && Boolean(getLocalAuth(store));
 
     const sanitizedLessons = store.lessons.map((lesson) => ({
       ...lesson,
@@ -347,6 +664,26 @@ export async function handleLocalApi(
         ...(includeAnswers ? { submissions: store.submissions } : {}),
       },
     };
+  }
+
+  const isTeacherOnlyPath =
+    pathname.startsWith('/api/workspace/') ||
+    pathname === '/api/sync/cloud-hydrate' ||
+    pathname.startsWith('/api/classes') ||
+    pathname.startsWith('/api/lessons');
+
+  if (isTeacherOnlyPath) {
+    const authStore = loadLocalStore(storage);
+    if (!getLocalAuth(authStore)) {
+      return {
+        ok: false,
+        status: 401,
+        data: {
+          error:
+            'Phiên Giáo viên / Admin chưa xác thực. Vui lòng đăng nhập lại.',
+        },
+      };
+    }
   }
 
   // GET /api/workspace/export

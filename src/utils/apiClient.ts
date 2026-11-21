@@ -1,4 +1,5 @@
 import { Language } from '../shared/types';
+import { getAdminToken } from './authSession';
 import { handleLocalApi } from './localStoreApi';
 import { HtmlInsteadOfJsonError, readJsonSafe } from './safeJson';
 
@@ -24,6 +25,7 @@ export interface ApiJsonResponse<T> {
 
 /**
  * Transparent API client:
+ * - Attaches in-memory Teacher/Admin Authorization Bearer token when authenticated.
  * - Uses Express `/api/*` when running with a backend (AI Studio, Cloud Run, Render, local dev).
  * - Automatically falls back to browser-local `localStoreApi` on static hosts (GitHub Pages, `vite preview`).
  */
@@ -32,10 +34,18 @@ export async function apiRequestJson<T = unknown>(
   init: RequestInit = {},
   lang: Language = 'vi',
 ): Promise<ApiJsonResponse<T>> {
+  const token = getAdminToken();
+  const headers = new Headers(init.headers ?? {});
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  const authedInit: RequestInit = { ...init, headers };
+
   if (isStaticHostingEnvironment()) {
     const local = await handleLocalApi(url, {
-      method: init.method,
-      body: init.body,
+      method: authedInit.method,
+      body: authedInit.body,
+      authToken: token ?? undefined,
     });
     return {
       ok: local.ok,
@@ -46,7 +56,7 @@ export async function apiRequestJson<T = unknown>(
   }
 
   try {
-    const res = await fetch(url, init);
+    const res = await fetch(url, authedInit);
     const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
 
     // Static hosts return 404/405 or HTML (index.html / 404.html) for /api/*
@@ -57,8 +67,9 @@ export async function apiRequestJson<T = unknown>(
     ) {
       detectedStaticHost = true;
       const local = await handleLocalApi(url, {
-        method: init.method,
-        body: init.body,
+        method: authedInit.method,
+        body: authedInit.body,
+        authToken: token ?? undefined,
       });
       return {
         ok: local.ok,
@@ -79,8 +90,9 @@ export async function apiRequestJson<T = unknown>(
     if (err instanceof HtmlInsteadOfJsonError) {
       detectedStaticHost = true;
       const local = await handleLocalApi(url, {
-        method: init.method,
-        body: init.body,
+        method: authedInit.method,
+        body: authedInit.body,
+        authToken: token ?? undefined,
       });
       return {
         ok: local.ok,

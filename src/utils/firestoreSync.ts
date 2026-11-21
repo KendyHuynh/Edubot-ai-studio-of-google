@@ -29,6 +29,16 @@ import { app, auth } from './googleDrive';
 
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
+function isActiveOwner(ownerUid: string): boolean {
+  const current = auth.currentUser;
+  return Boolean(current && current.uid === ownerUid && current.emailVerified);
+}
+
+function isSignedInVerified(): boolean {
+  const current = auth.currentUser;
+  return Boolean(current && current.emailVerified);
+}
+
 export enum OperationType {
   CREATE = 'create',
   UPDATE = 'update',
@@ -104,10 +114,12 @@ export async function testFirestoreConnection(): Promise<boolean> {
 }
 
 export async function syncUserProfileToFirestore(user: User): Promise<void> {
+  if (!isActiveOwner(user.uid)) return;
   const path = `users/${user.uid}`;
   try {
     const ref = doc(db, 'users', user.uid);
     const snap = await getDoc(ref);
+    if (!isActiveOwner(user.uid)) return;
     const displayName = (user.displayName || user.email || 'Giáo viên').slice(0, 120);
     const email = (user.email || '').slice(0, 200);
     if (!snap.exists()) {
@@ -127,6 +139,7 @@ export async function syncUserProfileToFirestore(user: User): Promise<void> {
       });
     }
   } catch (error) {
+    if (!isActiveOwner(user.uid)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
@@ -135,11 +148,13 @@ export async function saveClassToFirestore(
   cls: ClassRoom,
   ownerUid: string,
 ): Promise<void> {
+  if (!isActiveOwner(ownerUid)) return;
   const docId = toFirestoreDocId(cls.id, 64);
   const path = `classes/${docId}`;
   try {
     const ref = doc(db, 'classes', docId);
     const snap = await getDoc(ref);
+    if (!isActiveOwner(ownerUid)) return;
     const mutable = {
       name: (cls.name || docId).slice(0, 160),
       grade: (cls.grade || 'Khối 5').slice(0, 60),
@@ -157,16 +172,19 @@ export async function saveClassToFirestore(
       await updateDoc(ref, mutable);
     }
   } catch (error) {
+    if (!isActiveOwner(ownerUid)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
 
 export async function deleteClassFromFirestore(classId: string): Promise<void> {
+  if (!isSignedInVerified()) return;
   const docId = toFirestoreDocId(classId, 64);
   const path = `classes/${docId}`;
   try {
     await deleteDoc(doc(db, 'classes', docId));
   } catch (error) {
+    if (!isSignedInVerified()) return;
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
@@ -175,11 +193,13 @@ export async function saveLessonToFirestore(
   lesson: Lesson,
   ownerUid: string,
 ): Promise<void> {
+  if (!isActiveOwner(ownerUid)) return;
   const docId = toFirestoreDocId(lesson.id, 80);
   const path = `lessons/${docId}`;
   try {
     const ref = doc(db, 'lessons', docId);
     const snap = await getDoc(ref);
+    if (!isActiveOwner(ownerUid)) return;
     const mutable = sanitizeLessonFieldsForFirestore(lesson, docId);
     if (!snap.exists()) {
       await setDoc(ref, {
@@ -196,16 +216,19 @@ export async function saveLessonToFirestore(
       });
     }
   } catch (error) {
+    if (!isActiveOwner(ownerUid)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
 
 export async function deleteLessonFromFirestore(lessonId: string): Promise<void> {
+  if (!isSignedInVerified()) return;
   const docId = toFirestoreDocId(lessonId, 80);
   const path = `lessons/${docId}`;
   try {
     await deleteDoc(doc(db, 'lessons', docId));
   } catch (error) {
+    if (!isSignedInVerified()) return;
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
@@ -214,11 +237,13 @@ export async function saveSubmissionToFirestore(
   sub: AnswerSubmission,
   ownerUid: string,
 ): Promise<void> {
+  if (!isActiveOwner(ownerUid)) return;
   const docId = toFirestoreDocId(sub.id, 80);
   const path = `submissions/${docId}`;
   try {
     const ref = doc(db, 'submissions', docId);
     const snap = await getDoc(ref);
+    if (!isActiveOwner(ownerUid)) return;
     const mutable = {
       userAnswer: (sub.userAnswer ?? '').slice(0, 1000),
       isCorrect: Boolean(sub.isCorrect),
@@ -251,6 +276,7 @@ export async function saveSubmissionToFirestore(
       await updateDoc(ref, mutable);
     }
   } catch (error) {
+    if (!isActiveOwner(ownerUid)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
@@ -259,11 +285,13 @@ export async function saveNotificationToFirestore(
   notif: PushNotification,
   ownerUid: string,
 ): Promise<void> {
+  if (!isActiveOwner(ownerUid)) return;
   const docId = toFirestoreDocId(notif.id, 80);
   const path = `notifications/${docId}`;
   try {
     const ref = doc(db, 'notifications', docId);
     const snap = await getDoc(ref);
+    if (!isActiveOwner(ownerUid)) return;
     if (!snap.exists()) {
       await setDoc(ref, {
         id: docId,
@@ -281,6 +309,7 @@ export async function saveNotificationToFirestore(
       });
     }
   } catch (error) {
+    if (!isActiveOwner(ownerUid)) return;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
@@ -288,13 +317,22 @@ export async function saveNotificationToFirestore(
 export async function saveActivityLogToFirestore(
   log: ActivityLog,
   ownerUid: string,
+  knownExists?: boolean,
 ): Promise<void> {
+  if (!isActiveOwner(ownerUid)) return;
+  if (knownExists === true) return; // activityLogs are immutable once created
   const docId = toFirestoreDocId(log.id, 80);
   const path = `activityLogs/${docId}`;
   try {
     const ref = doc(db, 'activityLogs', docId);
-    const snap = await getDoc(ref);
-    if (!snap.exists()) {
+    let shouldCreate = knownExists === false;
+    if (knownExists === undefined) {
+      const snap = await getDoc(ref);
+      if (!isActiveOwner(ownerUid)) return;
+      shouldCreate = !snap.exists();
+    }
+    if (shouldCreate) {
+      if (!isActiveOwner(ownerUid)) return;
       await setDoc(ref, {
         id: docId,
         ownerUid,
@@ -302,8 +340,8 @@ export async function saveActivityLogToFirestore(
         groupId: (log.groupId || 'Hệ thống').slice(0, 120),
         action: (log.action || 'Hoạt động').slice(0, 120),
         detail: (log.detail || '').slice(0, 500),
-        ...(log.competencyId ? { competencyId: log.competencyId.slice(0, 16) } : {}),
-        ...(typeof log.pointsDelta === 'number'
+        ...(log.competencyId ? { competencyId: String(log.competencyId).slice(0, 16) } : {}),
+        ...(typeof log.pointsDelta === 'number' && Number.isFinite(log.pointsDelta)
           ? { pointsDelta: Math.round(log.pointsDelta) }
           : {}),
         timestamp: (log.timestamp || new Date().toISOString()).slice(0, 64),
@@ -311,6 +349,7 @@ export async function saveActivityLogToFirestore(
       });
     }
   } catch (error) {
+    if (!isActiveOwner(ownerUid)) return;
     handleFirestoreError(error, OperationType.CREATE, path);
   }
 }
@@ -330,6 +369,9 @@ export async function fetchTeacherCloudData(ownerUid: string): Promise<{
   notifications: PushNotification[];
   activityLogs: ActivityLog[];
 }> {
+  if (!isActiveOwner(ownerUid)) {
+    return { classes: [], lessons: [], submissions: [], notifications: [], activityLogs: [] };
+  }
   try {
     const [clsSnap, lesSnap, subSnap, notifSnap, logSnap] = await Promise.all([
       getDocs(query(collection(db, 'classes'), where('ownerUid', '==', ownerUid))),
@@ -419,6 +461,9 @@ export async function fetchTeacherCloudData(ownerUid: string): Promise<{
 
     return { classes, lessons, submissions, notifications, activityLogs };
   } catch (error) {
+    if (!isActiveOwner(ownerUid)) {
+      return { classes: [], lessons: [], submissions: [], notifications: [], activityLogs: [] };
+    }
     handleFirestoreError(error, OperationType.LIST, 'teacher_workspace');
   }
 }
@@ -432,21 +477,29 @@ export async function pushWorkspaceToFirestore(
     notifications: PushNotification[];
     activityLogs: ActivityLog[];
   },
+  existingLogIds?: Set<string>,
 ): Promise<void> {
   for (const cls of payload.classes) {
+    if (!isActiveOwner(ownerUid)) return;
     await saveClassToFirestore(cls, ownerUid);
   }
   for (const lesson of payload.lessons) {
+    if (!isActiveOwner(ownerUid)) return;
     await saveLessonToFirestore(lesson, ownerUid);
   }
   for (const sub of payload.submissions.slice(0, 40)) {
+    if (!isActiveOwner(ownerUid)) return;
     await saveSubmissionToFirestore(sub, ownerUid);
   }
   for (const notif of payload.notifications.slice(0, 20)) {
+    if (!isActiveOwner(ownerUid)) return;
     await saveNotificationToFirestore(notif, ownerUid);
   }
   for (const log of payload.activityLogs.slice(0, 30)) {
-    await saveActivityLogToFirestore(log, ownerUid);
+    if (!isActiveOwner(ownerUid)) return;
+    const docId = toFirestoreDocId(log.id, 80);
+    const knownExists = existingLogIds ? existingLogIds.has(docId) : undefined;
+    await saveActivityLogToFirestore(log, ownerUid, knownExists);
   }
 }
 
@@ -461,10 +514,12 @@ export async function publishPublicWorkspace(
   lessons: Lesson[],
 ): Promise<string> {
   const docId = toFirestoreDocId(workspaceCode, 64);
+  if (!isActiveOwner(ownerUid)) return docId;
   const path = `publicWorkspaces/${docId}`;
   try {
     const ref = doc(db, 'publicWorkspaces', docId);
     const snap = await getDoc(ref);
+    if (!isActiveOwner(ownerUid)) return docId;
     const cleanClasses = classes.slice(0, 100).map((c) => ({
       id: String(c.id).slice(0, 64),
       name: String(c.name || c.id).slice(0, 160),
@@ -499,6 +554,7 @@ export async function publishPublicWorkspace(
     }
     return docId;
   } catch (error) {
+    if (!isActiveOwner(ownerUid)) return docId;
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }

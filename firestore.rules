@@ -185,7 +185,7 @@ service cloud.firestore {
 
     // Classrooms
     match /classes/{classId} {
-      allow get: if isValidId(classId) && isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow get: if isValidId(classId) && isSignedIn() && (resource == null || existing().ownerUid == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
       allow create: if isValidId(classId)
         && isVerifiedUser()
@@ -210,7 +210,7 @@ service cloud.firestore {
 
     // Lessons & 15+ Questions
     match /lessons/{lessonId} {
-      allow get: if isValidId(lessonId) && isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow get: if isValidId(lessonId) && isSignedIn() && (resource == null || existing().ownerUid == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
       allow create: if isValidId(lessonId)
         && isVerifiedUser()
@@ -235,7 +235,7 @@ service cloud.firestore {
 
     // Student Submissions Synced to Teacher Workspace
     match /submissions/{submissionId} {
-      allow get: if isValidId(submissionId) && isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow get: if isValidId(submissionId) && isSignedIn() && (resource == null || existing().ownerUid == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
       allow create: if isValidId(submissionId)
         && isVerifiedUser()
@@ -258,7 +258,7 @@ service cloud.firestore {
 
     // Assignment Notifications
     match /notifications/{notificationId} {
-      allow get: if isValidId(notificationId) && isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow get: if isValidId(notificationId) && isSignedIn() && (resource == null || existing().ownerUid == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
       allow create: if isValidId(notificationId)
         && isVerifiedUser()
@@ -281,7 +281,7 @@ service cloud.firestore {
 
     // Activity Logs
     match /activityLogs/{logId} {
-      allow get: if isValidId(logId) && isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow get: if isValidId(logId) && isSignedIn() && (resource == null || existing().ownerUid == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
       allow create: if isValidId(logId)
         && isVerifiedUser()

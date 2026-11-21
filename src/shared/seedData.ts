@@ -7,12 +7,31 @@ import {
 } from './types';
 import { formatGroupId } from './scoring';
 
+export const PRIMARY_ADMIN_EMAIL = 'huynh.nhu.y1601@gmail.com';
+
+export interface AdminSecurityConfig {
+  pinHash?: string;
+  adminOnlyMode: boolean;
+  adminEmails: string[];
+  tokenVersion: number;
+  updatedAt?: string;
+}
+
+export function createDefaultAdminSecurity(adminOnlyMode = false): AdminSecurityConfig {
+  return {
+    adminOnlyMode,
+    adminEmails: [PRIMARY_ADMIN_EMAIL],
+    tokenVersion: 1,
+  };
+}
+
 export interface StoreData {
   classes: ClassRoom[];
   lessons: Lesson[];
   submissions: AnswerSubmission[];
   notifications: PushNotification[];
   activityLogs: ActivityLog[];
+  adminSecurity?: AdminSecurityConfig;
 }
 
 export function createSeedData(): StoreData {

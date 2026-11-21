@@ -39,6 +39,7 @@ import {
   syncOfflineQueueToServer,
 } from './utils/offlineSync';
 import { apiRequestJson } from './utils/apiClient';
+import { clearAdminSession, getAdminToken } from './utils/authSession';
 import { AppPortal, parseEntryParams } from './utils/routing';
 
 interface BootstrapResponse {
@@ -53,7 +54,6 @@ interface BootstrapResponse {
   sharedAppUrl?: string;
 }
 
-const TEACHER_UNLOCK_KEY = 'edubot_teacher_unlocked_v1';
 const WORKSPACE_CODE_KEY = 'edubot_ws_code_v1';
 
 export default function App() {
@@ -64,10 +64,13 @@ export default function App() {
     parseEntryParams(window.location.pathname, window.location.search, window.location.hash),
   );
   const [portal, setPortal] = useState<AppPortal>(() => entryParams.portal);
-  const [teacherUnlocked, setTeacherUnlocked] = useState<boolean>(
-    () =>
-      typeof window !== 'undefined' &&
-      window.sessionStorage.getItem(TEACHER_UNLOCK_KEY) === '1',
+  // Keep Teacher/Admin session strictly in JS memory (never persisted in sessionStorage/localStorage)
+  const [teacherUnlocked, setTeacherUnlocked] = useState<boolean>(() =>
+    Boolean(getAdminToken()),
+  );
+  // Hide the Teacher Portal link completely when students open a shared class/tablet join link
+  const isLockedStudentLink = Boolean(
+    entryParams.classId || entryParams.tabletNumber || entryParams.workspaceCode,
   );
 
   const [session, setSession] = useState<SessionIdentity | null>(() => {
@@ -370,13 +373,12 @@ export default function App() {
   };
 
   const handleTeacherUnlocked = () => {
-    window.sessionStorage.setItem(TEACHER_UNLOCK_KEY, '1');
     setTeacherUnlocked(true);
     setActiveTab('teacher');
   };
 
   const handleLockTeacherPortal = () => {
-    window.sessionStorage.removeItem(TEACHER_UNLOCK_KEY);
+    clearAdminSession();
     setTeacherUnlocked(false);
   };
 
@@ -619,18 +621,20 @@ export default function App() {
                 ? 'Giao diện Học sinh · Công dân số TT 02/2025'
                 : 'Student Portal · Digital Citizenship'}
             </span>
-            <button
-              type="button"
-              onClick={switchToTeacherPortal}
-              className="inline-flex items-center gap-1.5 font-semibold text-slate-600 hover:text-sky-700 cursor-pointer"
-            >
-              <Lock className="w-3.5 h-3.5" />
-              <span>
-                {lang === 'vi'
-                  ? 'Cổng Giáo Viên (Yêu cầu mã PIN)'
-                  : 'Teacher Portal (PIN required)'}
-              </span>
-            </button>
+            {!isLockedStudentLink && (
+              <button
+                type="button"
+                onClick={switchToTeacherPortal}
+                className="inline-flex items-center gap-1.5 font-semibold text-slate-600 hover:text-sky-700 cursor-pointer"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                <span>
+                  {lang === 'vi'
+                    ? 'Cổng Giáo Viên (Admin)'
+                    : 'Teacher Portal (Admin)'}
+                </span>
+              </button>
+            )}
           </div>
         </footer>
       )}

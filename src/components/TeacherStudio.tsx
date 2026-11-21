@@ -20,6 +20,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Shield,
   Sparkles,
   Trash2,
   Upload,
@@ -60,6 +61,7 @@ import {
   resolveShareableBaseUrl,
 } from '../utils/routing';
 import { parseJsonTextSafe } from '../utils/safeJson';
+import { AdminSecurityPanel } from './AdminSecurityPanel';
 import { GoogleDrivePanel } from './GoogleDrivePanel';
 import { LessonEditorModal } from './LessonEditorModal';
 
@@ -101,7 +103,7 @@ export function TeacherStudio({
   lang,
 }: TeacherStudioProps) {
   const [subTab, setSubTab] = useState<
-    'generate' | 'drive' | 'classes' | 'matrix' | 'history'
+    'generate' | 'drive' | 'classes' | 'matrix' | 'history' | 'security'
   >('generate');
 
   // Lesson upload / AI generator form (default 15 questions)
@@ -194,6 +196,9 @@ export function TeacherStudio({
   const syncWithCloud = useCallback(
     async (user: User, manual = false) => {
       if (cloudSyncingRef.current) return;
+      if (!auth.currentUser || auth.currentUser.uid !== user.uid || !user.emailVerified) {
+        return;
+      }
       cloudSyncingRef.current = true;
       setCloudSyncing(true);
       try {
@@ -209,7 +214,9 @@ export function TeacherStudio({
           return;
         }
         await syncUserProfileToFirestore(user);
+        if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
         const cloudData = await fetchTeacherCloudData(user.uid);
+        if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
         if (
           cloudData.classes.length > 0 ||
           cloudData.lessons.length > 0 ||
@@ -226,13 +233,20 @@ export function TeacherStudio({
           );
           await onRefreshData();
         }
-        await pushWorkspaceToFirestore(user.uid, {
-          classes,
-          lessons,
-          submissions,
-          notifications,
-          activityLogs,
-        });
+        if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
+        const existingLogIds = new Set(cloudData.activityLogs.map((l) => l.id));
+        await pushWorkspaceToFirestore(
+          user.uid,
+          {
+            classes,
+            lessons,
+            submissions,
+            notifications,
+            activityLogs,
+          },
+          existingLogIds,
+        );
+        if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
         await publishLatestPublicSnapshot(user.uid);
         hydratedUidRef.current = user.uid;
         if (manual) {
@@ -247,6 +261,9 @@ export function TeacherStudio({
           window.setTimeout(() => setCloudNotice(null), 5000);
         }
       } catch (err) {
+        if (!auth.currentUser || auth.currentUser.uid !== user.uid) {
+          return;
+        }
         setCloudNotice({
           type: 'err',
           text: err instanceof Error ? err.message : 'Lỗi đồng bộ Firestore.',
@@ -720,6 +737,18 @@ export function TeacherStudio({
             >
               <History className="w-4 h-4" />
               <span>{lang === 'vi' ? 'Lịch sử hoạt động' : 'Activity Log'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('security')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs sm:text-sm font-medium rounded-lg cursor-pointer whitespace-nowrap ${
+                subTab === 'security'
+                  ? 'bg-white text-slate-900 shadow-xs font-semibold'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Shield className="w-4 h-4" />
+              <span>{lang === 'vi' ? 'Bảo mật & Admin' : 'Security & Admin'}</span>
             </button>
           </div>
 
@@ -1299,11 +1328,11 @@ export function TeacherStudio({
               <p className="leading-relaxed">
                 {isStaticHostingEnvironment()
                   ? lang === 'vi'
-                    ? `Các link bên dưới đã trỏ tới địa chỉ web công khai (${shareOrigin}). Thầy/cô có thể gửi ngay cho 10 máy tính bảng học sinh, mở cổng Giáo viên tại ${buildTeacherPortalUrl(shareOrigin)} (PIN: 2025), hoặc bật Cloud Firestore / dùng nút Xuất - Nhập file JSON bên dưới để đồng bộ bài học sang các máy.`
-                    : `Links below point to your public static URL (${shareOrigin}). Share them directly with student tablets, open Teacher Portal at ${buildTeacherPortalUrl(shareOrigin)} (PIN: 2025), or use Cloud Firestore / JSON Export-Import below to sync lessons across devices.`
+                    ? `Các link bên dưới đã trỏ tới địa chỉ web công khai (${shareOrigin}) và tự động ẨN nút Cổng Giáo Viên trên máy học sinh. Thầy/cô truy cập cổng quản trị tại ${buildTeacherPortalUrl(shareOrigin)} bằng tài khoản Admin Google hoặc mã PIN riêng.`
+                    : `Links below point to your public static URL (${shareOrigin}) and automatically HIDE the Teacher Portal button on student tablets. Teachers sign in at ${buildTeacherPortalUrl(shareOrigin)} using Google Admin or private PIN.`
                   : lang === 'vi'
-                    ? `Các link bên dưới đã tự động trỏ tới địa chỉ Share App (${shareOrigin}). Hãy bật quyền chia sẻ công khai trong "Share App" của AI Studio để máy tính bảng học sinh mở được ngay. Thầy/cô cũng có thể mở trực tiếp ${buildTeacherPortalUrl(shareOrigin)} (PIN: 2025) trên Share App hoặc dùng nút Xuất / Nhập file JSON bên dưới mà không cần đăng nhập Google.`
-                    : `Links below point automatically to your public Share App URL (${shareOrigin}). Make sure Share App visibility is enabled in AI Studio, or manage lessons directly at ${buildTeacherPortalUrl(shareOrigin)} (PIN: 2025) / use JSON Export-Import without Google sign-in.`}
+                    ? `Các link bên dưới đã tự động trỏ tới địa chỉ Share App (${shareOrigin}) và tự động ẨN nút Cổng Giáo Viên trên máy học sinh. Thầy/cô quản trị lớp tại ${buildTeacherPortalUrl(shareOrigin)} bằng Google Admin hoặc mã PIN bảo mật riêng (đổi tại tab Bảo mật & Admin).`
+                    : `Links below point automatically to your public Share App URL (${shareOrigin}) and HIDE the Teacher Portal link for students. Manage classes at ${buildTeacherPortalUrl(shareOrigin)} via Google Admin or your private Teacher PIN.`}
               </p>
             </div>
 
@@ -1499,8 +1528,8 @@ export function TeacherStudio({
                   <code className="px-2 py-1 rounded bg-slate-100 font-mono-num text-slate-800 break-all">
                     {buildTeacherPortalUrl(shareOrigin)}
                   </code>
-                  <span className="font-semibold text-slate-800">
-                    ({lang === 'vi' ? 'PIN mặc định: 2025' : 'Default PIN: 2025'})
+                  <span className="font-semibold text-emerald-700">
+                    ({lang === 'vi' ? 'Bảo vệ bởi Admin Google / PIN riêng' : 'Protected by Google Admin / Private PIN'})
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -1850,6 +1879,10 @@ export function TeacherStudio({
           )}
         </div>
       )}
+
+      {/* TAB 5: Security, Change PIN & Admin RBAC */}
+      {subTab === 'security' && <AdminSecurityPanel lang={lang} />}
+
       {/* Full Lesson & 15+ Questions Editor Modal */}
       {editingLesson && (
         <LessonEditorModal
