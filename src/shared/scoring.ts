@@ -30,10 +30,13 @@ const NEGATION_TOKENS = new Set([
   "don't",
 ]);
 
+const OPTION_LETTERS = ['a', 'b', 'c', 'd', 'e', 'f'];
+
 export function isAnswerMatch(
   userAnswer: string,
   correctAnswer: string,
   type: QuestionType,
+  options?: string[],
 ): boolean {
   const normUser = normalizeAnswer(userAnswer);
   const normCorrect = normalizeAnswer(correctAnswer);
@@ -42,6 +45,28 @@ export function isAnswerMatch(
   }
   if (normUser === normCorrect) {
     return true;
+  }
+  if (type === 'multiple_choice') {
+    // Support letter-only correctAnswer (e.g. "C") when options are provided
+    const letterIdx = OPTION_LETTERS.indexOf(normCorrect);
+    if (letterIdx >= 0 && Array.isArray(options) && options[letterIdx]) {
+      if (normUser === normalizeAnswer(options[letterIdx])) {
+        return true;
+      }
+    }
+    // Support letter-prefixed correctAnswer (e.g. "C. SaoXanh#5A@2026!")
+    const strippedCorrect = normalizeAnswer(
+      correctAnswer.trim().replace(/^[A-Fa-f][.):\-\s]+/, ''),
+    );
+    if (strippedCorrect && normUser === strippedCorrect) {
+      return true;
+    }
+    const strippedUser = normalizeAnswer(
+      userAnswer.trim().replace(/^[A-Fa-f][.):\-\s]+/, ''),
+    );
+    if (strippedUser && strippedUser === normCorrect) {
+      return true;
+    }
   }
   if (type === 'fill_blank' || type === 'short_answer') {
     const refTokens = normCorrect.split(' ').filter((t) => t.length > 1);

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { createSeedData, StoreData } from '../src/shared/seedData';
+import { recoverMissingCorrectAnswers } from '../src/utils/answerRecovery';
 
 export type { StoreData };
 
@@ -29,6 +30,13 @@ export function loadStore(): StoreData {
           };
           upgraded = true;
         }
+      }
+      const hadBlankAnswers = parsed.lessons.some((l) =>
+        (l.questions ?? []).some((q) => !q.correctAnswer?.trim()),
+      );
+      if (hadBlankAnswers) {
+        parsed.lessons = recoverMissingCorrectAnswers(parsed.lessons);
+        upgraded = true;
       }
       cachedStore = parsed;
       if (upgraded) {

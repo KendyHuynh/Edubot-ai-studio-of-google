@@ -21,7 +21,12 @@ import {
   ClassRoom,
   Lesson,
   PushNotification,
+  Question,
 } from '../shared/types';
+import {
+  hasStrippedAnswers,
+  recoverMissingCorrectAnswers,
+} from './answerRecovery';
 import {
   DEFAULT_PUBLIC_WORKSPACE_ID,
   mergeLatestSubmissions,
@@ -204,7 +209,23 @@ export async function saveLessonToFirestore(
     const ref = doc(db, 'lessons', docId);
     const snap = await getDoc(ref);
     if (!isActiveOwner(ownerUid)) return;
-    const mutable = sanitizeLessonFieldsForFirestore(lesson, docId);
+    const existingLesson: Lesson[] = snap.exists()
+      ? [
+          {
+            ...lesson,
+            id: docId,
+            questions: Array.isArray(snap.data()?.questions)
+              ? (snap.data().questions as Question[])
+              : [],
+          },
+        ]
+      : [];
+    const [healedLesson] = recoverMissingCorrectAnswers([lesson], existingLesson);
+    // Hard anti-wipe guard: never overwrite an existing Firestore lesson with student-stripped blank answers
+    if (snap.exists() && hasStrippedAnswers([healedLesson])) {
+      return;
+    }
+    const mutable = sanitizeLessonFieldsForFirestore(healedLesson, docId);
     if (!snap.exists()) {
       await setDoc(ref, {
         id: docId,
@@ -508,9 +529,11 @@ export async function fetchTeacherCloudData(ownerUid: string): Promise<{
     const mergedSubmissions = mergeLatestSubmissions(submissions, publicSubmissions);
     const mergedActivityLogs = mergeSubmissionActivityLogs(activityLogs, mergedSubmissions);
 
+    const healedLessons = recoverMissingCorrectAnswers(lessons);
+
     return {
       classes,
-      lessons,
+      lessons: healedLessons,
       submissions: mergedSubmissions,
       notifications,
       activityLogs: mergedActivityLogs,
@@ -603,6 +626,20 @@ export async function publishPublicWorkspace(
   if (!isActiveOwner(ownerUid)) return docId;
   const path = `publicWorkspaces/${docId}`;
   try {
+    let existingLessons: Lesson[] = [];
+    try {
+      const existingSnap = await getDoc(doc(db, 'publicWorkspaces', docId));
+      if (existingSnap.exists() && Array.isArray(existingSnap.data()?.lessons)) {
+        existingLessons = existingSnap.data().lessons as Lesson[];
+      }
+    } catch {
+      // Non-fatal
+    }
+    const healedLessons = recoverMissingCorrectAnswers(lessons, existingLessons);
+    // Hard anti-wipe guard: never publish student-sanitized lessons (all blank answers) to publicWorkspaces
+    if (hasStrippedAnswers(healedLessons)) {
+      return docId;
+    }
     const cleanClasses = classes.slice(0, 100).map((c) => ({
       id: String(c.id).slice(0, 64),
       name: String(c.name || c.id).slice(0, 160),
@@ -610,7 +647,7 @@ export async function publishPublicWorkspace(
       teacherName: String(c.teacherName || 'Giáo viên').slice(0, 120),
       createdAt: String(c.createdAt || new Date().toISOString()).slice(0, 64),
     }));
-    const cleanLessons = lessons.slice(0, 100).map((l) => {
+    const cleanLessons = healedLessons.slice(0, 100).map((l) => {
       const lid = toFirestoreDocId(l.id, 80);
       return {
         id: lid,

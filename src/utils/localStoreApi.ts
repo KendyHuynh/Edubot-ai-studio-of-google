@@ -43,6 +43,7 @@ import {
   validateTeacherPin,
   verifyPinWebCrypto,
 } from './pinCrypto';
+import { recoverMissingCorrectAnswers } from './answerRecovery';
 
 const STATIC_STORE_KEY = 'edubot_static_store_v1';
 
@@ -178,6 +179,7 @@ export function loadLocalStore(storage: StorageLike = defaultStorage): StoreData
     if (raw) {
       const parsed = JSON.parse(raw) as StoreData;
       if (Array.isArray(parsed.classes) && Array.isArray(parsed.lessons)) {
+        parsed.lessons = recoverMissingCorrectAnswers(parsed.lessons);
         return parsed;
       }
     }
@@ -227,7 +229,7 @@ async function hydrateLocalFromPublicWorkspace(
         changed = true;
       }
       if (snapshot.lessons.length > 0) {
-        store.lessons = snapshot.lessons;
+        store.lessons = recoverMissingCorrectAnswers(snapshot.lessons, store.lessons);
         changed = true;
       }
       if (snapshot.notifications && snapshot.notifications.length > 0) {
@@ -294,12 +296,23 @@ function gradeOneLocally(
   const question = lesson?.questions.find((q) => q.id === item.questionId);
   if (!lesson || !question) return null;
 
+  let resolvedCorrectAnswer = question.correctAnswer ?? '';
+  if (!resolvedCorrectAnswer.trim()) {
+    const healedLesson = recoverMissingCorrectAnswers([lesson])[0];
+    const healedQuestion = healedLesson?.questions.find((q) => q.id === item.questionId);
+    if (healedQuestion?.correctAnswer?.trim()) {
+      resolvedCorrectAnswer = healedQuestion.correctAnswer.trim();
+      question.correctAnswer = resolvedCorrectAnswer;
+    }
+  }
+
   const groupId = formatGroupId(item.tabletNumber, item.groupName);
   const comp = getCompetencyById(question.competencyId);
   const isCorrect = isAnswerMatch(
     item.userAnswer,
-    question.correctAnswer ?? '',
+    resolvedCorrectAnswer,
     question.type,
+    question.options,
   );
   const breakdown = calculatePoints(isCorrect, item.elapsedMs);
 
@@ -796,7 +809,7 @@ export async function handleLocalApi(
         (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
       );
       if (validLessons.length > 0) {
-        store.lessons = validLessons;
+        store.lessons = recoverMissingCorrectAnswers(validLessons, store.lessons);
       }
     }
     if (Array.isArray(payload.submissions) && payload.submissions.length > 0) {

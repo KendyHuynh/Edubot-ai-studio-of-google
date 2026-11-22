@@ -273,3 +273,138 @@ test('localStoreApi supports authenticated classroom CRUD, PIN rotation, and tok
     },
   );
 });
+
+test('localStoreApi auto-heals stripped correctAnswer="" from Firestore so SaoXanh#5A@2026! is graded correct with full points', async () => {
+  await withMockFetch(
+    (url, init) => {
+      if (url.includes('/publicWorkspaces/default?') && (!init?.method || init.method === 'GET')) {
+        const docFields = toFirestoreRestValue({
+          id: 'default',
+          classes: [
+            {
+              id: 'LOP-8A',
+              name: 'Lớp 8A',
+              grade: 'Khối 8',
+              teacherName: 'Cô Ý',
+              createdAt: '2026-11-20T00:00:00.000Z',
+            },
+          ],
+          lessons: [
+            {
+              id: 'lesson-safety-netiquette',
+              title: 'Bài 1: Bảo vệ dữ liệu & Ứng xử văn minh trên mạng',
+              topic: 'An toàn & Ứng xử',
+              sourceFileName: 'Bai1.txt',
+              summary: 'Tóm tắt',
+              assignedClassIds: ['LOP-8A'],
+              createdAt: '2026-11-20T00:00:00.000Z',
+              questions: [
+                {
+                  id: 'q1-pw',
+                  type: 'multiple_choice',
+                  questionText:
+                    'Khi lập tài khoản học tập trực tuyến, lựa chọn mật khẩu nào sau đây giúp bảo vệ dữ liệu cá nhân tốt nhất?',
+                  options: [
+                    '12345678',
+                    'ngay_sinh_cua_em_2015',
+                    'SaoXanh#5A@2026!',
+                    'matkhau',
+                  ],
+                  aiSearchKeywordHint: 'Cách đặt mật khẩu mạnh an toàn thông tin học sinh',
+                  correctAnswer: '',
+                  competencyId: '4.2',
+                  competencyIds: ['4.2'],
+                  explanation:
+                    'Mật khẩu mạnh cần kết hợp chữ hoa, chữ thường, chữ số và ký tự đặc biệt.',
+                },
+              ],
+            },
+            {
+              id: 'lesson-1794902362895',
+              title: 'GIAO TIẾP VÀ HỢP TÁC HIỆU QUẢ TRONG MÔI TRƯỜNG SỐ',
+              topic: 'Giao tiếp số',
+              sourceFileName: 'BaiGiaoTiep.txt',
+              summary: 'Tóm tắt',
+              assignedClassIds: ['LOP-8A'],
+              createdAt: '2026-11-20T00:00:00.000Z',
+              questions: [
+                {
+                  id: 'q-1794902362895-2',
+                  type: 'multiple_choice',
+                  questionText: 'Công cụ họp trực tuyến và soạn thảo nhóm?',
+                  options: ['Paint', 'Google Meet và Google Docs', 'Calculator', 'Notepad'],
+                  aiSearchKeywordHint: 'Google Meet Google Docs',
+                  correctAnswer: '',
+                  competencyId: '2.2',
+                  competencyIds: ['2.2'],
+                  explanation: 'Google Meet và Google Docs hỗ trợ hợp tác nhóm trực tuyến.',
+                },
+              ],
+            },
+          ],
+        }).mapValue?.fields;
+        return new Response(JSON.stringify({ fields: docFields }), { status: 200 });
+      }
+      if (url.includes(':runQuery')) {
+        return new Response(JSON.stringify([{ readTime: '2026-11-21T00:00:00Z' }]), { status: 200 });
+      }
+      if (url.includes(':commit') && init?.method === 'POST') {
+        return new Response(JSON.stringify({ writeResults: [{}] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    },
+    async () => {
+      resetLocalHydrationCache();
+      const storage = createMemoryStorage();
+      const bootRes = await handleLocalApi('/api/bootstrap?lang=vi&role=student', { method: 'GET' }, storage);
+      assert.equal(bootRes.ok, true);
+
+      // Submit exact correct answer for q1-pw
+      const sub1 = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-8A',
+            tabletNumber: 2,
+            groupName: 'Tia Chớp',
+            lessonId: 'lesson-safety-netiquette',
+            questionId: 'q1-pw',
+            userAnswer: 'SaoXanh#5A@2026!',
+            elapsedMs: 3500,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(sub1.ok, true);
+      const d1 = sub1.data as { submission: { isCorrect: boolean; totalPoints: number } };
+      assert.equal(d1.submission.isCorrect, true);
+      assert.ok(d1.submission.totalPoints >= 100, `Expected >=100 points, got ${d1.submission.totalPoints}`);
+
+      // Submit exact correct answer for teacher's custom lesson q-1794902362895-2
+      const sub2 = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-8A',
+            tabletNumber: 2,
+            groupName: 'Tia Chớp',
+            lessonId: 'lesson-1794902362895',
+            questionId: 'q-1794902362895-2',
+            userAnswer: 'Google Meet và Google Docs',
+            elapsedMs: 4000,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(sub2.ok, true);
+      const d2 = sub2.data as { submission: { isCorrect: boolean; totalPoints: number } };
+      assert.equal(d2.submission.isCorrect, true);
+      assert.ok(d2.submission.totalPoints >= 100);
+    },
+  );
+});
+

@@ -23,6 +23,7 @@ import {
   formatGroupId,
   isAnswerMatch,
 } from './src/shared/scoring';
+import { recoverMissingCorrectAnswers } from './src/utils/answerRecovery';
 import {
   ActivityLog,
   AnswerSubmission,
@@ -128,7 +129,7 @@ async function hydrateFromPublicWorkspace(
         changed = true;
       }
       if (snapshot.lessons.length > 0) {
-        store.lessons = snapshot.lessons;
+        store.lessons = recoverMissingCorrectAnswers(snapshot.lessons, store.lessons);
         changed = true;
       }
       if (snapshot.notifications && snapshot.notifications.length > 0) {
@@ -958,7 +959,7 @@ async function startServer() {
         (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
       );
       if (validLessons.length > 0) {
-        store.lessons = validLessons;
+        store.lessons = recoverMissingCorrectAnswers(validLessons, store.lessons);
       }
     }
 
@@ -1064,14 +1065,25 @@ async function startServer() {
       return null;
     }
 
+    let resolvedCorrectAnswer = question.correctAnswer ?? '';
+    if (!resolvedCorrectAnswer.trim()) {
+      const healedLesson = recoverMissingCorrectAnswers([lesson])[0];
+      const healedQuestion = healedLesson?.questions.find((q) => q.id === item.questionId);
+      if (healedQuestion?.correctAnswer?.trim()) {
+        resolvedCorrectAnswer = healedQuestion.correctAnswer.trim();
+        question.correctAnswer = resolvedCorrectAnswer;
+      }
+    }
+
     const groupId = formatGroupId(item.tabletNumber, item.groupName);
     const comp = getCompetencyById(question.competencyId);
     const compName = `${comp.id}. ${lang === 'vi' ? comp.nameVi : comp.nameEn}`;
 
     let isCorrect = isAnswerMatch(
       item.userAnswer,
-      question.correctAnswer ?? '',
+      resolvedCorrectAnswer,
       question.type,
+      question.options,
     );
     let feedbackText = '';
     let explanation = question.explanation;
@@ -1080,7 +1092,7 @@ async function startServer() {
       try {
         const aiGrade = await evaluateShortAnswerWithAI({
           questionText: question.questionText,
-          correctAnswer: question.correctAnswer ?? '',
+          correctAnswer: resolvedCorrectAnswer,
           userAnswer: item.userAnswer,
           competencyName: compName,
           groupName: item.groupName,

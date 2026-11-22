@@ -61,6 +61,10 @@ import {
   resolveShareableBaseUrl,
 } from '../utils/routing';
 import { parseJsonTextSafe } from '../utils/safeJson';
+import {
+  hasStrippedAnswers,
+  recoverMissingCorrectAnswers,
+} from '../utils/answerRecovery';
 import { AdminSecurityPanel } from './AdminSecurityPanel';
 import { AuthErrorBanner } from './AuthErrorBanner';
 import { GoogleDrivePanel } from './GoogleDrivePanel';
@@ -171,6 +175,7 @@ export function TeacherStudio({
         let nextClasses = classes;
         let nextLessons = lessons;
         let nextNotifications = notifications;
+        let gotTeacherBootstrap = false;
         try {
           const res = await apiRequestJson<{
             classes?: ClassRoom[];
@@ -180,6 +185,7 @@ export function TeacherStudio({
           if (res.ok && res.data?.classes && res.data?.lessons) {
             nextClasses = res.data.classes;
             nextLessons = res.data.lessons;
+            gotTeacherBootstrap = true;
             if (Array.isArray(res.data.notifications)) {
               nextNotifications = res.data.notifications;
             }
@@ -187,11 +193,16 @@ export function TeacherStudio({
         } catch {
           // Fall back to current in-memory classes & lessons
         }
+        const safeLessons = recoverMissingCorrectAnswers(nextLessons);
+        // Never publish student-sanitized lessons (stripped correctAnswer) to publicWorkspaces
+        if (hasStrippedAnswers(safeLessons) || (!gotTeacherBootstrap && hasStrippedAnswers(nextLessons))) {
+          return;
+        }
         await publishPublicWorkspace(
           defaultShareCodeForUid(uid),
           uid,
           nextClasses,
-          nextLessons,
+          safeLessons,
           nextNotifications,
         );
       } catch {
@@ -243,8 +254,8 @@ export function TeacherStudio({
         }
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
 
-        // Always read freshly hydrated teacher store so stale seed classes/lessons from React closure
-        // are NEVER pushed back over the teacher's authoritative cloud workspace!
+        // Always read freshly hydrated teacher store so stale seed classes/lessons or student-stripped
+        // React props are NEVER pushed back over the teacher's authoritative cloud workspace!
         let freshClasses = classes;
         let freshLessons = lessons;
         let freshSubmissions = submissions;
@@ -269,12 +280,15 @@ export function TeacherStudio({
           // Keep current state as fallback
         }
 
+        const safeLessons = recoverMissingCorrectAnswers(freshLessons, cloudData.lessons);
+        const canSafelyPushLessons = !hasStrippedAnswers(safeLessons);
+
         const existingLogIds = new Set(cloudData.activityLogs.map((l) => l.id));
         await pushWorkspaceToFirestore(
           user.uid,
           {
             classes: freshClasses,
-            lessons: freshLessons,
+            lessons: canSafelyPushLessons ? safeLessons : [],
             submissions: freshSubmissions,
             notifications: freshNotifications,
             activityLogs: freshLogs,
@@ -282,13 +296,15 @@ export function TeacherStudio({
           existingLogIds,
         );
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
-        await publishPublicWorkspace(
-          defaultShareCodeForUid(user.uid),
-          user.uid,
-          freshClasses,
-          freshLessons,
-          freshNotifications,
-        );
+        if (canSafelyPushLessons) {
+          await publishPublicWorkspace(
+            defaultShareCodeForUid(user.uid),
+            user.uid,
+            freshClasses,
+            safeLessons,
+            freshNotifications,
+          );
+        }
         hydratedUidRef.current = user.uid;
         if (manual) {
           const code = defaultShareCodeForUid(user.uid);
