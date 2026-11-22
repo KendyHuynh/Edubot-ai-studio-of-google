@@ -432,7 +432,9 @@ export function LessonEditorModal({
                   ) : (
                     <div className="space-y-1">
                       <label className="block text-xs font-semibold text-slate-700">
-                        {lang === 'vi' ? 'Đáp án đúng' : 'Correct Answer'}
+                        {lang === 'vi'
+                          ? 'Đáp án đúng (Chấm tự động trực tiếp, không dùng AI)'
+                          : 'Correct Answer (Instant Rule-Based Grading, No AI)'}
                       </label>
                       <input
                         type="text"
@@ -442,6 +444,11 @@ export function LessonEditorModal({
                         }
                         className="w-full px-3 py-2 text-sm border border-emerald-300 bg-emerald-50/40 rounded-xl"
                       />
+                      <p className="text-[11px] text-slate-500">
+                        {lang === 'vi'
+                          ? 'Mẹo: Có thể ghi nhiều đáp án/từ khóa đồng nghĩa cách nhau bằng dấu "|" (VD: giấy phép sử dụng | bản quyền | copyright). Không phân biệt hoa/thường và hỗ trợ gõ không dấu.'
+                          : 'Tip: Separate multiple accepted answer variants with "|" (e.g. copyright | license). Case-insensitive deterministic matching.'}
+                      </p>
                     </div>
                   )}
 

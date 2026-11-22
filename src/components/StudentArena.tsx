@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { getCompetencyById, getDomainByCompetencyId } from '../shared/competencies';
 import { CopyDict } from '../shared/i18n';
+import { calculatePoints, getTimingRuleForQuestionType } from '../shared/scoring';
 import {
   AnswerSubmission,
   Language,
@@ -26,11 +27,18 @@ import {
   UiMode,
 } from '../shared/types';
 
+export interface GroupLessonProgress {
+  answeredQuestionIds: string[];
+  correctCount: number;
+  totalPoints: number;
+}
+
 interface StudentArenaProps {
   session: SessionIdentity | null;
   lessons: Lesson[];
   selectedLessonId: string | null;
   onSelectLesson: (lessonId: string | null) => void;
+  groupProgress?: Record<string, GroupLessonProgress>;
   notifications: PushNotification[];
   onGoToIdentity: () => void;
   onGoToHonorBoard: () => void;
@@ -44,6 +52,8 @@ interface StudentArenaProps {
 
 interface LocalFeedbackState {
   isOfflineQueued: boolean;
+  alreadySubmitted?: boolean;
+  isError?: boolean;
   isCorrect?: boolean;
   totalPoints?: number;
   speedBonus?: number;
@@ -58,6 +68,7 @@ export function StudentArena({
   lessons,
   selectedLessonId,
   onSelectLesson,
+  groupProgress = {},
   notifications,
   onGoToIdentity,
   onGoToHonorBoard,
@@ -78,12 +89,13 @@ export function StudentArena({
   const [sessionScore, setSessionScore] = useState(0);
   const startTimeRef = useRef<number>(Date.now());
 
-  const activeLesson =
-    lessons.find((l) => l.id === selectedLessonId) ?? null;
-
   const classLessons = session
     ? lessons.filter((l) => l.assignedClassIds.includes(session.classId))
-    : lessons;
+    : [];
+
+  // Strictly restrict activeLesson to lessons assigned to the student's checked-in class
+  const activeLesson =
+    classLessons.find((l) => l.id === selectedLessonId) ?? null;
 
   const currentQuestion: Question | null =
     activeLesson && activeLesson.questions[questionIndex]
@@ -138,6 +150,7 @@ export function StudentArena({
     const unreadNotifs = notifications.filter(
       (n) =>
         n.classId === session.classId &&
+        classLessons.some((l) => l.id === n.lessonId) &&
         !n.readByGroupIds.includes(session.groupId),
     );
 
@@ -215,24 +228,51 @@ export function StudentArena({
                   ),
                 ),
               );
+              const prog = groupProgress[lesson.id];
+              const answeredSet = new Set(prog?.answeredQuestionIds ?? []);
+              const answeredCount = answeredSet.size;
+              const totalCount = lesson.questions.length;
+              const isCompleted = totalCount > 0 && answeredCount >= totalCount;
+              const isInProgress = answeredCount > 0 && answeredCount < totalCount;
+              const firstUnansweredIdx = lesson.questions.findIndex(
+                (q) => !answeredSet.has(q.id),
+              );
+
               return (
                 <article
                   key={lesson.id}
                   className="bg-white border border-slate-200 rounded-2xl p-6 flex flex-col justify-between gap-5"
                 >
                   <div className="space-y-2.5">
-                    <div className="flex items-center gap-2 text-xs text-slate-500">
-                      <span className="font-semibold text-sky-700">
-                        {lesson.questions.length}{' '}
-                        {lang === 'vi' ? 'câu hỏi' : 'questions'}
-                      </span>
-                      <span aria-hidden="true">·</span>
-                      <span>
-                        {lang === 'vi' ? 'Nhóm năng lực' : 'Domains'}{' '}
-                        {uniqueDomains.join(', ')}
-                      </span>
-                      <span aria-hidden="true">·</span>
-                      <span className="truncate">{lesson.sourceFileName}</span>
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="font-semibold text-sky-700 shrink-0">
+                          {totalCount} {lang === 'vi' ? 'câu hỏi' : 'questions'}
+                        </span>
+                        <span aria-hidden="true">·</span>
+                        <span className="shrink-0">
+                          {lang === 'vi' ? 'Nhóm năng lực' : 'Domains'}{' '}
+                          {uniqueDomains.join(', ')}
+                        </span>
+                      </div>
+                      {isCompleted ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 font-semibold tabular-nums">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>
+                            {lang === 'vi'
+                              ? `Đã hoàn thành ${answeredCount}/${totalCount} · ${prog?.totalPoints ?? 0}đ`
+                              : `Done ${answeredCount}/${totalCount} · ${prog?.totalPoints ?? 0} pts`}
+                          </span>
+                        </span>
+                      ) : isInProgress ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-sky-50 border border-sky-200 text-sky-800 font-semibold tabular-nums">
+                          <span>
+                            {lang === 'vi'
+                              ? `Đang làm ${answeredCount}/${totalCount} · ${prog?.totalPoints ?? 0}đ`
+                              : `In progress ${answeredCount}/${totalCount}`}
+                          </span>
+                        </span>
+                      ) : null}
                     </div>
                     <h2 className="text-lg font-bold text-slate-900 text-balance">
                       {lesson.title}
@@ -249,15 +289,33 @@ export function StudentArena({
                     <button
                       type="button"
                       onClick={() => {
-                        setQuestionIndex(0);
-                        setSessionScore(0);
+                        setQuestionIndex(
+                          isInProgress && firstUnansweredIdx >= 0
+                            ? firstUnansweredIdx
+                            : 0,
+                        );
+                        setSessionScore(prog?.totalPoints ?? 0);
                         onSelectLesson(lesson.id);
                       }}
-                      className={`inline-flex items-center gap-2 px-5 font-semibold text-white bg-sky-600 hover:bg-sky-700 rounded-xl whitespace-nowrap shrink-0 cursor-pointer ${
-                        uiMode === 'kid' ? 'py-3 text-base' : 'py-2 text-sm'
-                      }`}
+                      className={`inline-flex items-center gap-2 px-5 font-semibold rounded-xl whitespace-nowrap shrink-0 cursor-pointer ${
+                        isCompleted
+                          ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                          : 'bg-sky-600 hover:bg-sky-700 text-white'
+                      } ${uiMode === 'kid' ? 'py-3 text-base' : 'py-2 text-sm'}`}
                     >
-                      <span>{lang === 'vi' ? 'Bắt đầu chơi' : 'Start Quiz'}</span>
+                      <span>
+                        {isCompleted
+                          ? lang === 'vi'
+                            ? 'Xem lại (Đã khóa điểm)'
+                            : 'Review (Locked)'
+                          : isInProgress
+                            ? lang === 'vi'
+                              ? `Tiếp tục câu ${firstUnansweredIdx + 1}`
+                              : `Resume Q${firstUnansweredIdx + 1}`
+                            : lang === 'vi'
+                              ? 'Bắt đầu chơi'
+                              : 'Start Quiz'}
+                      </span>
                       <ArrowRight className="w-4 h-4" />
                     </button>
                   </div>
@@ -325,7 +383,11 @@ export function StudentArena({
 
     try {
       const { apiRequestJson } = await import('../utils/apiClient');
-      const res = await apiRequestJson<{ submission?: AnswerSubmission }>(
+      const res = await apiRequestJson<{
+        submission?: AnswerSubmission;
+        alreadySubmitted?: boolean;
+        error?: string;
+      }>(
         '/api/quiz/submit',
         {
           method: 'POST',
@@ -344,15 +406,34 @@ export function StudentArena({
         lang,
       );
 
+      if (res.status === 403) {
+        setFeedback({
+          isOfflineQueued: false,
+          isError: true,
+          isCorrect: false,
+          totalPoints: 0,
+          feedbackText:
+            res.data?.error ||
+            (lang === 'vi'
+              ? 'Bài tập này thuộc lớp học khác, không được giao cho lớp của em.'
+              : 'This lesson belongs to another class.'),
+        });
+        return;
+      }
+
       if (!res.ok || !res.data?.submission) {
         throw new Error('Network error');
       }
 
       const submission = res.data.submission;
+      const alreadySubmitted = Boolean(res.data.alreadySubmitted);
       onOnlineSubmission(submission);
-      setSessionScore((prev) => prev + submission.totalPoints);
+      if (!alreadySubmitted) {
+        setSessionScore((prev) => prev + submission.totalPoints);
+      }
       setFeedback({
         isOfflineQueued: false,
+        alreadySubmitted,
         isCorrect: submission.isCorrect,
         totalPoints: submission.totalPoints,
         speedBonus: submission.speedBonus,
@@ -417,11 +498,41 @@ export function StudentArena({
             </span>
           </div>
 
-          <div className="flex items-center gap-4 tabular-nums">
+          <div className="flex flex-wrap items-center gap-3 tabular-nums">
             <span className="inline-flex items-center gap-1.5 font-mono-num font-semibold text-slate-900">
               <Clock className="w-4 h-4 text-sky-600" />
               <span>{(elapsedMs / 1000).toFixed(1)}s</span>
             </span>
+            {!feedback && (() => {
+              const rule = getTimingRuleForQuestionType(currentQuestion.type);
+              const live = calculatePoints(true, elapsedMs, currentQuestion.type);
+              const elapsedSec = elapsedMs / 1000;
+              if (elapsedSec <= rule.graceSec) {
+                return (
+                  <span className="text-xs font-semibold text-emerald-700">
+                    {lang === 'vi'
+                      ? `≤${rule.graceSec}s · Thưởng tối đa +50đ`
+                      : `≤${rule.graceSec}s · Max +50 speed bonus`}
+                  </span>
+                );
+              }
+              if (live.speedBonus > 0) {
+                return (
+                  <span className="text-xs font-semibold text-sky-700">
+                    {lang === 'vi'
+                      ? `Thưởng tốc độ: +${live.speedBonus}đ (tới ${rule.bonusEndSec}s)`
+                      : `Speed bonus: +${live.speedBonus} (up to ${rule.bonusEndSec}s)`}
+                  </span>
+                );
+              }
+              return (
+                <span className="text-xs font-medium text-slate-500">
+                  {lang === 'vi'
+                    ? 'Đúng vẫn trọn +100đ'
+                    : 'Correct still earns +100 pts'}
+                </span>
+              );
+            })()}
             <span aria-hidden="true">·</span>
             <span className="font-semibold text-sky-700">
               {lang === 'vi' ? `Điểm lượt này: ${sessionScore}` : `Score: ${sessionScore}`}
@@ -610,7 +721,7 @@ export function StudentArena({
           <div
             role="status"
             className={`rounded-xl border p-5 space-y-3 ${
-              feedback.isOfflineQueued
+              feedback.isOfflineQueued || feedback.alreadySubmitted
                 ? 'bg-amber-50 border-amber-200'
                 : feedback.isCorrect
                   ? 'bg-emerald-50 border-emerald-200'
@@ -626,6 +737,15 @@ export function StudentArena({
                       {lang === 'vi'
                         ? 'Đã lưu ngoại tuyến (Chờ đồng bộ)'
                         : 'Saved Offline (Pending Sync)'}
+                    </span>
+                  </>
+                ) : feedback.alreadySubmitted ? (
+                  <>
+                    <CheckCircle2 className="w-5 h-5 text-amber-700" />
+                    <span className="text-amber-900">
+                      {lang === 'vi'
+                        ? 'Câu này đã được ghi điểm ở lần nộp đầu tiên'
+                        : 'First Official Attempt Already Locked'}
                     </span>
                   </>
                 ) : feedback.isCorrect ? (
@@ -645,12 +765,17 @@ export function StudentArena({
                 )}
               </div>
 
-              {!feedback.isOfflineQueued && (
+              {!feedback.isOfflineQueued && !feedback.isError && (
                 <span className="font-mono-num text-sm font-bold text-slate-900">
-                  +{feedback.totalPoints ?? 0}{' '}
-                  {lang === 'vi' ? 'điểm' : 'pts'}
-                  {(feedback.speedBonus ?? 0) > 0 &&
-                    ` (+${feedback.speedBonus} ${lang === 'vi' ? 'tốc độ' : 'speed'})`}
+                  {feedback.alreadySubmitted
+                    ? lang === 'vi'
+                      ? `Giữ nguyên: ${feedback.totalPoints ?? 0} điểm`
+                      : `Kept: ${feedback.totalPoints ?? 0} pts`
+                    : `+${feedback.totalPoints ?? 0} ${lang === 'vi' ? 'điểm' : 'pts'}${
+                        (feedback.speedBonus ?? 0) > 0
+                          ? ` (+${feedback.speedBonus} ${lang === 'vi' ? 'tốc độ' : 'speed'})`
+                          : ''
+                      }`}
                 </span>
               )}
             </div>

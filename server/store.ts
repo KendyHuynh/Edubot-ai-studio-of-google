@@ -11,9 +11,10 @@ const STORE_PATH = path.join(DATA_DIR, 'edubot-store.json');
 let cachedStore: StoreData | null = null;
 
 export function loadStore(): StoreData {
-  if (cachedStore) {
+  if (cachedStore && fs.existsSync(STORE_PATH)) {
     return cachedStore;
   }
+  cachedStore = null;
   try {
     if (fs.existsSync(STORE_PATH)) {
       const raw = fs.readFileSync(STORE_PATH, 'utf-8');

@@ -306,6 +306,45 @@ export async function saveSubmissionToFirestore(
   }
 }
 
+/**
+ * Syncs a teacher's manual grade override to both private `submissions` and published
+ * `publicWorkspaces/{ws}/submissions` (permitted for admins in firestore.rules).
+ */
+export async function syncOverriddenSubmissionToCloud(
+  sub: AnswerSubmission,
+  ownerUid: string,
+): Promise<void> {
+  if (!isActiveOwner(ownerUid)) return;
+  await saveSubmissionToFirestore(sub, ownerUid);
+  const docId = toFirestoreDocId(sub.id, 128);
+  const targetWorkspaces = Array.from(
+    new Set([DEFAULT_PUBLIC_WORKSPACE_ID, defaultShareCodeForUid(ownerUid)]),
+  );
+  const mutable = {
+    userAnswer: (sub.userAnswer ?? '').slice(0, 1000),
+    isCorrect: Boolean(sub.isCorrect),
+    basePoints: Math.max(0, Math.min(1000, Math.round(sub.basePoints))),
+    speedBonus: Math.max(0, Math.min(1000, Math.round(sub.speedBonus))),
+    totalPoints: Math.max(0, Math.min(2000, Math.round(sub.totalPoints))),
+    elapsedMs: Math.max(0, Math.min(3600000, Math.round(sub.elapsedMs))),
+    submittedAt: (sub.submittedAt || new Date().toISOString()).slice(0, 64),
+    feedbackText: (sub.feedbackText ?? '').slice(0, 500),
+    explanation: (sub.explanation ?? '').slice(0, 1200),
+    syncedFromOffline: Boolean(sub.syncedFromOffline),
+  };
+  for (const wsId of targetWorkspaces) {
+    try {
+      const ref = doc(db, 'publicWorkspaces', wsId, 'submissions', docId);
+      const snap = await getDoc(ref);
+      if (snap.exists()) {
+        await updateDoc(ref, mutable);
+      }
+    } catch {
+      // Non-fatal if doc was not created in this public workspace
+    }
+  }
+}
+
 export async function saveNotificationToFirestore(
   notif: PushNotification,
   ownerUid: string,

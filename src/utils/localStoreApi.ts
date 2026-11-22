@@ -5,6 +5,7 @@ import {
   buildDomainChampions,
   buildLeaderboard,
   calculatePoints,
+  clampElapsedMs,
   formatGroupId,
   isAnswerMatch,
 } from '../shared/scoring';
@@ -28,6 +29,7 @@ import {
 } from '../shared/types';
 import {
   DEFAULT_PUBLIC_WORKSPACE_ID,
+  isDefaultSeedClassesOnly,
   LEGACY_FALLBACK_WORKSPACE_ID,
   mergeLatestSubmissions,
   mergeSubmissionActivityLogs,
@@ -44,6 +46,7 @@ import {
   verifyPinWebCrypto,
 } from './pinCrypto';
 import { recoverMissingCorrectAnswers } from './answerRecovery';
+import { mergeLessonsPreservingCustom } from './aiLessonVault';
 
 const STATIC_STORE_KEY = 'edubot_static_store_v1';
 
@@ -225,7 +228,13 @@ async function hydrateLocalFromPublicWorkspace(
 
     if (snapshot && options.replaceContent) {
       if (snapshot.classes.length > 0) {
+        const wasDemoSeedOnly = isDefaultSeedClassesOnly(store.classes);
         store.classes = snapshot.classes;
+        if (wasDemoSeedOnly && !isDefaultSeedClassesOnly(snapshot.classes)) {
+          store.submissions = store.submissions.filter((s) => !s.id.startsWith('sub-seed-'));
+          store.activityLogs = store.activityLogs.filter((l) => !l.id.startsWith('log-seed-'));
+          store.notifications = store.notifications.filter((n) => !n.id.startsWith('notif-seed-'));
+        }
         changed = true;
       }
       if (snapshot.lessons.length > 0) {
@@ -233,16 +242,22 @@ async function hydrateLocalFromPublicWorkspace(
         changed = true;
       }
       if (snapshot.notifications && snapshot.notifications.length > 0) {
+        const activeClassIds = new Set(store.classes.map((c) => c.id));
         const readMap = new Map(
           store.notifications.map((n) => [n.id, new Set(n.readByGroupIds ?? [])]),
         );
-        store.notifications = snapshot.notifications.map((n) => {
-          const existingRead = readMap.get(n.id);
-          const mergedRead = Array.from(
-            new Set([...(n.readByGroupIds ?? []), ...(existingRead ? Array.from(existingRead) : [])]),
-          );
-          return { ...n, readByGroupIds: mergedRead };
-        });
+        store.notifications = snapshot.notifications
+          .filter((n) => !n.classId || activeClassIds.size === 0 || activeClassIds.has(n.classId))
+          .map((n) => {
+            const existingRead = readMap.get(n.id);
+            const mergedRead = Array.from(
+              new Set([
+                ...(n.readByGroupIds ?? []),
+                ...(existingRead ? Array.from(existingRead) : []),
+              ]),
+            );
+            return { ...n, readByGroupIds: mergedRead };
+          });
         changed = true;
       }
     }
@@ -277,6 +292,11 @@ async function hydrateLocalFromPublicWorkspace(
   }
 }
 
+type LocalGradeResult =
+  | { status: 'ok'; submission: AnswerSubmission; alreadySubmitted?: boolean }
+  | { status: 'forbidden' }
+  | { status: 'not_found' };
+
 function gradeOneLocally(
   store: StoreData,
   item: {
@@ -291,10 +311,42 @@ function gradeOneLocally(
   },
   lang: Language,
   syncedFromOffline = false,
-): AnswerSubmission | null {
+): LocalGradeResult {
   const lesson = store.lessons.find((l) => l.id === item.lessonId);
   const question = lesson?.questions.find((q) => q.id === item.questionId);
-  if (!lesson || !question) return null;
+  if (!lesson || !question) return { status: 'not_found' };
+
+  if (
+    item.classId &&
+    lesson.assignedClassIds.length > 0 &&
+    !lesson.assignedClassIds.includes(item.classId)
+  ) {
+    return { status: 'forbidden' };
+  }
+
+  const groupId = formatGroupId(item.tabletNumber, item.groupName);
+
+  // Official 1st-attempt lock: preserve the first recorded submission for this group + question
+  const existing = store.submissions.find(
+    (s) =>
+      s.classId === item.classId &&
+      s.groupId === groupId &&
+      s.lessonId === lesson.id &&
+      s.questionId === question.id,
+  );
+  if (existing) {
+    return {
+      status: 'ok',
+      alreadySubmitted: true,
+      submission: {
+        ...existing,
+        feedbackText:
+          lang === 'en'
+            ? `Your team (${item.groupName}) already submitted this question earlier (${existing.totalPoints} pts). First official attempt is locked so scores stay fair.`
+            : `Nhóm ${item.groupName} đã hoàn thành câu này trước đó (${existing.totalPoints} điểm). Hệ thống giữ nguyên kết quả lần nộp đầu tiên để không bị cộng trùng hoặc ghi đè điểm.`,
+      },
+    };
+  }
 
   let resolvedCorrectAnswer = question.correctAnswer ?? '';
   if (!resolvedCorrectAnswer.trim()) {
@@ -306,15 +358,15 @@ function gradeOneLocally(
     }
   }
 
-  const groupId = formatGroupId(item.tabletNumber, item.groupName);
   const comp = getCompetencyById(question.competencyId);
+  const safeElapsedMs = clampElapsedMs(item.elapsedMs, question.type);
   const isCorrect = isAnswerMatch(
     item.userAnswer,
     resolvedCorrectAnswer,
     question.type,
     question.options,
   );
-  const breakdown = calculatePoints(isCorrect, item.elapsedMs);
+  const breakdown = calculatePoints(isCorrect, safeElapsedMs, question.type);
 
   const feedbackText =
     lang === 'en'
@@ -345,25 +397,14 @@ function gradeOneLocally(
     basePoints: breakdown.basePoints,
     speedBonus: breakdown.speedBonus,
     totalPoints: breakdown.totalPoints,
-    elapsedMs: item.elapsedMs,
+    elapsedMs: safeElapsedMs,
     submittedAt: item.submittedAt || new Date().toISOString(),
     feedbackText,
     explanation: question.explanation,
     syncedFromOffline,
   };
 
-  const existingIdx = store.submissions.findIndex(
-    (s) =>
-      s.classId === submission.classId &&
-      s.groupId === submission.groupId &&
-      s.lessonId === submission.lessonId &&
-      s.questionId === submission.questionId,
-  );
-  if (existingIdx >= 0) {
-    store.submissions[existingIdx] = submission;
-  } else {
-    store.submissions.push(submission);
-  }
+  store.submissions.push(submission);
 
   store.activityLogs.unshift({
     id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -382,7 +423,7 @@ function gradeOneLocally(
     timestamp: submission.submittedAt,
   });
 
-  return submission;
+  return { status: 'ok', submission };
 }
 
 export interface LocalApiResult {
@@ -661,39 +702,88 @@ export async function handleLocalApi(
     const includeAnswers =
       parsedUrl.searchParams.get('role') === 'teacher' && Boolean(getLocalAuth(preStore));
 
+    const storeIsOnlyDemoSeed = isDefaultSeedClassesOnly(preStore.classes);
     // Student / unauthenticated requests ALWAYS hydrate authoritative teacher classes, lessons,
     // notifications & live submissions from Firestore (no Google/Firebase login required!).
-    // Authenticated teacher requests only pull live student submissions here so unsaved local edits aren't clobbered.
+    // Authenticated teacher requests also hydrate when the local store only holds starter demo classes (5A/5B/6A).
     const resolvedWsId = await hydrateLocalFromPublicWorkspace(ws, storage, {
-      replaceContent: !includeAnswers,
-      forceRefresh,
+      replaceContent: !includeAnswers || storeIsOnlyDemoSeed,
+      forceRefresh: forceRefresh || storeIsOnlyDemoSeed,
     });
 
     const store = loadLocalStore(storage);
     const classId = parsedUrl.searchParams.get('classId') || '';
+    const lessonIdFilter = parsedUrl.searchParams.get('lessonId') || '';
+    const groupIdFilter = parsedUrl.searchParams.get('groupId') || '';
     const lang = (parsedUrl.searchParams.get('lang') === 'en' ? 'en' : 'vi') as Language;
 
-    const sanitizedLessons = store.lessons.map((lesson) => ({
+    const targetClassId =
+      classId && store.classes.some((c) => c.id === classId)
+        ? classId
+        : store.classes[0]?.id || 'LOP-8A';
+
+    // Strict class isolation for students: only expose lessons assigned to their class
+    const visibleLessons =
+      !includeAnswers && classId
+        ? store.lessons.filter((l) => l.assignedClassIds.includes(classId))
+        : store.lessons;
+
+    const sanitizedLessons = visibleLessons.map((lesson) => ({
       ...lesson,
       questions: lesson.questions.map((q) =>
         includeAnswers ? q : { ...q, correctAnswer: undefined },
       ),
     }));
 
-    const targetClassId =
-      classId && store.classes.some((c) => c.id === classId)
-        ? classId
-        : store.classes[0]?.id || 'LOP-8A';
-    const leaderboard = buildLeaderboard(targetClassId, store.submissions, lang);
-    const domainChampions = buildDomainChampions(targetClassId, store.submissions, lang);
+    const leaderboard = buildLeaderboard(
+      targetClassId,
+      store.submissions,
+      lang,
+      lessonIdFilter || undefined,
+    );
+    const domainChampions = buildDomainChampions(
+      targetClassId,
+      store.submissions,
+      lang,
+      lessonIdFilter || undefined,
+    );
     const competencyMatrix = buildCompetencyMatrix(
       store.lessons,
       store.submissions,
       classId || undefined,
     );
 
+    const groupProgress: Record<
+      string,
+      { answeredQuestionIds: string[]; correctCount: number; totalPoints: number }
+    > = {};
+    if (classId && groupIdFilter) {
+      for (const sub of store.submissions) {
+        if (sub.classId === classId && sub.groupId === groupIdFilter) {
+          const entry = groupProgress[sub.lessonId] ?? {
+            answeredQuestionIds: [],
+            correctCount: 0,
+            totalPoints: 0,
+          };
+          if (!entry.answeredQuestionIds.includes(sub.questionId)) {
+            entry.answeredQuestionIds.push(sub.questionId);
+            if (sub.isCorrect) entry.correctCount += 1;
+            entry.totalPoints += sub.totalPoints;
+          }
+          groupProgress[sub.lessonId] = entry;
+        }
+      }
+    }
+
+    const visibleLessonIds = new Set(visibleLessons.map((l) => l.id));
     const notifications = store.notifications
-      .filter((n) => !classId || n.classId === classId)
+      .filter((n) => {
+        if (classId && n.classId !== classId) return false;
+        if (!includeAnswers && classId && n.lessonId && !visibleLessonIds.has(n.lessonId)) {
+          return false;
+        }
+        return true;
+      })
       .slice(0, 20);
 
     const activityLogs = store.activityLogs
@@ -711,6 +801,7 @@ export async function handleLocalApi(
         competencyMatrix,
         notifications,
         activityLogs,
+        groupProgress,
         submissionsCount: store.submissions.length,
         activeWorkspaceId: resolvedWsId || activePublicWorkspaceId,
         ...(includeAnswers ? { submissions: store.submissions } : {}),
@@ -722,7 +813,8 @@ export async function handleLocalApi(
     pathname.startsWith('/api/workspace/') ||
     pathname === '/api/sync/cloud-hydrate' ||
     pathname.startsWith('/api/classes') ||
-    pathname.startsWith('/api/lessons');
+    pathname.startsWith('/api/lessons') ||
+    pathname.startsWith('/api/submissions/');
 
   if (isTeacherOnlyPath) {
     const authStore = loadLocalStore(storage);
@@ -809,7 +901,7 @@ export async function handleLocalApi(
         (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
       );
       if (validLessons.length > 0) {
-        store.lessons = recoverMissingCorrectAnswers(validLessons, store.lessons);
+        store.lessons = mergeLessonsPreservingCustom(store.lessons, validLessons);
       }
     }
     if (Array.isArray(payload.submissions) && payload.submissions.length > 0) {
@@ -1048,6 +1140,55 @@ export async function handleLocalApi(
     return { ok: true, status: 200, data: { ok: true } };
   }
 
+  // POST /api/submissions/:id/override (Teacher manual review / re-grade)
+  const overrideMatch = pathname.match(/^\/api\/submissions\/([^/]+)\/override$/);
+  if (overrideMatch && method === 'POST') {
+    const subId = decodeURIComponent(overrideMatch[1]);
+    const { isCorrect } = body as { isCorrect?: boolean };
+    if (typeof isCorrect !== 'boolean') {
+      return {
+        ok: false,
+        status: 400,
+        data: { error: 'Vui lòng chọn kết quả chấm lại (Đúng hoặc Chưa đúng).' },
+      };
+    }
+    const store = loadLocalStore(storage);
+    const sub = store.submissions.find((s) => s.id === subId);
+    if (!sub) {
+      return { ok: false, status: 404, data: { error: 'Không tìm thấy bài làm cần phúc khảo.' } };
+    }
+    const lesson = store.lessons.find((l) => l.id === sub.lessonId);
+    const question = lesson?.questions.find((q) => q.id === sub.questionId);
+    const breakdown = calculatePoints(isCorrect, sub.elapsedMs, question?.type ?? 'fill_blank');
+
+    sub.isCorrect = isCorrect;
+    sub.basePoints = breakdown.basePoints;
+    sub.speedBonus = breakdown.speedBonus;
+    sub.totalPoints = breakdown.totalPoints;
+    sub.feedbackText = isCorrect
+      ? `[GV phúc khảo] Công nhận đáp án đúng! Nhóm ${sub.groupName} nhận +${breakdown.totalPoints} điểm.`
+      : `[GV phúc khảo] Đánh dấu chưa đạt (0 điểm).`;
+
+    store.activityLogs.unshift({
+      id: `log-ov-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      classId: sub.classId,
+      groupId: sub.groupId,
+      action: isCorrect ? 'GV phúc khảo · Công nhận đúng' : 'GV phúc khảo · Chưa đúng',
+      detail: `${sub.lessonTitle} · Đáp án HS: "${sub.userAnswer.slice(0, 80)}"`,
+      competencyId: sub.competencyId,
+      pointsDelta: sub.totalPoints,
+      timestamp: new Date().toISOString(),
+    });
+
+    saveLocalStore(store, storage);
+    const leaderboard = buildLeaderboard(sub.classId, store.submissions, 'vi');
+    return {
+      ok: true,
+      status: 200,
+      data: { submission: sub, submissions: store.submissions, leaderboard },
+    };
+  }
+
   // POST /api/quiz/submit
   if (pathname === '/api/quiz/submit' && method === 'POST') {
     const item = body as {
@@ -1062,26 +1203,39 @@ export async function handleLocalApi(
     };
     const store = loadLocalStore(storage);
     const lang: Language = item.lang === 'en' ? 'en' : 'vi';
-    const submission = gradeOneLocally(store, item, lang, false);
-    if (!submission) {
+    const graded = gradeOneLocally(store, item, lang, false);
+    if (graded.status === 'forbidden') {
+      return {
+        ok: false,
+        status: 403,
+        data: { error: 'Bài tập này thuộc lớp học khác, không được giao cho lớp của em.' },
+      };
+    }
+    if (graded.status === 'not_found') {
       return { ok: false, status: 404, data: { error: 'Không tìm thấy câu hỏi tương ứng.' } };
     }
-    saveLocalStore(store, storage);
-    // Sync graded submission to Firestore publicSubmissions (zero-login) so all tablets & teacher see it live
-    const written = await writePublicSubmissionViaRest(
-      firebaseConfig,
-      activePublicWorkspaceId,
-      submission,
-    );
-    if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
-      await writePublicSubmissionViaRest(
+    const { submission, alreadySubmitted } = graded;
+    if (!alreadySubmitted) {
+      saveLocalStore(store, storage);
+      const written = await writePublicSubmissionViaRest(
         firebaseConfig,
-        LEGACY_FALLBACK_WORKSPACE_ID,
+        activePublicWorkspaceId,
         submission,
       );
+      if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
+        await writePublicSubmissionViaRest(
+          firebaseConfig,
+          LEGACY_FALLBACK_WORKSPACE_ID,
+          submission,
+        );
+      }
     }
     const leaderboard = buildLeaderboard(item.classId, store.submissions, lang);
-    return { ok: true, status: 200, data: { submission, leaderboard } };
+    return {
+      ok: true,
+      status: 200,
+      data: { submission, alreadySubmitted: Boolean(alreadySubmitted), leaderboard },
+    };
   }
 
   // POST /api/quiz/sync
@@ -1091,20 +1245,22 @@ export async function handleLocalApi(
     const resolvedLang: Language = lang === 'en' ? 'en' : 'vi';
     const synced: AnswerSubmission[] = [];
     for (const item of items ?? []) {
-      const sub = gradeOneLocally(store, item, resolvedLang, true);
-      if (sub) {
-        synced.push(sub);
-        const written = await writePublicSubmissionViaRest(
-          firebaseConfig,
-          activePublicWorkspaceId,
-          sub,
-        );
-        if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
-          await writePublicSubmissionViaRest(
+      const graded = gradeOneLocally(store, item, resolvedLang, true);
+      if (graded.status === 'ok') {
+        synced.push(graded.submission);
+        if (!graded.alreadySubmitted) {
+          const written = await writePublicSubmissionViaRest(
             firebaseConfig,
-            LEGACY_FALLBACK_WORKSPACE_ID,
-            sub,
+            activePublicWorkspaceId,
+            graded.submission,
           );
+          if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
+            await writePublicSubmissionViaRest(
+              firebaseConfig,
+              LEGACY_FALLBACK_WORKSPACE_ID,
+              graded.submission,
+            );
+          }
         }
       }
     }

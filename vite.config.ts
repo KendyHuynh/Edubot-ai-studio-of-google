@@ -2,7 +2,13 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import fs from 'fs';
 import path from 'path';
+import {fileURLToPath} from 'url';
 import {defineConfig} from 'vite';
+
+const rootDir =
+  typeof import.meta.dirname === 'string'
+    ? import.meta.dirname
+    : path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig(({command}) => {
   const buildBase = process.env.VITE_BASE_PATH || './';
@@ -11,6 +17,10 @@ export default defineConfig(({command}) => {
     build: {
       outDir: 'docs',
       emptyOutDir: true,
+    },
+    optimizeDeps: {
+      // Only scan the real app entry so static build outputs in docs/ and dist/ are never crawled in dev
+      entries: ['index.html'],
     },
     plugins: [
       react(),
@@ -23,9 +33,9 @@ export default defineConfig(({command}) => {
           if (error) {
             return;
           }
-          const docsDir = path.resolve(__dirname, 'docs');
-          const distDir = path.resolve(__dirname, 'dist');
-          const srcAssets = path.resolve(__dirname, 'src/assets');
+          const docsDir = path.resolve(rootDir, 'docs');
+          const distDir = path.resolve(rootDir, 'dist');
+          const srcAssets = path.resolve(rootDir, 'src/assets');
 
           // Remove AI Studio chat-uploaded preview images from the published static docs/ folder
           const chatUploadsDir = path.join(docsDir, 'assets', 'aistudio');
@@ -56,7 +66,7 @@ export default defineConfig(({command}) => {
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(rootDir, '.'),
       },
     },
     server: {
@@ -64,7 +74,12 @@ export default defineConfig(({command}) => {
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      watch:
+        process.env.DISABLE_HMR === 'true'
+          ? null
+          : {
+              ignored: ['**/docs/**', '**/dist/**', '**/data/**', '**/.playwright-cli/**'],
+            },
     },
   };
 });

@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import {
   DEFAULT_PUBLIC_WORKSPACE_ID,
+  isDefaultSeedClassesOnly,
   LEGACY_FALLBACK_WORKSPACE_ID,
   mergeLatestSubmissions,
   mergeSubmissionActivityLogs,
@@ -20,10 +21,12 @@ import {
   buildDomainChampions,
   buildLeaderboard,
   calculatePoints,
+  clampElapsedMs,
   formatGroupId,
   isAnswerMatch,
 } from './src/shared/scoring';
 import { recoverMissingCorrectAnswers } from './src/utils/answerRecovery';
+import { mergeLessonsPreservingCustom } from './src/utils/aiLessonVault';
 import {
   ActivityLog,
   AnswerSubmission,
@@ -35,7 +38,7 @@ import {
   Question,
   QuestionType,
 } from './src/shared/types';
-import { generateLessonQuestions, evaluateShortAnswerWithAI } from './server/gemini';
+import { generateLessonQuestions, QuestionStylePreset } from './server/gemini';
 import { loadStore, saveStore } from './server/store';
 import {
   AdminTokenPayload,
@@ -125,7 +128,14 @@ async function hydrateFromPublicWorkspace(
 
     if (snapshot && options.replaceContent) {
       if (snapshot.classes.length > 0) {
+        const wasDemoSeedOnly = isDefaultSeedClassesOnly(store.classes);
         store.classes = snapshot.classes;
+        if (wasDemoSeedOnly && !isDefaultSeedClassesOnly(snapshot.classes)) {
+          // Remove starter demo 5A/5B/6A submissions, notifications, and logs when real classes load
+          store.submissions = store.submissions.filter((s) => !s.id.startsWith('sub-seed-'));
+          store.activityLogs = store.activityLogs.filter((l) => !l.id.startsWith('log-seed-'));
+          store.notifications = store.notifications.filter((n) => !n.id.startsWith('notif-seed-'));
+        }
         changed = true;
       }
       if (snapshot.lessons.length > 0) {
@@ -133,16 +143,22 @@ async function hydrateFromPublicWorkspace(
         changed = true;
       }
       if (snapshot.notifications && snapshot.notifications.length > 0) {
+        const activeClassIds = new Set(store.classes.map((c) => c.id));
         const readMap = new Map(
           store.notifications.map((n) => [n.id, new Set(n.readByGroupIds ?? [])]),
         );
-        store.notifications = snapshot.notifications.map((n) => {
-          const existingRead = readMap.get(n.id);
-          const mergedRead = Array.from(
-            new Set([...(n.readByGroupIds ?? []), ...(existingRead ? Array.from(existingRead) : [])]),
-          );
-          return { ...n, readByGroupIds: mergedRead };
-        });
+        store.notifications = snapshot.notifications
+          .filter((n) => !n.classId || activeClassIds.size === 0 || activeClassIds.has(n.classId))
+          .map((n) => {
+            const existingRead = readMap.get(n.id);
+            const mergedRead = Array.from(
+              new Set([
+                ...(n.readByGroupIds ?? []),
+                ...(existingRead ? Array.from(existingRead) : []),
+              ]),
+            );
+            return { ...n, readByGroupIds: mergedRead };
+          });
         changed = true;
       }
     }
@@ -179,7 +195,7 @@ async function hydrateFromPublicWorkspace(
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: '25mb' }));
 
@@ -541,36 +557,88 @@ async function startServer() {
     const teacherAuth = getAuthenticatedTeacher(req);
     const includeAnswers = req.query.role === 'teacher' && Boolean(teacherAuth);
 
+    const preStore = loadStore();
+    const storeIsOnlyDemoSeed = isDefaultSeedClassesOnly(preStore.classes);
+
     const resolvedWsId = await hydrateFromPublicWorkspace(ws, {
-      replaceContent: !includeAnswers,
-      forceRefresh,
+      replaceContent: !includeAnswers || storeIsOnlyDemoSeed,
+      forceRefresh: forceRefresh || storeIsOnlyDemoSeed,
     });
 
     const store = loadStore();
     const classId = typeof req.query.classId === 'string' ? req.query.classId : '';
+    const lessonIdFilter = typeof req.query.lessonId === 'string' ? req.query.lessonId : '';
+    const groupIdFilter = typeof req.query.groupId === 'string' ? req.query.groupId : '';
     const lang = (req.query.lang === 'en' ? 'en' : 'vi') as Language;
 
-    const sanitizedLessons = store.lessons.map((lesson) => ({
+    const targetClassId =
+      classId && store.classes.some((c) => c.id === classId)
+        ? classId
+        : store.classes[0]?.id || 'LOP-8A';
+
+    // Strict class isolation for students: only expose lessons assigned to their checked-in class
+    const visibleLessons =
+      !includeAnswers && classId
+        ? store.lessons.filter((l) => l.assignedClassIds.includes(classId))
+        : store.lessons;
+
+    const sanitizedLessons = visibleLessons.map((lesson) => ({
       ...lesson,
       questions: lesson.questions.map((q) =>
         includeAnswers ? q : { ...q, correctAnswer: undefined },
       ),
     }));
 
-    const targetClassId =
-      classId && store.classes.some((c) => c.id === classId)
-        ? classId
-        : store.classes[0]?.id || 'LOP-8A';
-    const leaderboard = buildLeaderboard(targetClassId, store.submissions, lang);
-    const domainChampions = buildDomainChampions(targetClassId, store.submissions, lang);
+    const leaderboard = buildLeaderboard(
+      targetClassId,
+      store.submissions,
+      lang,
+      lessonIdFilter || undefined,
+    );
+    const domainChampions = buildDomainChampions(
+      targetClassId,
+      store.submissions,
+      lang,
+      lessonIdFilter || undefined,
+    );
     const competencyMatrix = buildCompetencyMatrix(
       store.lessons,
       store.submissions,
       classId || undefined,
     );
 
+    // Safe per-lesson completion summary for the currently checked-in student group (zero answer leaks)
+    const groupProgress: Record<
+      string,
+      { answeredQuestionIds: string[]; correctCount: number; totalPoints: number }
+    > = {};
+    if (classId && groupIdFilter) {
+      for (const sub of store.submissions) {
+        if (sub.classId === classId && sub.groupId === groupIdFilter) {
+          const entry = groupProgress[sub.lessonId] ?? {
+            answeredQuestionIds: [],
+            correctCount: 0,
+            totalPoints: 0,
+          };
+          if (!entry.answeredQuestionIds.includes(sub.questionId)) {
+            entry.answeredQuestionIds.push(sub.questionId);
+            if (sub.isCorrect) entry.correctCount += 1;
+            entry.totalPoints += sub.totalPoints;
+          }
+          groupProgress[sub.lessonId] = entry;
+        }
+      }
+    }
+
+    const visibleLessonIds = new Set(visibleLessons.map((l) => l.id));
     const notifications = store.notifications
-      .filter((n) => !classId || n.classId === classId)
+      .filter((n) => {
+        if (classId && n.classId !== classId) return false;
+        if (!includeAnswers && classId && n.lessonId && !visibleLessonIds.has(n.lessonId)) {
+          return false;
+        }
+        return true;
+      })
       .slice(0, 20);
 
     const activityLogs = store.activityLogs
@@ -590,6 +658,7 @@ async function startServer() {
       competencyMatrix,
       notifications,
       activityLogs,
+      groupProgress,
       submissionsCount: store.submissions.length,
       activeWorkspaceId: resolvedWsId,
       sharedAppUrl,
@@ -774,6 +843,7 @@ async function startServer() {
       base64Data,
       mimeType,
       questionCount,
+      questionStyle,
       assignedClassIds,
       language,
     } = req.body as {
@@ -783,6 +853,7 @@ async function startServer() {
       base64Data?: string;
       mimeType?: string;
       questionCount?: number;
+      questionStyle?: QuestionStylePreset;
       assignedClassIds?: string[];
       language?: Language;
     };
@@ -802,6 +873,7 @@ async function startServer() {
         base64Data,
         mimeType,
         questionCount: questionCount ?? 15,
+        questionStyle: questionStyle ?? 'multiple_choice_only',
         language: language ?? 'vi',
       });
 
@@ -959,7 +1031,7 @@ async function startServer() {
         (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
       );
       if (validLessons.length > 0) {
-        store.lessons = recoverMissingCorrectAnswers(validLessons, store.lessons);
+        store.lessons = mergeLessonsPreservingCustom(store.lessons, validLessons);
       }
     }
 
@@ -1057,12 +1129,39 @@ async function startServer() {
     },
     lang: Language,
     syncedFromOffline = false,
-  ): Promise<AnswerSubmission | null> {
+  ): Promise<
+    | { status: 'ok'; submission: AnswerSubmission; alreadySubmitted?: boolean }
+    | { status: 'forbidden' }
+    | { status: 'not_found' }
+  > {
     const store = loadStore();
     const lesson = store.lessons.find((l) => l.id === item.lessonId);
     const question = lesson?.questions.find((q) => q.id === item.questionId);
     if (!lesson || !question) {
-      return null;
+      return { status: 'not_found' };
+    }
+
+    // Strict per-class authorization: students may only submit to lessons assigned to their class
+    if (
+      Array.isArray(lesson.assignedClassIds) &&
+      lesson.assignedClassIds.length > 0 &&
+      !lesson.assignedClassIds.includes(item.classId)
+    ) {
+      return { status: 'forbidden' };
+    }
+
+    const groupId = formatGroupId(item.tabletNumber, item.groupName);
+
+    // Official 1st-attempt lock: keep the group's first recorded answer so repeated plays cannot overwrite/game scores
+    const existing = store.submissions.find(
+      (s) =>
+        s.classId === item.classId &&
+        s.groupId === groupId &&
+        s.lessonId === lesson.id &&
+        s.questionId === question.id,
+    );
+    if (existing) {
+      return { status: 'ok', submission: existing, alreadySubmitted: true };
     }
 
     let resolvedCorrectAnswer = question.correctAnswer ?? '';
@@ -1075,54 +1174,31 @@ async function startServer() {
       }
     }
 
-    const groupId = formatGroupId(item.tabletNumber, item.groupName);
     const comp = getCompetencyById(question.competencyId);
-    const compName = `${comp.id}. ${lang === 'vi' ? comp.nameVi : comp.nameEn}`;
+    const safeElapsedMs = clampElapsedMs(item.elapsedMs, question.type);
 
-    let isCorrect = isAnswerMatch(
+    // 100% deterministic, instant forgiving grading using stored answer keys + synonyms — NO AI calls!
+    const isCorrect = isAnswerMatch(
       item.userAnswer,
       resolvedCorrectAnswer,
       question.type,
       question.options,
     );
-    let feedbackText = '';
-    let explanation = question.explanation;
+    const explanation = question.explanation;
+    const breakdown = calculatePoints(isCorrect, safeElapsedMs, question.type);
 
-    if (question.type === 'short_answer' && process.env.GEMINI_API_KEY) {
-      try {
-        const aiGrade = await evaluateShortAnswerWithAI({
-          questionText: question.questionText,
-          correctAnswer: resolvedCorrectAnswer,
-          userAnswer: item.userAnswer,
-          competencyName: compName,
-          groupName: item.groupName,
-          language: lang,
-        });
-        isCorrect = aiGrade.isCorrect;
-        feedbackText = aiGrade.feedbackText;
-        explanation = aiGrade.explanation;
-      } catch {
-        // Fallback smoothly to deterministic feedback if AI grading call drops
-      }
-    }
-
-    const breakdown = calculatePoints(isCorrect, item.elapsedMs);
-
-    if (!feedbackText) {
-      if (lang === 'en') {
-        feedbackText = isCorrect
+    const feedbackText =
+      lang === 'en'
+        ? isCorrect
           ? breakdown.speedBonus >= 35
             ? `Lightning fast, ${item.groupName}! +${breakdown.totalPoints} pts (including +${breakdown.speedBonus} speed bonus)!`
             : `Spot on, ${item.groupName}! +${breakdown.totalPoints} pts!`
-          : `Nice try, ${item.groupName}! Check the Digital Citizen tip below and keep going!`;
-      } else {
-        feedbackText = isCorrect
+          : `Nice try, ${item.groupName}! Check the Digital Citizen tip below and keep going!`
+        : isCorrect
           ? breakdown.speedBonus >= 35
             ? `Quá nhanh quá nguy hiểm! Nhóm ${item.groupName} ghi ngay +${breakdown.totalPoints} điểm (gồm +${breakdown.speedBonus} điểm tốc độ)!`
             : `Chính xác tuyệt đối! Chúc mừng nhóm ${item.groupName} nhận +${breakdown.totalPoints} điểm!`
           : `Suýt đúng rồi ${item.groupName} ơi! Xem bí kíp Công dân số bên dưới để ghi điểm câu sau nhé!`;
-      }
-    }
 
     const submission: AnswerSubmission = {
       id: `sub-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -1140,26 +1216,14 @@ async function startServer() {
       basePoints: breakdown.basePoints,
       speedBonus: breakdown.speedBonus,
       totalPoints: breakdown.totalPoints,
-      elapsedMs: item.elapsedMs,
+      elapsedMs: safeElapsedMs,
       submittedAt: item.submittedAt || new Date().toISOString(),
       feedbackText,
       explanation,
       syncedFromOffline,
     };
 
-    // Replace earlier attempt for the same group + question + lesson so retries update cleanly or keep best
-    const existingIdx = store.submissions.findIndex(
-      (s) =>
-        s.classId === submission.classId &&
-        s.groupId === submission.groupId &&
-        s.lessonId === submission.lessonId &&
-        s.questionId === submission.questionId,
-    );
-    if (existingIdx >= 0) {
-      store.submissions[existingIdx] = submission;
-    } else {
-      store.submissions.push(submission);
-    }
+    store.submissions.push(submission);
 
     const log: ActivityLog = {
       id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1180,8 +1244,52 @@ async function startServer() {
     store.activityLogs.unshift(log);
 
     saveStore(store);
-    return submission;
+    return { status: 'ok', submission, alreadySubmitted: false };
   }
+
+  // Teacher manual grade review / override for any recorded student answer
+  app.post('/api/submissions/:id/override', requireTeacherAuth, (req, res) => {
+    const subId = decodeURIComponent(req.params.id);
+    const { isCorrect } = req.body as { isCorrect?: boolean };
+    if (typeof isCorrect !== 'boolean') {
+      res.status(400).json({ error: 'Vui lòng chọn kết quả chấm lại (Đúng hoặc Chưa đúng).' });
+      return;
+    }
+
+    const store = loadStore();
+    const sub = store.submissions.find((s) => s.id === subId);
+    if (!sub) {
+      res.status(404).json({ error: 'Không tìm thấy bài làm cần phúc khảo.' });
+      return;
+    }
+
+    const lesson = store.lessons.find((l) => l.id === sub.lessonId);
+    const question = lesson?.questions.find((q) => q.id === sub.questionId);
+    const breakdown = calculatePoints(isCorrect, sub.elapsedMs, question?.type ?? 'fill_blank');
+
+    sub.isCorrect = isCorrect;
+    sub.basePoints = breakdown.basePoints;
+    sub.speedBonus = breakdown.speedBonus;
+    sub.totalPoints = breakdown.totalPoints;
+    sub.feedbackText = isCorrect
+      ? `[GV phúc khảo] Công nhận đáp án đúng! Nhóm ${sub.groupName} nhận +${breakdown.totalPoints} điểm.`
+      : `[GV phúc khảo] Đánh dấu chưa đạt (0 điểm).`;
+
+    store.activityLogs.unshift({
+      id: `log-ov-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      classId: sub.classId,
+      groupId: sub.groupId,
+      action: isCorrect ? 'GV phúc khảo · Công nhận đúng' : 'GV phúc khảo · Chưa đúng',
+      detail: `${sub.lessonTitle} · Đáp án HS: "${sub.userAnswer.slice(0, 80)}"`,
+      competencyId: sub.competencyId,
+      pointsDelta: sub.totalPoints,
+      timestamp: new Date().toISOString(),
+    });
+
+    saveStore(store);
+    const leaderboard = buildLeaderboard(sub.classId, store.submissions, 'vi');
+    res.json({ submission: sub, submissions: store.submissions, leaderboard });
+  });
 
   // Step 3: Submit single answer
   app.post('/api/quiz/submit', async (req, res) => {
@@ -1201,22 +1309,33 @@ async function startServer() {
       return;
     }
 
-    const submission = await gradeSubmissionItem(
+    const graded = await gradeSubmissionItem(
       body,
       body.lang === 'en' ? 'en' : 'vi',
       false,
     );
 
-    if (!submission) {
+    if (graded.status === 'forbidden') {
+      res.status(403).json({
+        error: 'Bài tập này thuộc lớp học khác, không được giao cho lớp của em.',
+      });
+      return;
+    }
+
+    if (graded.status === 'not_found') {
       res.status(404).json({ error: 'Không tìm thấy câu hỏi tương ứng.' });
       return;
     }
 
-    // Mirror graded submission to Firestore publicSubmissions so GitHub Pages / other devices & teacher see it live
-    const cfg = readFirebaseConfig();
-    const written = await writePublicSubmissionViaRest(cfg, activePublicWorkspaceId, submission);
-    if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
-      await writePublicSubmissionViaRest(cfg, LEGACY_FALLBACK_WORKSPACE_ID, submission);
+    const { submission, alreadySubmitted } = graded;
+
+    // Mirror newly graded submission to Firestore publicSubmissions so GitHub Pages / other devices & teacher see it live
+    if (!alreadySubmitted) {
+      const cfg = readFirebaseConfig();
+      const written = await writePublicSubmissionViaRest(cfg, activePublicWorkspaceId, submission);
+      if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
+        await writePublicSubmissionViaRest(cfg, LEGACY_FALLBACK_WORKSPACE_ID, submission);
+      }
     }
 
     const store = loadStore();
@@ -1226,7 +1345,7 @@ async function startServer() {
       body.lang === 'en' ? 'en' : 'vi',
     );
 
-    res.json({ submission, leaderboard });
+    res.json({ submission, alreadySubmitted: Boolean(alreadySubmitted), leaderboard });
   });
 
   // Sync queued offline answers
@@ -1239,16 +1358,26 @@ async function startServer() {
     const cfg = readFirebaseConfig();
     const synced: AnswerSubmission[] = [];
     for (const item of items ?? []) {
-      const result = await gradeSubmissionItem(
+      const graded = await gradeSubmissionItem(
         item,
         lang === 'en' ? 'en' : 'vi',
         true,
       );
-      if (result) {
-        synced.push(result);
-        const written = await writePublicSubmissionViaRest(cfg, activePublicWorkspaceId, result);
-        if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
-          await writePublicSubmissionViaRest(cfg, LEGACY_FALLBACK_WORKSPACE_ID, result);
+      if (graded.status === 'ok') {
+        synced.push(graded.submission);
+        if (!graded.alreadySubmitted) {
+          const written = await writePublicSubmissionViaRest(
+            cfg,
+            activePublicWorkspaceId,
+            graded.submission,
+          );
+          if (!written && activePublicWorkspaceId === DEFAULT_PUBLIC_WORKSPACE_ID) {
+            await writePublicSubmissionViaRest(
+              cfg,
+              LEGACY_FALLBACK_WORKSPACE_ID,
+              graded.submission,
+            );
+          }
         }
       }
     }
@@ -1326,23 +1455,61 @@ async function startServer() {
     },
   );
 
+  let viteServer: Awaited<ReturnType<typeof createViteServer>> | null = null;
+
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
+    const disableHmr = process.env.DISABLE_HMR === 'true';
+    const viteReady = createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: !disableHmr,
+        watch: disableHmr ? null : undefined,
+      },
       appType: 'spa',
+    }).then((server) => {
+      viteServer = server;
+      return server;
     });
-    app.use(vite.middlewares);
+
+    // Attach Vite lazily so port 3000 opens immediately for health checks without waiting on cold Vite warm-up
+    app.use((req, res, next) => {
+      viteReady
+        .then((server) => server.middlewares(req, res, next))
+        .catch(next);
+    });
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distPath));
+    const staticRoot = fs.existsSync(path.join(distPath, 'index.html'))
+      ? distPath
+      : path.resolve(process.cwd(), 'docs');
+    app.use(express.static(staticRoot));
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(path.join(staticRoot, 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`EduBot Digital Citizen running on http://localhost:${PORT}`);
+    // Immediately replace built-in demo seed classes (5A/5B/6A) with published Firestore classes if local file was reset
+    if (isDefaultSeedClassesOnly(loadStore().classes)) {
+      void hydrateFromPublicWorkspace('', { replaceContent: true, forceRefresh: true });
+    }
   });
+
+  const shutdown = () => {
+    httpServer.close(() => {
+      if (viteServer) {
+        void viteServer.close().finally(() => process.exit(0));
+      } else {
+        process.exit(0);
+      }
+    });
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Failed to start EduBot server:', err);
+  process.exit(1);
+});

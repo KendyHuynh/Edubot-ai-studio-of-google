@@ -11,27 +11,68 @@ import {
 } from './scoring';
 import { AnswerSubmission, Lesson } from './types';
 
-test('calculatePoints awards base + speed bonus when correct and 0 when wrong', () => {
-  const fast = calculatePoints(true, 4000);
+test('calculatePoints awards fair per-question-type speed bonuses and preserves 100 base points after bonus window', () => {
+  // Multiple choice: <= 15s gets full +50 reading grace
+  const fast = calculatePoints(true, 14000, 'multiple_choice');
   assert.equal(fast.basePoints, 100);
   assert.equal(fast.speedBonus, 50);
   assert.equal(fast.totalPoints, 150);
 
-  const medium = calculatePoints(true, 26500);
+  // Multiple choice: 26.5s gets partial speed bonus
+  const medium = calculatePoints(true, 26500, 'multiple_choice');
   assert.equal(medium.basePoints, 100);
   assert.ok(medium.speedBonus > 0 && medium.speedBonus < 50);
 
-  const wrong = calculatePoints(false, 2000);
+  // Multiple choice: > 60s still keeps full 100 accuracy points (never penalized for researching)
+  const thorough = calculatePoints(true, 95000, 'multiple_choice');
+  assert.equal(thorough.basePoints, 100);
+  assert.equal(thorough.speedBonus, 0);
+  assert.equal(thorough.totalPoints, 100);
+
+  // Fill blank gets 20s full bonus; short answer gets 30s full bonus
+  assert.equal(calculatePoints(true, 19000, 'fill_blank').speedBonus, 50);
+  assert.equal(calculatePoints(true, 28000, 'short_answer').speedBonus, 50);
+
+  // Wrong answer always earns 0 points regardless of speed
+  const wrong = calculatePoints(false, 2000, 'multiple_choice');
   assert.equal(wrong.totalPoints, 0);
   assert.equal(wrong.speedBonus, 0);
 });
 
-test('isAnswerMatch handles Vietnamese diacritics, punctuation, and fill_blank phrases', () => {
+test('isAnswerMatch grades deterministically without AI (|-variants, diacritics, negation, core keywords)', () => {
   assert.equal(isAnswerMatch('Mật khẩu mạnh!', 'Mật khẩu mạnh', 'multiple_choice'), true);
   assert.equal(
     isAnswerMatch('Em sẽ dùng xác thực hai yếu tố để bảo vệ', 'xác thực hai yếu tố', 'fill_blank'),
     true,
   );
+  // Diacritic-insensitive tablet typing fallback
+  assert.equal(
+    isAnswerMatch('giay phep su dung', 'giấy phép sử dụng', 'fill_blank'),
+    true,
+  );
+  // Pipe-separated accepted answer variants
+  assert.equal(
+    isAnswerMatch('ban quyen', 'giấy phép sử dụng | bản quyền | copyright', 'fill_blank'),
+    true,
+  );
+  // Built-in Vietnamese synonym & number-word equivalence
+  assert.equal(isAnswerMatch('bảo mật hai lớp', '2FA', 'fill_blank'), true);
+  assert.equal(isAnswerMatch('xác thực hai bước', 'xác thực 2 bước', 'fill_blank'), true);
+  assert.equal(isAnswerMatch('tác quyền', 'bản quyền', 'fill_blank'), true);
+  assert.equal(isAnswerMatch('tin sai sự thật', 'tin giả', 'fill_blank'), true);
+  // Minor tablet typo tolerance (Levenshtein)
+  assert.equal(isAnswerMatch('mat khau manhh', 'mật khẩu mạnh', 'fill_blank'), true);
+  assert.equal(isAnswerMatch('kiem chung nguon', 'kiểm chứng nguồn tin', 'fill_blank'), true);
+  // Short answer core keyword coverage without AI
+  assert.equal(
+    isAnswerMatch(
+      'Nhắc bạn gỡ bỏ ngay vì tôn trọng quyền riêng tư không đăng ảnh người khác',
+      'Nhắc nhở bạn gỡ bỏ ngay, tôn trọng quyền riêng tư và đạo đức số, không chia sẻ thông tin cá nhân người khác khi chưa có sự đồng ý.',
+      'short_answer',
+    ),
+    true,
+  );
+  // Negation polarity still blocks opposite answers
   assert.equal(isAnswerMatch('Chia sẻ mật khẩu cho bạn', 'Không chia sẻ mật khẩu', 'short_answer'), false);
 });
 

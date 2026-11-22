@@ -1,6 +1,7 @@
 import {
   ActivityLog,
   AnswerSubmission,
+  ClassRoom,
   Lesson,
   Question,
 } from '../shared/types';
@@ -58,6 +59,25 @@ export function toFirestoreDocId(raw: string, maxLen = 80): string {
  */
 export function normalizeClassCode(raw: string): string {
   return toFirestoreDocId(raw, 64).toUpperCase();
+}
+
+const DEMO_SEED_CLASS_SIGNATURES = new Map<string, string>([
+  ['LOP-5A', 'Cô Minh Anh'],
+  ['LOP-5B', 'Thầy Quốc Bảo'],
+  ['LOP-6A', 'Cô Thu Hà'],
+]);
+
+/**
+ * Returns true when `classes` is empty or contains ONLY the built-in starter demo classes
+ * (LOP-5A, LOP-5B, LOP-6A). Used to guarantee real teacher classes from Firestore always
+ * replace starter demo placeholders—and demo classes are never accidentally pushed to cloud.
+ */
+export function isDefaultSeedClassesOnly(classes: ClassRoom[]): boolean {
+  if (!Array.isArray(classes) || classes.length === 0) return true;
+  return classes.every((c) => {
+    const demoTeacher = DEMO_SEED_CLASS_SIGNATURES.get(c.id);
+    return Boolean(demoTeacher && c.teacherName === demoTeacher);
+  });
 }
 
 /**

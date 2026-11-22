@@ -11,7 +11,7 @@ import {
 import { HonorBoard } from './components/HonorBoard';
 import { IdentityGate } from './components/IdentityGate';
 import { NotificationDrawer } from './components/NotificationDrawer';
-import { StudentArena } from './components/StudentArena';
+import { GroupLessonProgress, StudentArena } from './components/StudentArena';
 import { TeacherPinGate } from './components/TeacherPinGate';
 import { TeacherStudio } from './components/TeacherStudio';
 import { ActiveTab, TopNav } from './components/TopNav';
@@ -50,6 +50,7 @@ interface BootstrapResponse {
   competencyMatrix: CompetencyCoverageStat[];
   notifications: PushNotification[];
   activityLogs: ActivityLog[];
+  groupProgress?: Record<string, GroupLessonProgress>;
   submissions?: AnswerSubmission[];
   sharedAppUrl?: string;
 }
@@ -116,6 +117,8 @@ export default function App() {
     return window.localStorage.getItem(WORKSPACE_CODE_KEY);
   });
   const [honorClassId, setHonorClassId] = useState<string>('');
+  const [honorLessonId, setHonorLessonId] = useState<string>('');
+  const [groupProgress, setGroupProgress] = useState<Record<string, GroupLessonProgress>>({});
   const [selectedLessonId, setSelectedLessonId] = useState<string | null>(null);
 
   const [browserOnline, setBrowserOnline] = useState<boolean>(
@@ -141,10 +144,16 @@ export default function App() {
   const isOfflineEffective = !browserOnline || simulateOffline;
   const copy = getCopy(lang, uiMode);
 
+  // In Student Portal, strictly lock rankings & lessons to the checked-in class (or teacher join-link class)
+  const studentLockedClassId =
+    portal === 'student' ? session?.classId || entryParams.classId || null : null;
+
   const activeClassId =
-    activeTab === 'honor'
-      ? honorClassId || classes[0]?.id || ''
-      : session?.classId || entryParams.classId || classes[0]?.id || '';
+    portal === 'student'
+      ? studentLockedClassId || honorClassId || classes[0]?.id || ''
+      : activeTab === 'honor'
+        ? honorClassId || classes[0]?.id || ''
+        : honorClassId || classes[0]?.id || '';
 
   const fetchBootstrap = useCallback(
     async (forceRefresh = false) => {
@@ -155,19 +164,30 @@ export default function App() {
         const wsQuery = workspaceCode
           ? `&ws=${encodeURIComponent(workspaceCode)}`
           : '';
+        const lessonQuery =
+          activeTab === 'honor' && honorLessonId
+            ? `&lessonId=${encodeURIComponent(honorLessonId)}`
+            : '';
+        const groupQuery =
+          portal === 'student' && session?.groupId
+            ? `&groupId=${encodeURIComponent(session.groupId)}`
+            : '';
         const refreshQuery = forceRefresh ? '&refresh=1' : '';
         const url = `/api/bootstrap?classId=${encodeURIComponent(
           activeClassId,
-        )}&lang=${lang}&role=${roleParam}${wsQuery}${refreshQuery}`;
+        )}&lang=${lang}&role=${roleParam}${wsQuery}${lessonQuery}${groupQuery}${refreshQuery}`;
         const res = await apiRequestJson<BootstrapResponse>(url, {}, lang);
         if (!res.ok) return;
         const data = res.data;
 
         setClasses(data.classes);
         if (data.classes.length > 0) {
-          setHonorClassId((prev) =>
-            prev && data.classes.some((c) => c.id === prev) ? prev : data.classes[0].id,
-          );
+          setHonorClassId((prev) => {
+            if (studentLockedClassId) return studentLockedClassId;
+            return prev && data.classes.some((c) => c.id === prev)
+              ? prev
+              : data.classes[0].id;
+          });
         }
         setLessons(data.lessons);
         cacheLessonsOffline(data.lessons);
@@ -176,6 +196,7 @@ export default function App() {
         setCompetencyMatrix(data.competencyMatrix);
         setNotifications(data.notifications);
         setActivityLogs(data.activityLogs);
+        setGroupProgress(data.groupProgress ?? {});
         if (data.sharedAppUrl) {
           setSharedAppUrl(data.sharedAppUrl);
         }
@@ -206,12 +227,15 @@ export default function App() {
     },
     [
       activeClassId,
+      activeTab,
       browserPermission,
+      honorLessonId,
       isOfflineEffective,
       lang,
       portal,
       seenNotifIds,
       session,
+      studentLockedClassId,
       teacherUnlocked,
       workspaceCode,
     ],
@@ -538,7 +562,13 @@ export default function App() {
             <HonorBoard
               classes={classes}
               selectedClassId={honorClassId}
-              onChangeClass={(cid) => setHonorClassId(cid)}
+              onChangeClass={(cid) => {
+                setHonorClassId(cid);
+                setHonorLessonId('');
+              }}
+              lessons={lessons}
+              selectedLessonId={honorLessonId}
+              onChangeLesson={(lid) => setHonorLessonId(lid)}
               leaderboard={leaderboard}
               domainChampions={domainChampions}
               copy={copy}
@@ -556,20 +586,6 @@ export default function App() {
               selectedClassId={activeClassId}
               onRefreshData={() => fetchBootstrap(true)}
               onLockTeacherPortal={handleLockTeacherPortal}
-              onSelectLessonForPlay={(lid) => {
-                if (!session) {
-                  setSession({
-                    classId: classes[0]?.id || 'LOP-8A',
-                    tabletNumber: 1,
-                    groupName: 'Sao Xanh',
-                    groupId: 'Máy-01 · Sao Xanh',
-                  });
-                }
-                window.history.pushState({}, '', getCleanBasePath());
-                setPortal('student');
-                setSelectedLessonId(lid);
-                setActiveTab('play');
-              }}
               copy={copy}
               lang={lang}
             />
@@ -596,10 +612,12 @@ export default function App() {
                 lessons={lessons}
                 selectedLessonId={selectedLessonId}
                 onSelectLesson={setSelectedLessonId}
+                groupProgress={groupProgress}
                 notifications={notifications}
                 onGoToIdentity={() => setActiveTab('identity')}
                 onGoToHonorBoard={() => {
                   if (session) setHonorClassId(session.classId);
+                  setHonorLessonId('');
                   setActiveTab('honor');
                 }}
                 isOfflineEffective={isOfflineEffective}
@@ -616,8 +634,17 @@ export default function App() {
             {activeTab === 'honor' && (
               <HonorBoard
                 classes={classes}
-                selectedClassId={honorClassId}
-                onChangeClass={(cid) => setHonorClassId(cid)}
+                selectedClassId={studentLockedClassId || honorClassId}
+                lockedClassId={studentLockedClassId}
+                onChangeClass={(cid) => {
+                  if (!studentLockedClassId) {
+                    setHonorClassId(cid);
+                    setHonorLessonId('');
+                  }
+                }}
+                lessons={lessons}
+                selectedLessonId={honorLessonId}
+                onChangeLesson={(lid) => setHonorLessonId(lid)}
                 leaderboard={leaderboard}
                 domainChampions={domainChampions}
                 copy={copy}

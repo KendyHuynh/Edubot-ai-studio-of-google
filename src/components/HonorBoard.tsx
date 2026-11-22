@@ -1,13 +1,17 @@
-import { Award, Download, Medal, ShieldCheck, Trophy } from 'lucide-react';
+import { Award, Download, Lock, Medal, ShieldCheck, Trophy } from 'lucide-react';
 import { COMPETENCY_DOMAINS } from '../shared/competencies';
 import { CopyDict } from '../shared/i18n';
 import { DomainHonorAward } from '../shared/scoring';
-import { ClassRoom, Language, LeaderboardEntry } from '../shared/types';
+import { ClassRoom, Language, LeaderboardEntry, Lesson } from '../shared/types';
 
 interface HonorBoardProps {
   classes: ClassRoom[];
   selectedClassId: string;
+  lockedClassId?: string | null;
   onChangeClass: (classId: string) => void;
+  lessons?: Lesson[];
+  selectedLessonId?: string;
+  onChangeLesson?: (lessonId: string) => void;
   leaderboard: LeaderboardEntry[];
   domainChampions: DomainHonorAward[];
   copy: CopyDict;
@@ -17,16 +21,27 @@ interface HonorBoardProps {
 export function HonorBoard({
   classes,
   selectedClassId,
+  lockedClassId = null,
   onChangeClass,
+  lessons = [],
+  selectedLessonId = '',
+  onChangeLesson,
   leaderboard,
   domainChampions,
   copy,
   lang,
 }: HonorBoardProps) {
+  const effectiveClassId = lockedClassId || selectedClassId;
+  const activeClassObj = classes.find((c) => c.id === effectiveClassId);
+  const classLessons = lessons.filter(
+    (l) => !effectiveClassId || l.assignedClassIds.includes(effectiveClassId),
+  );
+
   const handleDownloadJson = () => {
     const payload = {
       exportedAt: new Date().toISOString(),
-      ClassID: selectedClassId,
+      ClassID: effectiveClassId,
+      LessonID: selectedLessonId || 'ALL',
       rankings: leaderboard.map((row) => ({
         ClassID: row.ClassID,
         GroupID: row.GroupID,
@@ -43,7 +58,7 @@ export function HonorBoard({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `vinh-danh-${selectedClassId}.json`;
+    a.download = `vinh-danh-${effectiveClassId}${selectedLessonId ? `-${selectedLessonId}` : ''}.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -52,7 +67,7 @@ export function HonorBoard({
 
   return (
     <section className="max-w-6xl mx-auto space-y-6">
-      {/* Header & Class Filter */}
+      {/* Header & Class / Lesson Filter */}
       <div className="bg-white border border-slate-200 rounded-2xl p-6 flex flex-wrap items-center justify-between gap-4">
         <div className="space-y-1">
           <p className="text-xs font-semibold text-sky-700">
@@ -66,21 +81,53 @@ export function HonorBoard({
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          <label htmlFor="honor-class-filter" className="text-sm font-medium text-slate-600">
-            {lang === 'vi' ? 'Lớp:' : 'Class:'}
-          </label>
-          <select
-            id="honor-class-filter"
-            value={selectedClassId}
-            onChange={(e) => onChangeClass(e.target.value)}
-            className="px-3.5 py-2 text-sm font-semibold border border-slate-300 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-sky-500"
-          >
-            {classes.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.id} · {c.name}
+          {lockedClassId ? (
+            <div className="inline-flex items-center gap-2 px-3.5 py-2 text-xs sm:text-sm font-semibold text-sky-900 bg-sky-50 border border-sky-200 rounded-xl">
+              <Lock className="w-3.5 h-3.5 text-sky-700 shrink-0" />
+              <span>
+                {lang === 'vi'
+                  ? `Lớp ${effectiveClassId}${activeClassObj ? ` · ${activeClassObj.name}` : ''} (Nội bộ lớp)`
+                  : `Class ${effectiveClassId} (Class-Only Ranking)`}
+              </span>
+            </div>
+          ) : (
+            <>
+              <label htmlFor="honor-class-filter" className="text-sm font-medium text-slate-600">
+                {lang === 'vi' ? 'Lớp:' : 'Class:'}
+              </label>
+              <select
+                id="honor-class-filter"
+                value={effectiveClassId}
+                onChange={(e) => onChangeClass(e.target.value)}
+                className="px-3.5 py-2 text-sm font-semibold border border-slate-300 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-sky-500"
+              >
+                {classes.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.id} · {c.name}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
+
+          {onChangeLesson && classLessons.length > 0 && (
+            <select
+              id="honor-lesson-filter"
+              aria-label={lang === 'vi' ? 'Lọc theo bài học' : 'Filter by lesson'}
+              value={selectedLessonId}
+              onChange={(e) => onChangeLesson(e.target.value)}
+              className="px-3.5 py-2 text-sm font-medium border border-slate-300 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-sky-500 max-w-[260px]"
+            >
+              <option value="">
+                {lang === 'vi' ? 'Tất cả bài học của lớp' : 'All Class Lessons'}
               </option>
-            ))}
-          </select>
+              {classLessons.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.title}
+                </option>
+              ))}
+            </select>
+          )}
 
           <button
             type="button"
@@ -171,8 +218,8 @@ export function HonorBoard({
         {leaderboard.length === 0 ? (
           <div className="p-10 text-center text-sm text-slate-500">
             {lang === 'vi'
-              ? `Lớp ${selectedClassId} chưa có lượt trả lời nào. Hãy vào mục Trò chơi để ghi điểm đầu tiên!`
-              : `No answers recorded yet for ${selectedClassId}. Start a quiz to earn points!`}
+              ? `Lớp ${effectiveClassId} chưa có lượt trả lời nào${selectedLessonId ? ' cho bài học này' : ''}. Hãy vào mục Trò chơi để ghi điểm đầu tiên!`
+              : `No answers recorded yet for ${effectiveClassId}. Start a quiz to earn points!`}
           </div>
         ) : (
           <div className="overflow-x-auto">

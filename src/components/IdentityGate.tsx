@@ -157,13 +157,22 @@ export function IdentityGate({
         <form onSubmit={handleSubmit} className="space-y-5">
           {/* Class selection */}
           <div className="space-y-3">
-            <label
-              htmlFor="class-code-select"
-              className="flex items-center gap-2 text-sm font-semibold text-slate-900"
-            >
-              <Users className="w-4 h-4 text-sky-600" />
-              <span>{copy.classCodeLabel}</span>
-            </label>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label
+                htmlFor="class-code-select"
+                className="flex items-center gap-2 text-sm font-semibold text-slate-900"
+              >
+                <Users className="w-4 h-4 text-sky-600" />
+                <span>{copy.classCodeLabel}</span>
+              </label>
+              {initialClassId && (
+                <span className="text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-lg">
+                  {lang === 'vi'
+                    ? `Đã khóa vào lớp ${initialClassId} theo link giáo viên`
+                    : `Locked to class ${initialClassId} by teacher link`}
+                </span>
+              )}
+            </div>
 
             {classes.length === 0 ? (
               <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 text-xs sm:text-sm text-slate-500">
@@ -173,14 +182,20 @@ export function IdentityGate({
               </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                {classes.map((cls) => {
+                {(initialClassId
+                  ? classes.filter((c) => c.id === initialClassId)
+                  : classes
+                ).map((cls) => {
                   const selected = selectedClassId === cls.id;
                   return (
                     <button
                       key={cls.id}
                       type="button"
+                      disabled={Boolean(initialClassId)}
                       onClick={() => setSelectedClassId(cls.id)}
-                      className={`text-left p-4 rounded-xl border transition-colors cursor-pointer min-h-[56px] ${
+                      className={`text-left p-4 rounded-xl border transition-colors min-h-[56px] ${
+                        initialClassId ? 'cursor-default' : 'cursor-pointer'
+                      } ${
                         selected
                           ? 'border-sky-600 bg-sky-50/70 text-slate-900'
                           : 'border-slate-200 bg-white hover:border-slate-300 text-slate-700'
@@ -204,21 +219,23 @@ export function IdentityGate({
               </div>
             )}
 
-            <div className="pt-1 flex flex-wrap items-center gap-3">
-              <input
-                id="class-code-select"
-                type="text"
-                value={selectedClassId}
-                onChange={(e) => setSelectedClassId(e.target.value.toUpperCase())}
-                placeholder={classes[0]?.id || 'LOP-8A'}
-                className="w-full sm:w-64 px-3.5 py-2.5 text-sm font-mono-num font-semibold border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-sky-500"
-              />
-              <span className="text-xs text-slate-500">
-                {lang === 'vi'
-                  ? 'Nhập Mã lớp giáo viên cung cấp hoặc mở link tham gia lớp.'
-                  : 'Enter the Class Code shared by your teacher or open their join link.'}
-              </span>
-            </div>
+            {!initialClassId && (
+              <div className="pt-1 flex flex-wrap items-center gap-3">
+                <input
+                  id="class-code-select"
+                  type="text"
+                  value={selectedClassId}
+                  onChange={(e) => setSelectedClassId(e.target.value.toUpperCase())}
+                  placeholder={classes[0]?.id || 'LOP-8A'}
+                  className="w-full sm:w-64 px-3.5 py-2.5 text-sm font-mono-num font-semibold border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-sky-500"
+                />
+                <span className="text-xs text-slate-500">
+                  {lang === 'vi'
+                    ? 'Nhập Mã lớp giáo viên cung cấp hoặc mở link tham gia lớp.'
+                    : 'Enter the Class Code shared by your teacher or open their join link.'}
+                </span>
+              </div>
+            )}
           </div>
 
           {/* 10 Shared Tablets Grid */}
@@ -280,6 +297,11 @@ export function IdentityGate({
                 uiMode === 'kid' ? 'py-3.5 text-base font-medium' : 'py-2.5 text-sm'
               }`}
             />
+            <p className="text-xs text-slate-500">
+              {lang === 'vi'
+                ? 'Lưu ý: Nhập đúng Tên nhóm hoặc Họ tên thành viên nhóm em (VD: Nhóm 1 - An, Bình) để thầy/cô dễ nhận biết bài làm và không bị trùng với ca học khác.'
+                : 'Tip: Enter your exact Team Name or student names so your teacher can clearly track your group’s work.'}
+            </p>
           </div>
 
           {errorMsg && (

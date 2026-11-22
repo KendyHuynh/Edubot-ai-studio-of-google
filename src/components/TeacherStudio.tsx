@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import {
+  BookmarkCheck,
   BookOpen,
   Check,
+  CheckCircle2,
+  ClipboardCheck,
+  Clock,
   Cloud,
   CloudOff,
   Code2,
@@ -11,6 +15,7 @@ import {
   Eye,
   EyeOff,
   FileUp,
+  FlaskConical,
   FolderOpen,
   History,
   LayoutGrid,
@@ -24,6 +29,7 @@ import {
   Sparkles,
   Trash2,
   Upload,
+  XCircle,
 } from 'lucide-react';
 import { COMPETENCIES_24, COMPETENCY_DOMAINS, getCompetencyById } from '../shared/competencies';
 import { CopyDict } from '../shared/i18n';
@@ -45,6 +51,7 @@ import {
   pushWorkspaceToFirestore,
   saveClassToFirestore,
   saveLessonToFirestore,
+  syncOverriddenSubmissionToCloud,
   syncUserProfileToFirestore,
   testFirestoreConnection,
 } from '../utils/firestoreSync';
@@ -65,10 +72,20 @@ import {
   hasStrippedAnswers,
   recoverMissingCorrectAnswers,
 } from '../utils/answerRecovery';
+import {
+  countReadyAnswerKeys,
+  forgetAiLesson,
+  isAiGeneratedOrCustomLesson,
+  loadDeletedLessonIds,
+  loadRememberedAiLessons,
+  rememberAiLessons,
+} from '../utils/aiLessonVault';
+import { isDefaultSeedClassesOnly } from '../utils/firestoreHelpers';
 import { AdminSecurityPanel } from './AdminSecurityPanel';
 import { AuthErrorBanner } from './AuthErrorBanner';
 import { GoogleDrivePanel } from './GoogleDrivePanel';
 import { LessonEditorModal } from './LessonEditorModal';
+import { TeacherPreviewModal } from './TeacherPreviewModal';
 
 interface TeacherStudioProps {
   classes: ClassRoom[];
@@ -80,7 +97,6 @@ interface TeacherStudioProps {
   sharedAppUrl?: string;
   selectedClassId: string;
   onRefreshData: () => Promise<void>;
-  onSelectLessonForPlay: (lessonId: string) => void;
   onLockTeacherPortal: () => void;
   copy: CopyDict;
   lang: Language;
@@ -102,13 +118,12 @@ export function TeacherStudio({
   sharedAppUrl,
   selectedClassId,
   onRefreshData,
-  onSelectLessonForPlay,
   onLockTeacherPortal,
   copy,
   lang,
 }: TeacherStudioProps) {
   const [subTab, setSubTab] = useState<
-    'generate' | 'drive' | 'classes' | 'matrix' | 'history' | 'security'
+    'generate' | 'drive' | 'classes' | 'reviews' | 'matrix' | 'history' | 'security'
   >('generate');
 
   // Lesson upload / AI generator form (default 15 questions)
@@ -118,13 +133,18 @@ export function TeacherStudio({
   const [base64Data, setBase64Data] = useState<string | undefined>(undefined);
   const [mimeType, setMimeType] = useState<string | undefined>(undefined);
   const [questionCount, setQuestionCount] = useState(15);
-  const [targetClassIds, setTargetClassIds] = useState<string[]>([
-    selectedClassId || classes[0]?.id || 'LOP-5A',
-  ]);
+  const [questionStyle, setQuestionStyle] = useState<
+    'multiple_choice_only' | 'mc_and_blank' | 'mixed'
+  >('multiple_choice_only');
+  const [targetClassIds, setTargetClassIds] = useState<string[]>(() => {
+    const initial = selectedClassId || classes[0]?.id;
+    return initial ? [initial] : [];
+  });
   const [generating, setGenerating] = useState(false);
   const [genStatus, setGenStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(
     null,
   );
+  const vaultRestoredRef = useRef(false);
 
   // Classroom create / edit / delete state
   const [newClassCode, setNewClassCode] = useState('');
@@ -142,9 +162,20 @@ export function TeacherStudio({
   } | null>(null);
   const [confirmDeleteClassId, setConfirmDeleteClassId] = useState<string | null>(null);
 
-  // Lesson editor & delete confirmation
+  // Lesson editor, isolated Teacher Sandbox preview & delete confirmation
   const [editingLesson, setEditingLesson] = useState<Lesson | null>(null);
+  const [previewLesson, setPreviewLesson] = useState<Lesson | null>(null);
   const [confirmDeleteLessonId, setConfirmDeleteLessonId] = useState<string | null>(null);
+
+  // Student Submissions Archive & Manual Review/Override state
+  const [reviewClassId, setReviewClassId] = useState<string>(
+    selectedClassId || classes[0]?.id || '',
+  );
+  const [reviewLessonId, setReviewLessonId] = useState<string>('');
+  const [reviewGroupId, setReviewGroupId] = useState<string>('');
+  const [reviewStatus, setReviewStatus] = useState<'all' | 'wrong' | 'correct'>('all');
+  const [overridingSubId, setOverridingSubId] = useState<string | null>(null);
+  const [reviewNotice, setReviewNotice] = useState<string | null>(null);
 
   // Firebase Firestore cloud sync state
   const [cloudUser, setCloudUser] = useState<User | null>(() => auth.currentUser);
@@ -282,12 +313,19 @@ export function TeacherStudio({
 
         const safeLessons = recoverMissingCorrectAnswers(freshLessons, cloudData.lessons);
         const canSafelyPushLessons = !hasStrippedAnswers(safeLessons);
+        const canSafelyPushClasses =
+          freshClasses.length > 0 &&
+          !(isDefaultSeedClassesOnly(freshClasses) && cloudData.classes.length > 0);
+        const effectiveClasses = canSafelyPushClasses ? freshClasses : cloudData.classes;
+        if (canSafelyPushLessons) {
+          rememberAiLessons(safeLessons);
+        }
 
         const existingLogIds = new Set(cloudData.activityLogs.map((l) => l.id));
         await pushWorkspaceToFirestore(
           user.uid,
           {
-            classes: freshClasses,
+            classes: canSafelyPushClasses ? freshClasses : [],
             lessons: canSafelyPushLessons ? safeLessons : [],
             submissions: freshSubmissions,
             notifications: freshNotifications,
@@ -296,11 +334,11 @@ export function TeacherStudio({
           existingLogIds,
         );
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
-        if (canSafelyPushLessons) {
+        if (canSafelyPushLessons && effectiveClasses.length > 0) {
           await publishPublicWorkspace(
             defaultShareCodeForUid(user.uid),
             user.uid,
-            freshClasses,
+            effectiveClasses,
             safeLessons,
             freshNotifications,
           );
@@ -355,6 +393,58 @@ export function TeacherStudio({
     });
     return () => unsub();
   }, []);
+
+  // Keep targetClassIds aligned with real synced classes instead of stale placeholder IDs
+  useEffect(() => {
+    if (classes.length === 0) return;
+    const validIds = new Set(classes.map((c) => c.id));
+    setTargetClassIds((prev) => {
+      const kept = prev.filter((id) => validIds.has(id));
+      if (kept.length > 0) return kept;
+      const fallback = selectedClassId && validIds.has(selectedClassId) ? selectedClassId : classes[0].id;
+      return [fallback];
+    });
+  }, [classes, selectedClassId]);
+
+  // Automatically back up every teacher lesson with valid answer keys to persistent browser vault
+  useEffect(() => {
+    if (lessons.length > 0 && !hasStrippedAnswers(lessons)) {
+      rememberAiLessons(lessons);
+    }
+  }, [lessons]);
+
+  // Restore any remembered AI/custom lessons missing from the active store (e.g. after server restart)
+  useEffect(() => {
+    if (vaultRestoredRef.current) return;
+    vaultRestoredRef.current = true;
+    const remembered = loadRememberedAiLessons();
+    if (remembered.length === 0) return;
+    const deletedIds = new Set(loadDeletedLessonIds());
+    const currentIds = new Set(lessons.map((l) => l.id));
+    const missing = remembered.filter(
+      (l) => !currentIds.has(l.id) && !deletedIds.has(l.id) && isAiGeneratedOrCustomLesson(l),
+    );
+    if (missing.length === 0) return;
+
+    void (async () => {
+      try {
+        const res = await apiRequestJson(
+          '/api/workspace/import',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ classes: [], lessons: missing }),
+          },
+          lang,
+        );
+        if (res.ok) {
+          await onRefreshData();
+        }
+      } catch {
+        // Non-fatal fallback
+      }
+    })();
+  }, [lang, lessons, onRefreshData]);
 
   const origin =
     typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
@@ -536,6 +626,7 @@ export function TeacherStudio({
             base64Data,
             mimeType,
             questionCount,
+            questionStyle,
             assignedClassIds: targetClassIds,
             language: lang,
           }),
@@ -547,6 +638,9 @@ export function TeacherStudio({
         throw new Error(data?.error || 'Không thể tạo bài học.');
       }
 
+      // Permanently remember this AI-generated lesson + pre-saved answer keys in local vault
+      rememberAiLessons([data.lesson]);
+
       if (cloudUser) {
         await saveLessonToFirestore(data.lesson, cloudUser.uid);
         await publishLatestPublicSnapshot(cloudUser.uid);
@@ -556,8 +650,8 @@ export function TeacherStudio({
         type: 'ok',
         text:
           lang === 'vi'
-            ? `Đã tạo "${data.lesson.title}" (${data.lesson.questions.length} câu hỏi) và gửi thông báo đẩy tới lớp ${targetClassIds.join(', ')}!`
-            : `Generated "${data.lesson.title}" (${data.lesson.questions.length} questions) and pushed alerts to ${targetClassIds.join(', ')}!`,
+            ? `Đã tạo và ghi nhớ "${data.lesson.title}" (${data.lesson.questions.length} câu kèm đáp án sẵn, chấm trực tiếp không cần AI) tới lớp ${targetClassIds.join(', ')}!`
+            : `Generated & saved "${data.lesson.title}" (${data.lesson.questions.length} pre-keyed questions, instant non-AI grading) for ${targetClassIds.join(', ')}!`,
       });
       setLessonTitle('');
       setTextContent('');
@@ -598,6 +692,7 @@ export function TeacherStudio({
   };
 
   const handleDeleteLesson = async (id: string) => {
+    forgetAiLesson(id);
     await apiRequestJson(`/api/lessons/${id}`, { method: 'DELETE' }, lang);
     setConfirmDeleteLessonId(null);
     if (cloudUser) {
@@ -719,6 +814,58 @@ export function TeacherStudio({
     }
   };
 
+  // Sync reviewClassId when classes list loads
+  useEffect(() => {
+    if (classes.length === 0) return;
+    setReviewClassId((prev) =>
+      prev && classes.some((c) => c.id === prev) ? prev : classes[0].id,
+    );
+  }, [classes]);
+
+  const handleOverrideSubmission = async (sub: AnswerSubmission, nextIsCorrect: boolean) => {
+    setOverridingSubId(sub.id);
+    setReviewNotice(null);
+    try {
+      const res = await apiRequestJson<{
+        submission?: AnswerSubmission;
+        error?: string;
+      }>(
+        `/api/submissions/${encodeURIComponent(sub.id)}/override`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ isCorrect: nextIsCorrect }),
+        },
+        lang,
+      );
+      if (!res.ok || !res.data?.submission) {
+        throw new Error(res.data?.error || 'Không thể cập nhật kết quả chấm.');
+      }
+      if (cloudUser) {
+        try {
+          await syncOverriddenSubmissionToCloud(res.data.submission, cloudUser.uid);
+        } catch {
+          // Non-fatal
+        }
+      }
+      await onRefreshData();
+      setReviewNotice(
+        lang === 'vi'
+          ? `Đã cập nhật điểm phúc khảo cho ${sub.groupId}: ${
+              nextIsCorrect ? `Công nhận đúng (+${res.data.submission.totalPoints}đ)` : 'Chấm chưa đúng (0đ)'
+            }.`
+          : `Updated grade for ${sub.groupId}: ${
+              nextIsCorrect ? `Accepted (+${res.data.submission.totalPoints} pts)` : 'Marked wrong (0 pts)'
+            }.`,
+      );
+      window.setTimeout(() => setReviewNotice(null), 5000);
+    } catch (err) {
+      setReviewNotice(err instanceof Error ? err.message : 'Lỗi phúc khảo.');
+    } finally {
+      setOverridingSubId(null);
+    }
+  };
+
   return (
     <section className="max-w-7xl mx-auto space-y-6">
       {/* Sub-navigation bar */}
@@ -769,6 +916,22 @@ export function TeacherStudio({
             >
               <BookOpen className="w-4 h-4" />
               <span>{lang === 'vi' ? 'Lớp & Giao bài' : 'Classes & Reuse'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('reviews')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs sm:text-sm font-medium rounded-lg cursor-pointer whitespace-nowrap ${
+                subTab === 'reviews'
+                  ? 'bg-white text-slate-900 shadow-xs font-semibold'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <ClipboardCheck className="w-4 h-4" />
+              <span>
+                {lang === 'vi'
+                  ? `Bài làm & Phúc khảo (${submissions.length})`
+                  : `Submissions (${submissions.length})`}
+              </span>
             </button>
             <button
               type="button"
@@ -1059,6 +1222,48 @@ export function TeacherStudio({
 
             <div className="space-y-1.5">
               <label
+                htmlFor="question-style-select"
+                className="block text-xs font-semibold text-slate-700"
+              >
+                {lang === 'vi'
+                  ? 'Dạng câu hỏi & Chấm điểm trực tiếp (không dùng AI chấm lại)'
+                  : 'Question Format & Direct Pre-Keyed Grading (Zero AI Grading)'}
+              </label>
+              <select
+                id="question-style-select"
+                value={questionStyle}
+                onChange={(e) =>
+                  setQuestionStyle(
+                    e.target.value as 'multiple_choice_only' | 'mc_and_blank' | 'mixed',
+                  )
+                }
+                className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-sky-500"
+              >
+                <option value="multiple_choice_only">
+                  {lang === 'vi'
+                    ? '100% Trắc nghiệm 4 đáp án (Chấm chuẩn tuyệt đối, không cần AI)'
+                    : '100% Multiple Choice (Exact answer-key grading, zero AI)'}
+                </option>
+                <option value="mc_and_blank">
+                  {lang === 'vi'
+                    ? 'Trắc nghiệm + Điền khuyết (So khớp trực tiếp đáp án đã lưu)'
+                    : 'Multiple Choice + Fill-in-the-Blank (Direct key matching)'}
+                </option>
+                <option value="mixed">
+                  {lang === 'vi'
+                    ? 'Đa dạng (Trắc nghiệm + Điền khuyết + Câu ngắn chấm từ khóa sẵn)'
+                    : 'Mixed (MC + Fill-Blank + Keyword-keyed Short Answer)'}
+                </option>
+              </select>
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                {lang === 'vi'
+                  ? 'AI chỉ chạy 1 lần khi tạo đề và tạo sẵn đáp án. Bộ đề được tự động ghi nhớ lâu dài; khi học sinh làm bài, hệ thống chấm tức thì theo đáp án lưu sẵn.'
+                  : 'AI runs once to build questions & answer keys. Lessons are remembered permanently and graded deterministically with zero runtime AI calls.'}
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label
                 htmlFor="lesson-file-upload"
                 className="block text-xs font-semibold text-slate-700"
               >
@@ -1170,7 +1375,10 @@ export function TeacherStudio({
                 : `Lesson Library (${lessons.length})`}
             </h2>
             <div className="divide-y divide-slate-100">
-              {lessons.map((lesson) => (
+              {lessons.map((lesson) => {
+                const keyStats = countReadyAnswerKeys(lesson);
+                const isCustomOrAi = isAiGeneratedOrCustomLesson(lesson);
+                return (
                 <div key={lesson.id} className="py-4 first:pt-0 last:pb-0 space-y-2">
                   <div className="flex items-start justify-between gap-3">
                     <div>
@@ -1180,6 +1388,25 @@ export function TeacherStudio({
                       <p className="text-xs text-slate-500 mt-0.5">
                         {lesson.questions.length} {lang === 'vi' ? 'câu' : 'Q'} ·{' '}
                         {lesson.assignedClassIds.join(', ') || 'Chưa giao'}
+                      </p>
+                      <p className="mt-1 inline-flex flex-wrap items-center gap-2 text-[11px] font-medium">
+                        <span
+                          className={
+                            keyStats.ready === keyStats.total && keyStats.total > 0
+                              ? 'text-emerald-700'
+                              : 'text-amber-700'
+                          }
+                        >
+                          {lang === 'vi'
+                            ? `✓ ${keyStats.ready}/${keyStats.total} đáp án sẵn · Chấm trực tiếp`
+                            : `✓ ${keyStats.ready}/${keyStats.total} keys ready · Direct grading`}
+                        </span>
+                        {isCustomOrAi && (
+                          <span className="inline-flex items-center gap-1 text-sky-700">
+                            <BookmarkCheck className="w-3 h-3" />
+                            <span>{lang === 'vi' ? 'Đã ghi nhớ (AI)' : 'Saved (AI)'}</span>
+                          </span>
+                        )}
                       </p>
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
@@ -1223,10 +1450,15 @@ export function TeacherStudio({
                   <div className="flex flex-wrap items-center gap-4">
                     <button
                       type="button"
-                      onClick={() => onSelectLessonForPlay(lesson.id)}
-                      className="text-xs font-semibold text-sky-700 hover:underline cursor-pointer"
+                      onClick={() => setPreviewLesson(lesson)}
+                      className="inline-flex items-center gap-1 text-xs font-semibold text-amber-700 hover:underline cursor-pointer"
                     >
-                      {lang === 'vi' ? 'Chạy thử trò chơi bài này →' : 'Launch quiz →'}
+                      <FlaskConical className="w-3.5 h-3.5" />
+                      <span>
+                        {lang === 'vi'
+                          ? 'Chạy thử đề (Giáo viên)'
+                          : 'Test Quiz (Teacher Sandbox)'}
+                      </span>
                     </button>
                     <button
                       type="button"
@@ -1314,7 +1546,50 @@ export function TeacherStudio({
                     </div>
                   )}
                 </div>
-              ))}
+                );
+              })}
+            </div>
+
+            <div className="pt-4 border-t border-slate-100 space-y-2">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
+                <Clock className="w-3.5 h-3.5 text-sky-600" />
+                <span>
+                  {lang === 'vi'
+                    ? 'Quy tắc tính thời gian & thưởng tốc độ hợp lý'
+                    : 'Fair Per-Question Timing & Speed Bonus Rules'}
+                </span>
+              </div>
+              <ul className="text-[11px] text-slate-600 space-y-1 leading-relaxed">
+                <li>
+                  <strong className="text-slate-800">
+                    {lang === 'vi' ? 'Trắc nghiệm:' : 'Multiple Choice:'}
+                  </strong>{' '}
+                  {lang === 'vi'
+                    ? '≤15 giây đọc đề được trọn +50đ thưởng tốc độ, giảm dần đến 60 giây.'
+                    : '≤15s reading window earns full +50 speed bonus, tapering to 60s.'}
+                </li>
+                <li>
+                  <strong className="text-slate-800">
+                    {lang === 'vi' ? 'Điền khuyết:' : 'Fill-in-Blank:'}
+                  </strong>{' '}
+                  {lang === 'vi'
+                    ? '≤20 giây trọn +50đ thưởng tốc độ, giảm dần đến 75 giây.'
+                    : '≤20s earns full +50 speed bonus, tapering to 75s.'}
+                </li>
+                <li>
+                  <strong className="text-slate-800">
+                    {lang === 'vi' ? 'Câu trả lời ngắn:' : 'Short Answer:'}
+                  </strong>{' '}
+                  {lang === 'vi'
+                    ? '≤30 giây trọn +50đ thưởng tốc độ, giảm dần đến 90 giây.'
+                    : '≤30s earns full +50 speed bonus, tapering to 90s.'}
+                </li>
+                <li className="text-emerald-700 font-medium">
+                  {lang === 'vi'
+                    ? 'Sau mốc thưởng, học sinh tra cứu & làm đúng vẫn giữ trọn +100đ chính xác (không trừ điểm, giới hạn treo máy 180s).'
+                    : 'After the bonus window, accurate answers still earn full +100 pts (never penalized, idle capped at 180s).'}
+                </li>
+              </ul>
             </div>
           </div>
         </div>
@@ -1760,6 +2035,14 @@ export function TeacherStudio({
                     <div className="flex items-center gap-3">
                       <button
                         type="button"
+                        onClick={() => setPreviewLesson(lesson)}
+                        className="inline-flex items-center gap-1 text-xs font-semibold text-amber-700 hover:underline cursor-pointer"
+                      >
+                        <FlaskConical className="w-3 h-3" />
+                        <span>{lang === 'vi' ? 'Chạy thử (GV)' : 'Sandbox Test'}</span>
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => setEditingLesson(lesson)}
                         className="inline-flex items-center gap-1 text-xs font-semibold text-sky-700 hover:underline cursor-pointer"
                       >
@@ -1936,8 +2219,324 @@ export function TeacherStudio({
         </div>
       )}
 
+      {/* TAB: Student Submissions Archive & Manual Review / Override */}
+      {subTab === 'reviews' && (() => {
+        const classSubs = submissions.filter(
+          (s) => !reviewClassId || s.classId === reviewClassId,
+        );
+        const classLessonsForReview = lessons.filter(
+          (l) => !reviewClassId || l.assignedClassIds.includes(reviewClassId),
+        );
+        const distinctGroups = Array.from(
+          new Set(classSubs.map((s) => s.groupId)),
+        ).sort();
+
+        // Build per-group completion summary so teacher clearly sees who completed which lesson
+        const groupSummaryMap = new Map<
+          string,
+          { groupId: string; lessonsDone: Set<string>; totalQ: number; rightQ: number; score: number }
+        >();
+        for (const s of classSubs) {
+          if (reviewLessonId && s.lessonId !== reviewLessonId) continue;
+          const entry = groupSummaryMap.get(s.groupId) ?? {
+            groupId: s.groupId,
+            lessonsDone: new Set<string>(),
+            totalQ: 0,
+            rightQ: 0,
+            score: 0,
+          };
+          entry.lessonsDone.add(s.lessonTitle || s.lessonId);
+          entry.totalQ += 1;
+          if (s.isCorrect) entry.rightQ += 1;
+          entry.score += s.totalPoints;
+          groupSummaryMap.set(s.groupId, entry);
+        }
+        const groupSummaries = Array.from(groupSummaryMap.values()).sort(
+          (a, b) => b.score - a.score,
+        );
+
+        const filteredSubs = classSubs
+          .filter((s) => (!reviewLessonId ? true : s.lessonId === reviewLessonId))
+          .filter((s) => (!reviewGroupId ? true : s.groupId === reviewGroupId))
+          .filter((s) =>
+            reviewStatus === 'all'
+              ? true
+              : reviewStatus === 'wrong'
+                ? !s.isCorrect
+                : s.isCorrect,
+          )
+          .slice()
+          .sort(
+            (a, b) =>
+              new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime(),
+          );
+
+        return (
+          <div className="space-y-5">
+            <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900">
+                    {lang === 'vi'
+                      ? 'Kho lưu đáp án học sinh & Phúc khảo điểm'
+                      : 'Student Answer Archive & Manual Grade Review'}
+                  </h2>
+                  <p className="text-sm text-slate-600 mt-0.5">
+                    {lang === 'vi'
+                      ? 'Mọi câu trả lời của học sinh đều được lưu nguyên văn kèm lớp, nhóm/máy và đáp án chuẩn. Thầy/cô có thể công nhận đúng ngay cho các câu trả lời gần đúng.'
+                      : 'Every student answer is archived with class, group/tablet, and reference key. Teachers can override grades in 1 click.'}
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    aria-label="Chọn lớp phúc khảo"
+                    value={reviewClassId}
+                    onChange={(e) => {
+                      setReviewClassId(e.target.value);
+                      setReviewLessonId('');
+                      setReviewGroupId('');
+                    }}
+                    className="px-3 py-2 text-xs font-semibold border border-slate-300 rounded-xl bg-white"
+                  >
+                    <option value="">
+                      {lang === 'vi' ? 'Tất cả lớp' : 'All Classes'}
+                    </option>
+                    {classes.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.id} · {c.name}
+                      </option>
+                    ))}
+                  </select>
+
+                  <select
+                    aria-label="Lọc theo bài học"
+                    value={reviewLessonId}
+                    onChange={(e) => setReviewLessonId(e.target.value)}
+                    className="px-3 py-2 text-xs font-medium border border-slate-300 rounded-xl bg-white max-w-[220px]"
+                  >
+                    <option value="">
+                      {lang === 'vi' ? 'Tất cả bài học' : 'All Lessons'}
+                    </option>
+                    {classLessonsForReview.map((l) => (
+                      <option key={l.id} value={l.id}>
+                        {l.title}
+                      </option>
+                    ))}
+                  </select>
+
+                  <select
+                    aria-label="Lọc theo nhóm máy"
+                    value={reviewGroupId}
+                    onChange={(e) => setReviewGroupId(e.target.value)}
+                    className="px-3 py-2 text-xs font-medium border border-slate-300 rounded-xl bg-white max-w-[200px]"
+                  >
+                    <option value="">
+                      {lang === 'vi' ? 'Tất cả nhóm / máy' : 'All Groups'}
+                    </option>
+                    {distinctGroups.map((g) => (
+                      <option key={g} value={g}>
+                        {g}
+                      </option>
+                    ))}
+                  </select>
+
+                  <select
+                    aria-label="Lọc theo kết quả"
+                    value={reviewStatus}
+                    onChange={(e) =>
+                      setReviewStatus(e.target.value as 'all' | 'wrong' | 'correct')
+                    }
+                    className="px-3 py-2 text-xs font-medium border border-slate-300 rounded-xl bg-white"
+                  >
+                    <option value="all">
+                      {lang === 'vi' ? 'Tất cả kết quả' : 'All Statuses'}
+                    </option>
+                    <option value="wrong">
+                      {lang === 'vi' ? 'Chưa đúng (Cần xem lại)' : 'Incorrect (Needs Review)'}
+                    </option>
+                    <option value="correct">
+                      {lang === 'vi' ? 'Đã đúng' : 'Correct'}
+                    </option>
+                  </select>
+                </div>
+              </div>
+
+              {reviewNotice && (
+                <div
+                  role="status"
+                  className="px-4 py-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-800"
+                >
+                  {reviewNotice}
+                </div>
+              )}
+
+              {/* Per-group completion summary strip */}
+              {groupSummaries.length > 0 && (
+                <div className="space-y-2 pt-2 border-t border-slate-100">
+                  <p className="text-xs font-semibold text-slate-700">
+                    {lang === 'vi'
+                      ? `Tổng hợp tiến độ các nhóm${reviewClassId ? ` lớp ${reviewClassId}` : ''} (${groupSummaries.length} nhóm đã nộp):`
+                      : `Group completion summary (${groupSummaries.length} groups):`}
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                    {groupSummaries.map((gs) => (
+                      <button
+                        key={gs.groupId}
+                        type="button"
+                        onClick={() =>
+                          setReviewGroupId((prev) => (prev === gs.groupId ? '' : gs.groupId))
+                        }
+                        className={`text-left p-3 rounded-xl border transition-colors cursor-pointer ${
+                          reviewGroupId === gs.groupId
+                            ? 'bg-sky-50 border-sky-400'
+                            : 'bg-slate-50/70 border-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-bold text-slate-900 truncate">
+                            {gs.groupId}
+                          </span>
+                          <span className="font-mono-num text-xs font-bold text-sky-700 shrink-0">
+                            {gs.score}đ
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-600 mt-1 tabular-nums">
+                          {lang === 'vi'
+                            ? `Đúng ${gs.rightQ}/${gs.totalQ} câu · ${gs.lessonsDone.size} bài`
+                            : `${gs.rightQ}/${gs.totalQ} correct · ${gs.lessonsDone.size} lesson(s)`}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Detailed archived answers table */}
+            <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+              <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+                <h3 className="text-sm font-bold text-slate-900">
+                  {lang === 'vi'
+                    ? `Chi tiết câu trả lời đã lưu (${filteredSubs.length})`
+                    : `Archived Student Answers (${filteredSubs.length})`}
+                </h3>
+              </div>
+
+              {filteredSubs.length === 0 ? (
+                <div className="p-8 text-center text-sm text-slate-500">
+                  {lang === 'vi'
+                    ? 'Chưa có bài làm nào khớp với bộ lọc hiện tại.'
+                    : 'No student submissions match the selected filters.'}
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[880px] text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600 whitespace-nowrap">
+                        <th className="py-3 px-4">{lang === 'vi' ? 'Lớp / Nhóm' : 'Class / Group'}</th>
+                        <th className="py-3 px-4">{lang === 'vi' ? 'Bài học & Câu hỏi' : 'Lesson & Question'}</th>
+                        <th className="py-3 px-4">{lang === 'vi' ? 'Học sinh trả lời' : 'Student Answer'}</th>
+                        <th className="py-3 px-4">{lang === 'vi' ? 'Đáp án chuẩn' : 'Reference Key'}</th>
+                        <th className="py-3 px-4 text-right">{lang === 'vi' ? 'Kết quả' : 'Result'}</th>
+                        <th className="py-3 px-4 text-right">{lang === 'vi' ? 'Phúc khảo' : 'Review'}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
+                      {filteredSubs.map((sub) => {
+                        const lessonObj = lessons.find((l) => l.id === sub.lessonId);
+                        const qObj = lessonObj?.questions.find((q) => q.id === sub.questionId);
+                        const busy = overridingSubId === sub.id;
+                        return (
+                          <tr key={sub.id} className="hover:bg-slate-50/70 align-top">
+                            <td className="py-3.5 px-4 whitespace-nowrap">
+                              <span className="font-mono-num text-xs font-bold text-sky-700 block">
+                                {sub.classId}
+                              </span>
+                              <span className="font-semibold text-slate-900 block">
+                                {sub.groupId}
+                              </span>
+                              <span className="text-[11px] font-mono-num text-slate-400 block mt-0.5">
+                                {new Date(sub.submittedAt).toLocaleTimeString('vi-VN', {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })}{' '}
+                                · {(sub.elapsedMs / 1000).toFixed(1)}s
+                              </span>
+                            </td>
+                            <td className="py-3.5 px-4 max-w-[240px]">
+                              <p className="text-xs font-semibold text-slate-500 truncate">
+                                {lessonObj?.title || sub.lessonTitle || sub.lessonId}
+                              </p>
+                              <p className="text-xs text-slate-900 mt-0.5 line-clamp-2">
+                                {qObj?.questionText || sub.questionId}
+                              </p>
+                            </td>
+                            <td className="py-3.5 px-4 max-w-[200px]">
+                              <span className="inline-block px-2.5 py-1 rounded-lg bg-slate-100 text-slate-900 font-medium break-words">
+                                {sub.userAnswer}
+                              </span>
+                            </td>
+                            <td className="py-3.5 px-4 max-w-[200px] text-xs text-emerald-800 font-medium break-words">
+                              {qObj?.correctAnswer || '—'}
+                            </td>
+                            <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                              {sub.isCorrect ? (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold">
+                                  <CheckCircle2 className="w-3.5 h-3.5" />
+                                  <span>+{sub.totalPoints}đ</span>
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-50 border border-rose-200 text-rose-800 text-xs font-bold">
+                                  <XCircle className="w-3.5 h-3.5" />
+                                  <span>0đ</span>
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                              {sub.isCorrect ? (
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => handleOverrideSubmission(sub, false)}
+                                  className="px-2.5 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg disabled:opacity-50 cursor-pointer"
+                                >
+                                  {lang === 'vi' ? 'Chấm sai (0đ)' : 'Mark Wrong'}
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => handleOverrideSubmission(sub, true)}
+                                  className="px-2.5 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg disabled:opacity-50 cursor-pointer"
+                                >
+                                  {lang === 'vi' ? 'Công nhận đúng' : 'Accept Answer'}
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
       {/* TAB 5: Security, Change PIN & Admin RBAC */}
       {subTab === 'security' && <AdminSecurityPanel lang={lang} />}
+
+      {/* Isolated Teacher Test / Sandbox Modal */}
+      {previewLesson && (
+        <TeacherPreviewModal
+          lesson={previewLesson}
+          lang={lang}
+          onClose={() => setPreviewLesson(null)}
+        />
+      )}
 
       {/* Full Lesson & 15+ Questions Editor Modal */}
       {editingLesson && (
@@ -1947,6 +2546,7 @@ export function TeacherStudio({
           lang={lang}
           onClose={() => setEditingLesson(null)}
           onSave={async (updated) => {
+            rememberAiLessons([updated]);
             if (cloudUser) {
               await saveLessonToFirestore(updated, cloudUser.uid);
               await publishLatestPublicSnapshot(cloudUser.uid);

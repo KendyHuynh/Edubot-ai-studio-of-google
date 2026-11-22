@@ -24,6 +24,8 @@ export interface GeneratedLessonPayload {
   questions: Question[];
 }
 
+export type QuestionStylePreset = 'multiple_choice_only' | 'mc_and_blank' | 'mixed';
+
 export async function generateLessonQuestions(params: {
   title?: string;
   sourceFileName: string;
@@ -31,6 +33,7 @@ export async function generateLessonQuestions(params: {
   base64Data?: string;
   mimeType?: string;
   questionCount: number;
+  questionStyle?: QuestionStylePreset;
   language: Language;
 }): Promise<GeneratedLessonPayload> {
   const ai = getGeminiClient();
@@ -40,6 +43,14 @@ export async function generateLessonQuestions(params: {
 
   const count = Math.max(3, Math.min(params.questionCount || 15, 25));
   const langLabel = params.language === 'vi' ? 'Tiếng Việt' : 'English';
+  const style: QuestionStylePreset = params.questionStyle ?? 'multiple_choice_only';
+
+  const styleInstruction =
+    style === 'multiple_choice_only'
+      ? `2. TẤT CẢ ${count} câu hỏi đều thuộc dạng "multiple_choice" (có đúng 4 đáp án ngắn gọn rõ ràng trong options, và correctAnswer PHẢI trùng khớp chính xác từng ký tự với đúng 1 phần tử trong options) để hệ thống chấm tự động chính xác 100% mà KHÔNG cần AI chấm lại.`
+      : style === 'mc_and_blank'
+        ? `2. Kết hợp khoảng 80% "multiple_choice" (4 đáp án rõ ràng, correctAnswer trùng khớp từng ký tự với 1 phần tử trong options) và 20% "fill_blank" (1 chỗ trống ______ với correctAnswer là cụm 1-3 từ ngắn gọn, có thể kèm 1-2 cách viết đồng nghĩa ngăn cách bằng dấu " | " để chấm tự động không cần AI). Không dùng "short_answer".`
+        : `2. Kết hợp đa dạng dạng câu hỏi: "multiple_choice" (4 đáp án rõ ràng, correctAnswer trùng khớp 1 phần tử trong options), "fill_blank" (1 chỗ trống ______ với correctAnswer ngắn 1-3 từ, có thể kèm biến thể cách nhau bằng " | "), và "short_answer" (ghi correctAnswer ngắn gọn gồm các từ khóa cốt lõi và 1-2 biến thể ngăn cách bằng " | " để hệ thống chấm trực tiếp theo đáp án có sẵn mà KHÔNG cần AI chấm).`;
 
   const systemInstruction = `Bạn là "EduBot Digital Citizen" - Trợ lý AI giáo dục chuyên về khung 24 Năng lực Công dân số (TT 02/2025).
 Nhiệm vụ của bạn: Đọc kỹ nội dung bài học giáo viên cung cấp và tạo ra ĐÚNG ${count} câu hỏi trò chơi tương tác (không ít hơn ${count} câu, tương tự Quizizz/Kahoot) bằng ${langLabel}, phù hợp với học sinh phổ thông.
@@ -47,9 +58,10 @@ Nhiệm vụ của bạn: Đọc kỹ nội dung bài học giáo viên cung c�
 QUY TẮC BẮT BUỘC:
 1. Mỗi câu hỏi phải ánh xạ vào 1 hoặc nhiều mã năng lực thành phần (1 đến 2 mã phù hợp nhất) trong số 24 mã dưới đây (chỉ ghi mã số như "1.1", "4.2", "6.2"):
 ${competencyCatalog}
-2. Kết hợp đa dạng dạng câu hỏi: "multiple_choice" (có đúng 4 đáp án ngắn gọn rõ ràng trong options, và correctAnswer trùng khớp hoàn toàn với 1 phần tử trong options), "fill_blank" (1 chỗ trống ______ với đáp án ngắn 1-3 từ), và "short_answer" kích thích tư duy.
+${styleInstruction}
 3. Mỗi câu hỏi PHẢI có "aiSearchKeywordHint": gợi ý từ khóa cụ thể để học sinh tự đi tra cứu trên Google hoặc AI khác trước khi chọn đáp án cuối cùng.
-4. Mỗi câu hỏi PHẢI có "explanation": giải thích ngắn gọn, dễ hiểu, gắn với tiêu chuẩn Công dân số.`;
+4. Mỗi câu hỏi PHẢI có "explanation": giải thích ngắn gọn, dễ hiểu, gắn với tiêu chuẩn Công dân số.
+5. Đáp án đúng ("correctAnswer") BẮT BUỘC phải đầy đủ, rõ ràng, không bao giờ để trống vì hệ thống lưu cố định đáp án này để chấm điểm trực tiếp không dùng AI.`;
 
   const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
 
@@ -66,9 +78,16 @@ ${competencyCatalog}
 Tiêu đề gợi ý: "${params.title || params.sourceFileName}"
 ${params.textContent ? `\nNội dung bài học:\n${params.textContent.slice(0, 24000)}` : '\nHãy phân tích tệp đính kèm ở trên và tạo câu hỏi.'}
 
-Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${count} câu hỏi Công dân số theo đúng JSON schema.`;
+Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${count} câu hỏi Công dân số kèm đáp án chuẩn sẵn sàng chấm tự động theo đúng JSON schema.`;
 
   parts.push({ text: promptText });
+
+  const allowedTypes =
+    style === 'multiple_choice_only'
+      ? ['multiple_choice']
+      : style === 'mc_and_blank'
+        ? ['multiple_choice', 'fill_blank']
+        : ['multiple_choice', 'fill_blank', 'short_answer'];
 
   const response = await ai.models.generateContent({
     model: 'gemini-4-hydrogen',
@@ -89,7 +108,7 @@ Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${co
               properties: {
                 type: {
                   type: Type.STRING,
-                  enum: ['multiple_choice', 'fill_blank', 'short_answer'],
+                  enum: allowedTypes,
                 },
                 questionText: { type: Type.STRING },
                 options: {
@@ -129,6 +148,8 @@ Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${co
   };
 
   const validIds = new Set(COMPETENCIES_24.map((c) => c.id));
+  const letters = ['a', 'b', 'c', 'd', 'e', 'f'];
+
   const questions: Question[] = (parsed.questions ?? []).map((q, index) => {
     const rawList = q.competencyIds?.length
       ? q.competencyIds
@@ -138,24 +159,46 @@ Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${co
     const filteredIds = Array.from(new Set(rawList.filter((id) => validIds.has(id))));
     const safeCompIds = filteredIds.length > 0 ? filteredIds : ['1.1'];
     const safeType =
-      q.type === 'fill_blank' || q.type === 'short_answer'
-        ? q.type
-        : 'multiple_choice';
-    const options =
-      safeType === 'multiple_choice'
-        ? (q.options && q.options.length >= 2 ? q.options : [q.correctAnswer ?? 'Đúng', 'Sai'])
-        : undefined;
+      style === 'multiple_choice_only'
+        ? 'multiple_choice'
+        : q.type === 'fill_blank' || (q.type === 'short_answer' && style === 'mixed')
+          ? q.type
+          : 'multiple_choice';
+
+    let options: string[] | undefined;
+    let resolvedAnswer = String(q.correctAnswer ?? '').trim();
+
+    if (safeType === 'multiple_choice') {
+      const cleanedOpts = (q.options ?? []).map((o) => String(o).trim()).filter(Boolean);
+      options =
+        cleanedOpts.length >= 2 ? cleanedOpts : [resolvedAnswer || 'Đúng', 'Sai'];
+      // Ensure correctAnswer matches one of the options verbatim for 100% deterministic grading
+      if (!options.includes(resolvedAnswer)) {
+        const letterIdx = letters.indexOf(resolvedAnswer.toLowerCase());
+        if (letterIdx >= 0 && options[letterIdx]) {
+          resolvedAnswer = options[letterIdx];
+        } else {
+          const stripped = resolvedAnswer.replace(/^[A-Fa-f][.):\-\s]+/, '').trim();
+          const matchedOpt = options.find(
+            (o) =>
+              o.toLowerCase() === resolvedAnswer.toLowerCase() ||
+              o.toLowerCase() === stripped.toLowerCase(),
+          );
+          resolvedAnswer = matchedOpt ?? options[0];
+        }
+      }
+    }
 
     return {
       id: `q-${Date.now()}-${index + 1}`,
       type: safeType,
-      questionText: q.questionText,
+      questionText: String(q.questionText ?? '').trim(),
       options,
-      aiSearchKeywordHint: q.aiSearchKeywordHint,
-      correctAnswer: q.correctAnswer,
+      aiSearchKeywordHint: String(q.aiSearchKeywordHint ?? '').trim() || 'công dân số TT 02/2025',
+      correctAnswer: resolvedAnswer,
       competencyId: safeCompIds[0],
       competencyIds: safeCompIds,
-      explanation: q.explanation,
+      explanation: String(q.explanation ?? '').trim(),
     };
   });
 
@@ -167,43 +210,3 @@ Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${co
   };
 }
 
-export async function evaluateShortAnswerWithAI(params: {
-  questionText: string;
-  correctAnswer: string;
-  userAnswer: string;
-  competencyName: string;
-  groupName: string;
-  language: Language;
-}): Promise<{ isCorrect: boolean; feedbackText: string; explanation: string }> {
-  const ai = getGeminiClient();
-  const langLabel = params.language === 'vi' ? 'Tiếng Việt' : 'English';
-
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: `Câu hỏi: ${params.questionText}
-Đáp án chuẩn tham chiếu: ${params.correctAnswer}
-Câu trả lời của nhóm "${params.groupName}": ${params.userAnswer}
-Năng lực công dân số: ${params.competencyName}
-
-Hãy chấm xem câu trả lời của học sinh có đúng/chấp nhận được về mặt ý nghĩa Công dân số không, và viết lời nhận xét giọng MC trò chơi vui tươi, cổ vũ bằng ${langLabel} (tối đa 2 câu) kèm giải thích ngắn gọn (1-2 câu).`,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          isCorrect: { type: Type.BOOLEAN },
-          feedbackText: { type: Type.STRING },
-          explanation: { type: Type.STRING },
-        },
-        required: ['isCorrect', 'feedbackText', 'explanation'],
-      },
-    },
-  });
-
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
-    isCorrect: boolean;
-    feedbackText: string;
-    explanation: string;
-  };
-  return parsed;
-}

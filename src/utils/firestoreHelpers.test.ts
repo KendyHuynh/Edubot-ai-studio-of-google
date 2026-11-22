@@ -163,3 +163,37 @@ test('mergeLatestSubmissions deduplicates by team+question keeping newest and sy
   assert.equal(logs[0].classId, 'LOP-8A');
   assert.equal(logs[0].pointsDelta, 140);
 });
+
+test('isDefaultSeedClassesOnly distinguishes built-in 5A/5B/6A seed classes from real teacher classes', async () => {
+  const { isDefaultSeedClassesOnly } = await import('./firestoreHelpers');
+  const { createSeedData } = await import('../shared/seedData');
+  const seed = createSeedData();
+  assert.equal(isDefaultSeedClassesOnly([]), true);
+  assert.equal(isDefaultSeedClassesOnly(seed.classes), true);
+  assert.equal(
+    isDefaultSeedClassesOnly([
+      {
+        id: 'LOP-8A',
+        name: 'Lớp 8A - AI Công Dân Số',
+        grade: 'Khối 8',
+        teacherName: 'Huỳnh Như Ý',
+        createdAt: '2026-11-20T00:00:00.000Z',
+      },
+    ]),
+    false,
+  );
+  // If a real teacher deliberately creates their own LOP-5A with their own name, it is NOT demo seed
+  assert.equal(
+    isDefaultSeedClassesOnly([
+      {
+        id: 'LOP-5A',
+        name: 'Lớp 5A thật',
+        grade: 'Khối 5',
+        teacherName: 'Huỳnh Như Ý',
+        createdAt: '2026-11-20T00:00:00.000Z',
+      },
+    ]),
+    false,
+  );
+});
+

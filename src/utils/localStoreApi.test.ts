@@ -408,3 +408,358 @@ test('localStoreApi auto-heals stripped correctAnswer="" from Firestore so SaoXa
   );
 });
 
+test('localStoreApi preserves locally generated AI lessons on cloud-hydrate and grades fill_blank deterministically with 20s full bonus', async () => {
+  await withMockFetch(
+    () => new Response(JSON.stringify({}), { status: 404 }),
+    async () => {
+      const storage = createMemoryStorage();
+      const token = await seedAuthenticatedTeacherToken(storage);
+
+      // Import a newly AI-generated lesson locally with pipe-separated accepted answers
+      const aiLesson = {
+        id: 'lesson-1799888777666',
+        title: 'Bài AI: Xác thực 2 bước',
+        topic: 'Bảo mật số',
+        sourceFileName: 'BaiAI.txt',
+        summary: 'Tạo bởi AI và ghi nhớ lâu dài',
+        assignedClassIds: ['LOP-5A'],
+        createdAt: '2026-11-21T08:00:00.000Z',
+        questions: [
+          {
+            id: 'q-ai-blank-1',
+            type: 'fill_blank',
+            questionText: 'Tính năng bảo mật cần thêm mã OTP ngoài mật khẩu gọi là gì?',
+            aiSearchKeywordHint: 'xác thực 2 bước 2FA',
+            correctAnswer: '2FA|xác thực 2 bước|xác thực hai yếu tố',
+            competencyId: '4.2',
+            competencyIds: ['4.2'],
+            explanation: '2FA (xác thực 2 bước) bảo vệ tài khoản ngay cả khi lộ mật khẩu.',
+          },
+        ],
+      };
+
+      const importRes = await handleLocalApi(
+        '/api/workspace/import',
+        {
+          method: 'POST',
+          authToken: token,
+          body: JSON.stringify({ classes: [], lessons: [aiLesson] }),
+        },
+        storage,
+      );
+      assert.equal(importRes.ok, true);
+
+      // Cloud hydrate arrives WITHOUT the newly created local AI lesson -> MUST preserve it!
+      const hydrateRes = await handleLocalApi(
+        '/api/sync/cloud-hydrate',
+        {
+          method: 'POST',
+          authToken: token,
+          body: JSON.stringify({
+            classes: [],
+            lessons: [
+              {
+                id: 'lesson-cloud-older',
+                title: 'Bài cũ trên đám mây',
+                topic: 'Cũ',
+                sourceFileName: 'old.txt',
+                summary: 'Cũ',
+                assignedClassIds: ['LOP-5A'],
+                createdAt: '2026-11-01T00:00:00.000Z',
+                questions: [
+                  {
+                    id: 'q-old-1',
+                    type: 'multiple_choice',
+                    questionText: 'Câu cũ?',
+                    options: ['Đúng', 'Sai'],
+                    aiSearchKeywordHint: 'câu cũ',
+                    correctAnswer: 'Đúng',
+                    competencyId: '1.1',
+                    competencyIds: ['1.1'],
+                    explanation: 'Đúng.',
+                  },
+                ],
+              },
+            ],
+          }),
+        },
+        storage,
+      );
+      assert.equal(hydrateRes.ok, true);
+
+      const storeAfterHydrate = loadLocalStore(storage);
+      assert.ok(
+        storeAfterHydrate.lessons.some((l) => l.id === 'lesson-1799888777666'),
+        'Local AI lesson must survive cloud-hydrate',
+      );
+      assert.ok(
+        storeAfterHydrate.lessons.some((l) => l.id === 'lesson-cloud-older'),
+        'Cloud lesson must also be present',
+      );
+
+      // Student submits diacritic-free variant of fill_blank at 19s -> instant non-AI match + full 20s speed bonus (+50)
+      const subRes = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-5A',
+            tabletNumber: 4,
+            groupName: 'Sao Băng',
+            lessonId: 'lesson-1799888777666',
+            questionId: 'q-ai-blank-1',
+            userAnswer: 'xac thuc 2 buoc',
+            elapsedMs: 19000,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(subRes.ok, true);
+      const subData = subRes.data as {
+        submission: {
+          isCorrect: boolean;
+          basePoints: number;
+          speedBonus: number;
+          totalPoints: number;
+        };
+      };
+      assert.equal(subData.submission.isCorrect, true);
+      assert.equal(subData.submission.basePoints, 100);
+      assert.equal(subData.submission.speedBonus, 50);
+      assert.equal(subData.submission.totalPoints, 150);
+    },
+  );
+});
+
+test('localStoreApi replaces starter 5A/5B/6A demo seed classes with real Firestore classes even on authenticated teacher bootstrap', async () => {
+  await withMockFetch(
+    (url, init) => {
+      if (url.includes('/publicWorkspaces/default?') && (!init?.method || init.method === 'GET')) {
+        const docFields = toFirestoreRestValue({
+          id: 'default',
+          classes: [
+            {
+              id: 'LOP-8A',
+              name: 'Lớp 8A - AI Công Dân Số',
+              grade: 'Khối 8',
+              teacherName: 'Huỳnh Như Ý',
+              createdAt: '2026-11-20T00:00:00.000Z',
+            },
+            {
+              id: 'LOP-8B',
+              name: 'Lớp 8B - AI Công Dân Số',
+              grade: 'Khối 8',
+              teacherName: 'Huỳnh Như Ý',
+              createdAt: '2026-11-20T00:00:00.000Z',
+            },
+          ],
+          lessons: [],
+        }).mapValue?.fields;
+        return new Response(JSON.stringify({ fields: docFields }), { status: 200 });
+      }
+      if (url.includes(':runQuery')) {
+        return new Response(JSON.stringify([{ readTime: '2026-11-21T00:00:00Z' }]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    },
+    async () => {
+      resetLocalHydrationCache();
+      const storage = createMemoryStorage();
+      const token = await seedAuthenticatedTeacherToken(storage);
+
+      // Authenticated teacher opens portal on a freshly reset store (which temporarily holds 5A/5B/6A seed)
+      const bootRes = await handleLocalApi(
+        '/api/bootstrap?lang=vi&role=teacher',
+        { method: 'GET', authToken: token },
+        storage,
+      );
+      assert.equal(bootRes.ok, true);
+      const boot = bootRes.data as {
+        classes: { id: string }[];
+        notifications: { id: string }[];
+      };
+      assert.deepEqual(
+        boot.classes.map((c) => c.id),
+        ['LOP-8A', 'LOP-8B'],
+      );
+      assert.equal(
+        boot.notifications.some((n) => n.id.startsWith('notif-seed-')),
+        false,
+        'Demo 5A/5B notifications must be removed when real classes load',
+      );
+    },
+  );
+});
+
+test('localStoreApi enforces class isolation (403 cross-class), 1st-attempt lock, groupProgress, and teacher grade override', async () => {
+  await withMockFetch(
+    () => new Response(JSON.stringify({}), { status: 404 }),
+    async () => {
+      const storage = createMemoryStorage();
+      const token = await seedAuthenticatedTeacherToken(storage);
+
+      // Seed 2 classes (LOP-8A, LOP-8B) and 1 lesson assigned ONLY to LOP-8A
+      await handleLocalApi(
+        '/api/workspace/import',
+        {
+          method: 'POST',
+          authToken: token,
+          body: JSON.stringify({
+            classes: [
+              { id: 'LOP-8A', name: 'Lớp 8A', grade: 'Khối 8', teacherName: 'Cô Ý', createdAt: '2026-11-20T00:00:00Z' },
+              { id: 'LOP-8B', name: 'Lớp 8B', grade: 'Khối 8', teacherName: 'Cô Ý', createdAt: '2026-11-20T00:00:00Z' },
+            ],
+            lessons: [
+              {
+                id: 'lesson-only-8a',
+                title: 'Bài riêng 8A',
+                topic: 'An toàn số',
+                sourceFileName: '8a.txt',
+                summary: 'Chỉ dành cho 8A',
+                assignedClassIds: ['LOP-8A'],
+                createdAt: '2026-11-20T00:00:00Z',
+                questions: [
+                  {
+                    id: 'q-8a-1',
+                    type: 'fill_blank',
+                    questionText: 'Tính năng bảo mật 2 lớp gọi là gì?',
+                    aiSearchKeywordHint: '2FA',
+                    correctAnswer: 'xác thực 2 bước',
+                    competencyId: '4.2',
+                    competencyIds: ['4.2'],
+                    explanation: '2FA bảo vệ tài khoản.',
+                  },
+                ],
+              },
+            ],
+          }),
+        },
+        storage,
+      );
+
+      // 1) Student in LOP-8B does NOT see lesson-only-8a on bootstrap
+      const boot8B = await handleLocalApi(
+        '/api/bootstrap?classId=LOP-8B&lang=vi&role=student',
+        { method: 'GET' },
+        storage,
+      );
+      const lessons8B = (boot8B.data as { lessons: { id: string }[] }).lessons;
+      assert.equal(lessons8B.some((l) => l.id === 'lesson-only-8a'), false);
+
+      // 2) Student in LOP-8B attempting to submit to lesson-only-8a gets HTTP 403
+      const crossClassSubmit = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-8B',
+            tabletNumber: 1,
+            groupName: 'Nhóm 8B',
+            lessonId: 'lesson-only-8a',
+            questionId: 'q-8a-1',
+            userAnswer: '2FA',
+            elapsedMs: 5000,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(crossClassSubmit.ok, false);
+      assert.equal(crossClassSubmit.status, 403);
+
+      // 3) Student in LOP-8A submits wrong answer on 1st attempt -> recorded with 0 pts
+      const firstAttempt = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-8A',
+            tabletNumber: 2,
+            groupName: 'Nhóm 1',
+            lessonId: 'lesson-only-8a',
+            questionId: 'q-8a-1',
+            userAnswer: 'câu trả lời gần đúng cần xem lại',
+            elapsedMs: 10000,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(firstAttempt.ok, true);
+      const firstData = firstAttempt.data as {
+        submission: { id: string; isCorrect: boolean; totalPoints: number; userAnswer: string };
+        alreadySubmitted: boolean;
+      };
+      assert.equal(firstData.alreadySubmitted, false);
+      assert.equal(firstData.submission.isCorrect, false);
+      assert.equal(firstData.submission.totalPoints, 0);
+      assert.equal(firstData.submission.userAnswer, 'câu trả lời gần đúng cần xem lại');
+
+      // 4) Same group retries with exact right answer -> 1st attempt stays locked (alreadySubmitted = true)
+      const secondAttempt = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-8A',
+            tabletNumber: 2,
+            groupName: 'Nhóm 1',
+            lessonId: 'lesson-only-8a',
+            questionId: 'q-8a-1',
+            userAnswer: 'xác thực 2 bước',
+            elapsedMs: 4000,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(secondAttempt.ok, true);
+      const secondData = secondAttempt.data as {
+        submission: { isCorrect: boolean; totalPoints: number };
+        alreadySubmitted: boolean;
+      };
+      assert.equal(secondData.alreadySubmitted, true);
+      assert.equal(secondData.submission.totalPoints, 0);
+
+      // 5) Bootstrap returns groupProgress showing Nhóm 1 answered q-8a-1
+      const boot8A = await handleLocalApi(
+        `/api/bootstrap?classId=LOP-8A&groupId=${encodeURIComponent('Máy-02 · Nhóm 1')}&lang=vi&role=student`,
+        { method: 'GET' },
+        storage,
+      );
+      const gp = (boot8A.data as { groupProgress: Record<string, { answeredQuestionIds: string[] }> }).groupProgress;
+      assert.deepEqual(gp['lesson-only-8a']?.answeredQuestionIds, ['q-8a-1']);
+
+      // 6) Unauthenticated caller CANNOT override grades (401)
+      const unauthOverride = await handleLocalApi(
+        `/api/submissions/${encodeURIComponent(firstData.submission.id)}/override`,
+        { method: 'POST', body: JSON.stringify({ isCorrect: true }) },
+        storage,
+      );
+      assert.equal(unauthOverride.status, 401);
+
+      // 7) Teacher manually accepts the archived answer -> points & class leaderboard update immediately!
+      const overrideRes = await handleLocalApi(
+        `/api/submissions/${encodeURIComponent(firstData.submission.id)}/override`,
+        {
+          method: 'POST',
+          authToken: token,
+          body: JSON.stringify({ isCorrect: true }),
+        },
+        storage,
+      );
+      assert.equal(overrideRes.ok, true);
+      const overrideData = overrideRes.data as {
+        submission: { isCorrect: boolean; totalPoints: number };
+        leaderboard: { GroupID: string; Score: number }[];
+      };
+      assert.equal(overrideData.submission.isCorrect, true);
+      assert.equal(overrideData.submission.totalPoints, 150);
+      assert.equal(overrideData.leaderboard[0]?.Score, 150);
+    },
+  );
+});
+
+
+
