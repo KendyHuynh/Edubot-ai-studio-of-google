@@ -81,7 +81,8 @@ import {
   loadRememberedAiLessons,
   rememberAiLessons,
 } from '../utils/aiLessonVault';
-import { isDefaultSeedClassesOnly } from '../utils/firestoreHelpers';
+import { isDefaultSeedClassesOnly, isDemoSeedClass } from '../utils/firestoreHelpers';
+import type { SyncLedgerMeta } from '../shared/seedData';
 import { AdminSecurityPanel } from './AdminSecurityPanel';
 import { AuthErrorBanner } from './AuthErrorBanner';
 import { GoogleDrivePanel } from './GoogleDrivePanel';
@@ -96,6 +97,7 @@ interface TeacherStudioProps {
   activityLogs: ActivityLog[];
   submissions?: AnswerSubmission[];
   notifications?: PushNotification[];
+  syncMeta?: SyncLedgerMeta | null;
   sharedAppUrl?: string;
   selectedClassId: string;
   onRefreshData: () => Promise<void>;
@@ -117,6 +119,7 @@ export function TeacherStudio({
   activityLogs,
   submissions = [],
   notifications = [],
+  syncMeta = null,
   sharedAppUrl,
   selectedClassId,
   onRefreshData,
@@ -273,31 +276,35 @@ export function TeacherStudio({
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
         const cloudData = await fetchTeacherCloudData(user.uid);
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
-        if (
-          cloudData.classes.length > 0 ||
-          cloudData.lessons.length > 0 ||
-          cloudData.submissions.length > 0
-        ) {
-          await apiRequestJson(
-            '/api/sync/cloud-hydrate',
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(cloudData),
-            },
-            lang,
-          );
-          await onRefreshData();
-        }
+
+        // ALWAYS authoritatively overwrite & deduplicate local store from Firebase (including empty real state)
+        // so virtual demo classes (LOP-5A/5B/6A) or duplicate records NEVER linger or get re-created!
+        const wsCode = defaultShareCodeForUid(user.uid);
+        await apiRequestJson(
+          '/api/sync/cloud-hydrate',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ...cloudData,
+              authoritativeCloud: true,
+              workspaceId: wsCode,
+              ownerUid: user.uid,
+              ownerEmail: user.email ?? undefined,
+              source: 'firestore_teacher',
+            }),
+          },
+          lang,
+        );
+        await onRefreshData();
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
 
-        // Always read freshly hydrated teacher store so stale seed classes/lessons or student-stripped
-        // React props are NEVER pushed back over the teacher's authoritative cloud workspace!
-        let freshClasses = classes;
-        let freshLessons = lessons;
-        let freshSubmissions = submissions;
-        let freshNotifications = notifications;
-        let freshLogs = activityLogs;
+        // Always read freshly hydrated teacher store so stale local props are NEVER pushed back over Firebase
+        let freshClasses: ClassRoom[] = [];
+        let freshLessons: Lesson[] = [];
+        let freshSubmissions: AnswerSubmission[] = [];
+        let freshNotifications: PushNotification[] = [];
+        let freshLogs: ActivityLog[] = [];
         try {
           const freshRes = await apiRequestJson<{
             classes?: ClassRoom[];
@@ -314,15 +321,19 @@ export function TeacherStudio({
             if (Array.isArray(freshRes.data.activityLogs)) freshLogs = freshRes.data.activityLogs;
           }
         } catch {
-          // Keep current state as fallback
+          freshClasses = cloudData.classes;
+          freshLessons = cloudData.lessons;
+          freshSubmissions = cloudData.submissions;
+          freshNotifications = cloudData.notifications;
+          freshLogs = cloudData.activityLogs;
         }
 
+        const realFreshClasses = freshClasses.filter((c) => !isDemoSeedClass(c));
         const safeLessons = recoverMissingCorrectAnswers(freshLessons, cloudData.lessons);
-        const canSafelyPushLessons = !hasStrippedAnswers(safeLessons);
+        const canSafelyPushLessons = safeLessons.length > 0 && !hasStrippedAnswers(safeLessons);
         const canSafelyPushClasses =
-          freshClasses.length > 0 &&
-          !(isDefaultSeedClassesOnly(freshClasses) && cloudData.classes.length > 0);
-        const effectiveClasses = canSafelyPushClasses ? freshClasses : cloudData.classes;
+          realFreshClasses.length > 0 && !isDefaultSeedClassesOnly(realFreshClasses);
+        const effectiveClasses = canSafelyPushClasses ? realFreshClasses : cloudData.classes;
         if (canSafelyPushLessons) {
           rememberAiLessons(safeLessons);
         }
@@ -331,7 +342,7 @@ export function TeacherStudio({
         await pushWorkspaceToFirestore(
           user.uid,
           {
-            classes: canSafelyPushClasses ? freshClasses : [],
+            classes: canSafelyPushClasses ? realFreshClasses : [],
             lessons: canSafelyPushLessons ? safeLessons : [],
             submissions: freshSubmissions,
             notifications: freshNotifications,
@@ -340,24 +351,23 @@ export function TeacherStudio({
           existingLogIds,
         );
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
-        if (canSafelyPushLessons && effectiveClasses.length > 0) {
+        if (effectiveClasses.length > 0 || canSafelyPushLessons) {
           await publishPublicWorkspace(
-            defaultShareCodeForUid(user.uid),
+            wsCode,
             user.uid,
             effectiveClasses,
-            safeLessons,
+            canSafelyPushLessons ? safeLessons : cloudData.lessons,
             freshNotifications,
           );
         }
         hydratedUidRef.current = user.uid;
         if (manual) {
-          const code = defaultShareCodeForUid(user.uid);
           setCloudNotice({
             type: 'ok',
             text:
               lang === 'vi'
-                ? `Đã đồng bộ 2 chiều: ${freshClasses.length} lớp, ${freshLessons.length} bài học, ${freshSubmissions.length} bài làm học sinh & xuất bản tự động (mặc định + mã ${code})!`
-                : `Two-way sync complete: ${freshClasses.length} classes, ${freshLessons.length} lessons, ${freshSubmissions.length} student answers published (default + ${code})!`,
+                ? `Đã đồng bộ chuẩn xác & ghi chép từ Firebase: ${effectiveClasses.length} lớp thật, ${safeLessons.length} bài học, ${freshSubmissions.length} bài làm học sinh (mã ${wsCode})!`
+                : `Authoritative Firebase sync complete: ${effectiveClasses.length} classes, ${safeLessons.length} lessons, ${freshSubmissions.length} student answers (${wsCode})!`,
           });
           window.setTimeout(() => setCloudNotice(null), 6000);
         }
@@ -1028,12 +1038,29 @@ export function TeacherStudio({
               <p className="text-[11px] text-slate-500 mt-0.5">
                 {cloudUser && shareCode
                   ? lang === 'vi'
-                    ? `Đã tự động xuất bản lên Cloud (mặc định + mã ${shareCode}) · Học sinh mở link chính hay link lớp đều tự tải bài mới nhất và gửi điểm về mà KHÔNG cần đăng nhập.`
-                    : `Auto-published to Cloud (default + ${shareCode}) · Students opening any link auto-load latest lessons & sync scores back with ZERO login.`
+                    ? `Đã tự động xuất bản lên Cloud (mặc định + mã ${shareCode}) · Không tạo lớp ảo, luôn ghi đè khử trùng từ Firebase.`
+                    : `Auto-published to Cloud (default + ${shareCode}) · Zero virtual classes, deduplicated directly from Firebase.`
                   : lang === 'vi'
-                    ? 'Học sinh mở link web sẽ tự động tải bài giáo viên đã xuất bản trên Cloud và gửi điểm về mà KHÔNG cần đăng nhập Google.'
-                    : 'Students auto-load published cloud lessons and sync scores back without Google/Firebase login.'}
+                    ? 'Học sinh mở link web sẽ tự động tải đúng danh sách lớp & bài đã đồng bộ từ Firebase (không tự tạo lớp ảo).'
+                    : 'Students auto-load real classes & lessons synced from Firebase (zero virtual classes).'}
               </p>
+              {syncMeta && (
+                <p className="text-[11px] font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1 mt-1.5 inline-flex flex-wrap items-center gap-x-2 gap-y-0.5 tabular-nums">
+                  <span>
+                    {lang === 'vi'
+                      ? `Ghi chép đồng bộ #${syncMeta.syncRevision}`
+                      : `Sync Ledger #${syncMeta.syncRevision}`}
+                  </span>
+                  <span>·</span>
+                  <span>{new Date(syncMeta.lastSyncedAt).toLocaleString('vi-VN')}</span>
+                  <span>·</span>
+                  <span>
+                    {syncMeta.classesCount} {lang === 'vi' ? 'lớp thật' : 'classes'} ·{' '}
+                    {syncMeta.lessonsCount} {lang === 'vi' ? 'bài' : 'lessons'} ·{' '}
+                    {syncMeta.submissionsCount} {lang === 'vi' ? 'bài làm' : 'submissions'}
+                  </span>
+                </p>
+              )}
             </div>
           </div>
 

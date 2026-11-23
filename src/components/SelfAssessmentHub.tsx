@@ -311,10 +311,11 @@ export function SelfAssessmentHub({
     outcomes: AssessmentExerciseOutcome[];
     maxCombo: number;
   }) => {
-    let idToken: string | undefined;
-    if (googleUser) {
-      idToken = await googleUser.getIdToken().catch(() => undefined);
+    if (!googleUser || !googleUser.emailVerified) {
+      return;
     }
+    const idToken = await googleUser.getIdToken().catch(() => undefined);
+    if (!idToken) return;
     const res = await apiRequestJson<{
       profile?: LearnerProfile;
       attempt?: AssessmentSessionAttempt;
@@ -326,7 +327,6 @@ export function SelfAssessmentHub({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           idToken,
-          learnerUid: profile?.uid,
           learnerName: profile?.fullName,
           className: profile?.className,
           schoolName: profile?.schoolName,
@@ -342,9 +342,7 @@ export function SelfAssessmentHub({
       if (res.data.attempt) {
         setAttempts((prev) => [res.data.attempt!, ...prev].slice(0, 30));
       }
-      if (res.data.profile.authType === 'google' && googleUser) {
-        void saveLearnerProfileToFirestore(res.data.profile);
-      }
+      void saveLearnerProfileToFirestore(res.data.profile);
     }
   };
 
@@ -566,13 +564,9 @@ export function SelfAssessmentHub({
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold bg-sky-50 text-sky-700 border border-sky-200">
               <GraduationCap className="w-3.5 h-3.5" />
               <span>
-                {googleUser
-                  ? lang === 'vi'
-                    ? `Tài khoản Google đã xác thực: ${googleUser.email}`
-                    : `Verified Google Account: ${googleUser.email}`
-                  : lang === 'vi'
-                    ? 'Hồ sơ Kiểm tra thử 24 Năng lực'
-                    : 'Quick Trial Learner Profile'}
+                {lang === 'vi'
+                  ? `Tài khoản Google đã xác thực: ${googleUser.email}`
+                  : `Verified Google Account: ${googleUser.email}`}
               </span>
             </div>
             <h1 className="text-xl sm:text-2xl font-bold text-slate-900">

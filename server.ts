@@ -4,11 +4,17 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import {
+  applyAuthoritativeCloudHydrate,
+  CloudHydratePayload,
+  dedupeById,
   DEFAULT_PUBLIC_WORKSPACE_ID,
   isDefaultSeedClassesOnly,
+  isDemoSeedArtifactId,
+  isDemoSeedClass,
   LEGACY_FALLBACK_WORKSPACE_ID,
   mergeLatestSubmissions,
   mergeSubmissionActivityLogs,
+  sanitizeStoreRemoveDemoArtifacts,
 } from './src/utils/firestoreHelpers';
 import {
   fetchPublicSubmissionsViaRest,
@@ -141,19 +147,17 @@ async function hydrateFromPublicWorkspace(
     let changed = false;
 
     if (snapshot && options.replaceContent) {
-      if (snapshot.classes.length > 0) {
-        const wasDemoSeedOnly = isDefaultSeedClassesOnly(store.classes);
-        store.classes = snapshot.classes;
-        if (wasDemoSeedOnly && !isDefaultSeedClassesOnly(snapshot.classes)) {
-          // Remove starter demo 5A/5B/6A submissions, notifications, and logs when real classes load
-          store.submissions = store.submissions.filter((s) => !s.id.startsWith('sub-seed-'));
-          store.activityLogs = store.activityLogs.filter((l) => !l.id.startsWith('log-seed-'));
-          store.notifications = store.notifications.filter((n) => !n.id.startsWith('notif-seed-'));
-        }
+      const cleanSnapClasses = dedupeById(
+        snapshot.classes.filter((c) => Boolean(c?.id && c?.name) && !isDemoSeedClass(c)),
+      );
+      if (cleanSnapClasses.length > 0) {
+        store.classes = cleanSnapClasses;
         changed = true;
       }
       if (snapshot.lessons.length > 0) {
-        store.lessons = recoverMissingCorrectAnswers(snapshot.lessons, store.lessons);
+        store.lessons = dedupeById(
+          recoverMissingCorrectAnswers(snapshot.lessons, store.lessons),
+        );
         changed = true;
       }
       if (snapshot.notifications && snapshot.notifications.length > 0) {
@@ -161,18 +165,25 @@ async function hydrateFromPublicWorkspace(
         const readMap = new Map(
           store.notifications.map((n) => [n.id, new Set(n.readByGroupIds ?? [])]),
         );
-        store.notifications = snapshot.notifications
-          .filter((n) => !n.classId || activeClassIds.size === 0 || activeClassIds.has(n.classId))
-          .map((n) => {
-            const existingRead = readMap.get(n.id);
-            const mergedRead = Array.from(
-              new Set([
-                ...(n.readByGroupIds ?? []),
-                ...(existingRead ? Array.from(existingRead) : []),
-              ]),
-            );
-            return { ...n, readByGroupIds: mergedRead };
-          });
+        store.notifications = dedupeById(
+          snapshot.notifications
+            .filter(
+              (n) =>
+                Boolean(n?.id) &&
+                !isDemoSeedArtifactId(n.id) &&
+                (!n.classId || activeClassIds.size === 0 || activeClassIds.has(n.classId)),
+            )
+            .map((n) => {
+              const existingRead = readMap.get(n.id);
+              const mergedRead = Array.from(
+                new Set([
+                  ...(n.readByGroupIds ?? []),
+                  ...(existingRead ? Array.from(existingRead) : []),
+                ]),
+              );
+              return { ...n, readByGroupIds: mergedRead };
+            }),
+        );
         changed = true;
       }
     }
@@ -187,7 +198,9 @@ async function hydrateFromPublicWorkspace(
     const cloudSubs: AnswerSubmission[] = [];
     for (const wsId of subSources) {
       const rows = await fetchPublicSubmissionsViaRest(cfg, wsId);
-      if (rows.length > 0) cloudSubs.push(...rows);
+      if (rows.length > 0) {
+        cloudSubs.push(...rows.filter((s) => !isDemoSeedArtifactId(s.id)));
+      }
     }
 
     if (cloudSubs.length > 0) {
@@ -196,7 +209,23 @@ async function hydrateFromPublicWorkspace(
       changed = true;
     }
 
-    if (changed) {
+    const cleaned = sanitizeStoreRemoveDemoArtifacts(store);
+    if (cleaned.changed) changed = true;
+
+    if (changed || snapshot) {
+      store.syncMeta = {
+        lastSyncedAt: new Date().toISOString(),
+        source: 'public_workspace',
+        workspaceId: resolvedWsId,
+        ownerUid: store.syncMeta?.ownerUid,
+        ownerEmail: store.syncMeta?.ownerEmail,
+        classesCount: store.classes.length,
+        lessonsCount: store.lessons.length,
+        submissionsCount: store.submissions.length,
+        notificationsCount: store.notifications.length,
+        learnersCount: Array.isArray(store.learnerProfiles) ? store.learnerProfiles.length : 0,
+        syncRevision: (store.syncMeta?.syncRevision ?? 0) + (changed ? 1 : 0),
+      };
       saveStore(store);
     }
     hydratedWorkspaceCache.set(cacheKey, Date.now());
@@ -588,7 +617,7 @@ async function startServer() {
     const targetClassId =
       classId && store.classes.some((c) => c.id === classId)
         ? classId
-        : store.classes[0]?.id || 'LOP-8A';
+        : store.classes[0]?.id || '';
 
     // Strict class isolation for students: only expose lessons assigned to their checked-in class
     const visibleLessons =
@@ -675,6 +704,7 @@ async function startServer() {
       groupProgress,
       submissionsCount: store.submissions.length,
       activeWorkspaceId: resolvedWsId,
+      syncMeta: store.syncMeta ?? null,
       sharedAppUrl,
       ...(includeAnswers ? { submissions: store.submissions } : {}),
     });
@@ -895,7 +925,9 @@ async function startServer() {
       const targetClasses =
         assignedClassIds && assignedClassIds.length > 0
           ? assignedClassIds
-          : [store.classes[0]?.id || 'LOP-5A'];
+          : store.classes[0]?.id
+            ? [store.classes[0].id]
+            : [];
 
       const newLesson: Lesson = {
         id: `lesson-${Date.now()}`,
@@ -1015,7 +1047,7 @@ async function startServer() {
 
     store.activityLogs.unshift({
       id: `log-${Date.now()}`,
-      classId: lesson.assignedClassIds[0] || store.classes[0]?.id || 'LOP-5A',
+      classId: lesson.assignedClassIds[0] || store.classes[0]?.id || '',
       groupId: 'Giáo viên',
       action: 'Chỉnh sửa bài học',
       detail: `${lesson.title} (${lesson.questions.length} câu hỏi)`,
@@ -1026,70 +1058,20 @@ async function startServer() {
     res.json({ lesson });
   });
 
-  // Hydrate cloud Firestore state into local server store (replaces seed classes/lessons with authoritative cloud data)
+  // Authoritatively hydrate cloud Firestore state into local server store (overwrites cleanly, deduplicates, purges demo artifacts, records syncMeta)
   app.post('/api/sync/cloud-hydrate', requireTeacherAuth, (req, res) => {
-    const payload = req.body as {
-      classes?: ClassRoom[];
-      lessons?: Lesson[];
-      submissions?: AnswerSubmission[];
-      notifications?: PushNotification[];
-      activityLogs?: ActivityLog[];
-    };
-
+    const payload = req.body as CloudHydratePayload;
     const store = loadStore();
-
-    if (Array.isArray(payload.classes) && payload.classes.length > 0) {
-      const validClasses = payload.classes.filter((c) => Boolean(c?.id && c?.name));
-      if (validClasses.length > 0) {
-        store.classes = validClasses;
-      }
-    }
-
-    if (Array.isArray(payload.lessons) && payload.lessons.length > 0) {
-      const validLessons = payload.lessons.filter(
-        (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
-      );
-      if (validLessons.length > 0) {
-        store.lessons = mergeLessonsPreservingCustom(store.lessons, validLessons);
-      }
-    }
-
-    if (Array.isArray(payload.submissions) && payload.submissions.length > 0) {
-      store.submissions = mergeLatestSubmissions(store.submissions, payload.submissions);
-    }
-
-    if (Array.isArray(payload.notifications) && payload.notifications.length > 0) {
-      const notifMap = new Map(store.notifications.map((n) => [n.id, n]));
-      for (const notif of payload.notifications) {
-        if (notif?.id) {
-          notifMap.set(notif.id, notif);
-        }
-      }
-      store.notifications = Array.from(notifMap.values());
-    }
-
-    if (Array.isArray(payload.activityLogs) && payload.activityLogs.length > 0) {
-      const logMap = new Map(store.activityLogs.map((l) => [l.id, l]));
-      for (const log of payload.activityLogs) {
-        if (log?.id) {
-          logMap.set(log.id, log);
-        }
-      }
-      store.activityLogs = mergeSubmissionActivityLogs(
-        Array.from(logMap.values()),
-        store.submissions,
-      );
-    } else if (store.submissions.length > 0) {
-      store.activityLogs = mergeSubmissionActivityLogs(store.activityLogs, store.submissions);
-    }
-
+    const syncMeta = applyAuthoritativeCloudHydrate(store, payload);
     saveStore(store);
     res.json({
       ok: true,
+      syncMeta,
       counts: {
         classes: store.classes.length,
         lessons: store.lessons.length,
         submissions: store.submissions.length,
+        notifications: store.notifications.length,
       },
     });
   });
@@ -1411,7 +1393,7 @@ async function startServer() {
     }
 
     const store = loadStore();
-    const classId = items?.[0]?.classId || store.classes[0]?.id || 'LOP-8A';
+    const classId = items?.[0]?.classId || store.classes[0]?.id || '';
     const leaderboard = buildLeaderboard(
       classId,
       store.submissions,
@@ -1441,7 +1423,7 @@ async function startServer() {
     const classId =
       typeof req.query.classId === 'string' && req.query.classId
         ? req.query.classId
-        : store.classes[0]?.id || 'LOP-5A';
+        : store.classes[0]?.id || '';
     const lang = (req.query.lang === 'en' ? 'en' : 'vi') as Language;
     const leaderboard = buildLeaderboard(classId, store.submissions, lang);
 
@@ -1755,10 +1737,8 @@ async function startServer() {
 
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`EduBot Digital Citizen running on http://localhost:${PORT}`);
-    // Immediately replace built-in demo seed classes (5A/5B/6A) with published Firestore classes if local file was reset
-    if (isDefaultSeedClassesOnly(loadStore().classes)) {
-      void hydrateFromPublicWorkspace('', { replaceContent: true, forceRefresh: true });
-    }
+    // Immediately pull real teacher classes, lessons, and alerts published in Firebase on boot
+    void hydrateFromPublicWorkspace('', { replaceContent: true, forceRefresh: true });
   });
 
   const shutdown = () => {

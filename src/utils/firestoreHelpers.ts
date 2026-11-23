@@ -3,9 +3,12 @@ import {
   AnswerSubmission,
   ClassRoom,
   Lesson,
+  PushNotification,
   Question,
 } from '../shared/types';
+import type { StoreData, SyncLedgerMeta } from '../shared/seedData';
 import { getCompetencyById } from '../shared/competencies';
+import { mergeLessonsPreservingCustom } from './aiLessonVault';
 
 /**
  * Default school-wide public workspace ID published by the primary Teacher/Admin
@@ -68,16 +71,217 @@ const DEMO_SEED_CLASS_SIGNATURES = new Map<string, string>([
 ]);
 
 /**
+ * Returns true if a single class matches one of the legacy starter demo placeholders
+ * (LOP-5A/Cô Minh Anh, LOP-5B/Thầy Quốc Bảo, LOP-6A/Cô Thu Hà).
+ * A real teacher creating their own LOP-5A with their own name returns false.
+ */
+export function isDemoSeedClass(cls: ClassRoom | null | undefined): boolean {
+  if (!cls?.id) return false;
+  const demoTeacher = DEMO_SEED_CLASS_SIGNATURES.get(cls.id);
+  return Boolean(demoTeacher && cls.teacherName === demoTeacher);
+}
+
+/**
+ * Returns true if an ID belongs to a legacy fake seed submission, notification, or log.
+ */
+export function isDemoSeedArtifactId(id: string | null | undefined): boolean {
+  if (!id) return false;
+  return (
+    id.startsWith('sub-seed-') ||
+    id.startsWith('notif-seed-') ||
+    id.startsWith('log-seed-')
+  );
+}
+
+/**
  * Returns true when `classes` is empty or contains ONLY the built-in starter demo classes
  * (LOP-5A, LOP-5B, LOP-6A). Used to guarantee real teacher classes from Firestore always
  * replace starter demo placeholders—and demo classes are never accidentally pushed to cloud.
  */
 export function isDefaultSeedClassesOnly(classes: ClassRoom[]): boolean {
   if (!Array.isArray(classes) || classes.length === 0) return true;
-  return classes.every((c) => {
-    const demoTeacher = DEMO_SEED_CLASS_SIGNATURES.get(c.id);
-    return Boolean(demoTeacher && c.teacherName === demoTeacher);
-  });
+  return classes.every((c) => isDemoSeedClass(c));
+}
+
+/**
+ * Deduplicates an array of objects by normalized `id`, keeping the latest entry per ID
+ * while preserving deterministic ordering.
+ */
+export function dedupeById<T extends { id: string }>(items: T[]): T[] {
+  const map = new Map<string, T>();
+  for (const item of items) {
+    if (!item?.id) continue;
+    const key = String(item.id).trim();
+    if (!key) continue;
+    map.set(key, item);
+  }
+  return Array.from(map.values());
+}
+
+/**
+ * Removes any legacy virtual demo classes (LOP-5A/5B/6A by demo teachers) and fake
+ * `*-seed-*` records from a store and deduplicates all collections by ID.
+ */
+export function sanitizeStoreRemoveDemoArtifacts(store: StoreData): {
+  store: StoreData;
+  changed: boolean;
+} {
+  const origClasses = Array.isArray(store.classes) ? store.classes : [];
+  const origLessons = Array.isArray(store.lessons) ? store.lessons : [];
+  const origSubs = Array.isArray(store.submissions) ? store.submissions : [];
+  const origNotifs = Array.isArray(store.notifications) ? store.notifications : [];
+  const origLogs = Array.isArray(store.activityLogs) ? store.activityLogs : [];
+
+  const cleanClasses = dedupeById(
+    origClasses.filter((c) => Boolean(c?.id && c?.name) && !isDemoSeedClass(c)),
+  );
+  const cleanLessons = dedupeById(
+    origLessons.filter((l) => Boolean(l?.id && l?.title && Array.isArray(l.questions))),
+  );
+  const cleanSubs = mergeLatestSubmissions(
+    [],
+    origSubs.filter((s) => Boolean(s?.id) && !isDemoSeedArtifactId(s.id)),
+  );
+  const cleanNotifs = dedupeById(
+    origNotifs.filter((n) => Boolean(n?.id) && !isDemoSeedArtifactId(n.id)),
+  );
+  const cleanLogs = dedupeById(
+    origLogs.filter((l) => Boolean(l?.id) && !isDemoSeedArtifactId(l.id)),
+  );
+
+  const changed =
+    cleanClasses.length !== origClasses.length ||
+    cleanLessons.length !== origLessons.length ||
+    cleanSubs.length !== origSubs.length ||
+    cleanNotifs.length !== origNotifs.length ||
+    cleanLogs.length !== origLogs.length;
+
+  store.classes = cleanClasses;
+  store.lessons = cleanLessons;
+  store.submissions = cleanSubs;
+  store.notifications = cleanNotifs;
+  store.activityLogs = cleanLogs;
+
+  return { store, changed };
+}
+
+export interface CloudHydratePayload {
+  classes?: ClassRoom[];
+  lessons?: Lesson[];
+  submissions?: AnswerSubmission[];
+  notifications?: PushNotification[];
+  activityLogs?: ActivityLog[];
+  authoritativeCloud?: boolean;
+  workspaceId?: string;
+  ownerUid?: string;
+  ownerEmail?: string;
+  source?: SyncLedgerMeta['source'];
+}
+
+/**
+ * Authoritatively reconciles local store with Firebase cloud records:
+ * - Overwrites `classes` directly from Firebase (even when empty if `authoritativeCloud: true`),
+ *   stripping any demo virtual classes and deduplicating by ID so classes never duplicate or resurrect.
+ * - Reconciles lessons cleanly without creating duplicates.
+ * - Deduplicates submissions, notifications, and activity logs while purging all fake `*-seed-*` ghosts.
+ * - Updates `store.syncMeta` (sync ledger record) so synced state is tracked and preserved.
+ */
+export function applyAuthoritativeCloudHydrate(
+  store: StoreData,
+  payload: CloudHydratePayload,
+): SyncLedgerMeta {
+  sanitizeStoreRemoveDemoArtifacts(store);
+
+  const isAuthoritative = Boolean(payload.authoritativeCloud);
+
+  if (Array.isArray(payload.classes)) {
+    const validClasses = dedupeById(
+      payload.classes.filter((c) => Boolean(c?.id && c?.name) && !isDemoSeedClass(c)),
+    );
+    if (isAuthoritative || validClasses.length > 0) {
+      store.classes = validClasses;
+    }
+  }
+
+  if (Array.isArray(payload.lessons)) {
+    const validLessons = dedupeById(
+      payload.lessons.filter(
+        (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
+      ),
+    );
+    if (validLessons.length > 0) {
+      store.lessons = dedupeById(mergeLessonsPreservingCustom(store.lessons, validLessons));
+    } else if (isAuthoritative && store.lessons.length === 0) {
+      store.lessons = [];
+    }
+  }
+
+  if (Array.isArray(payload.submissions)) {
+    const validSubs = payload.submissions.filter(
+      (s) => Boolean(s?.id) && !isDemoSeedArtifactId(s.id),
+    );
+    if (validSubs.length > 0) {
+      store.submissions = mergeLatestSubmissions(store.submissions, validSubs);
+    }
+  }
+
+  const activeClassIds = new Set(store.classes.map((c) => c.id));
+
+  if (Array.isArray(payload.notifications)) {
+    const existingReadMap = new Map(
+      store.notifications.map((n) => [n.id, new Set(n.readByGroupIds ?? [])]),
+    );
+    const validNotifs = payload.notifications.filter(
+      (n) =>
+        Boolean(n?.id) &&
+        !isDemoSeedArtifactId(n.id) &&
+        (!n.classId || activeClassIds.size === 0 || activeClassIds.has(n.classId)),
+    );
+    if (isAuthoritative || validNotifs.length > 0) {
+      const merged = validNotifs.map((n) => {
+        const prevRead = existingReadMap.get(n.id);
+        return {
+          ...n,
+          readByGroupIds: Array.from(
+            new Set([
+              ...(n.readByGroupIds ?? []),
+              ...(prevRead ? Array.from(prevRead) : []),
+            ]),
+          ),
+        };
+      });
+      store.notifications = dedupeById(merged);
+    }
+  }
+
+  if (Array.isArray(payload.activityLogs) && payload.activityLogs.length > 0) {
+    const validLogs = payload.activityLogs.filter(
+      (l) => Boolean(l?.id) && !isDemoSeedArtifactId(l.id),
+    );
+    const baseLogs = isAuthoritative
+      ? validLogs
+      : dedupeById([...store.activityLogs, ...validLogs]);
+    store.activityLogs = mergeSubmissionActivityLogs(baseLogs, store.submissions);
+  } else if (store.submissions.length > 0) {
+    store.activityLogs = mergeSubmissionActivityLogs(store.activityLogs, store.submissions);
+  }
+
+  const prevRev = store.syncMeta?.syncRevision ?? 0;
+  const nextMeta: SyncLedgerMeta = {
+    lastSyncedAt: new Date().toISOString(),
+    source: payload.source ?? 'firestore_teacher',
+    workspaceId: payload.workspaceId || store.syncMeta?.workspaceId || DEFAULT_PUBLIC_WORKSPACE_ID,
+    ownerUid: payload.ownerUid ?? store.syncMeta?.ownerUid,
+    ownerEmail: payload.ownerEmail ?? store.syncMeta?.ownerEmail,
+    classesCount: store.classes.length,
+    lessonsCount: store.lessons.length,
+    submissionsCount: store.submissions.length,
+    notificationsCount: store.notifications.length,
+    learnersCount: Array.isArray(store.learnerProfiles) ? store.learnerProfiles.length : 0,
+    syncRevision: prevRev + 1,
+  };
+  store.syncMeta = nextMeta;
+  return nextMeta;
 }
 
 /**

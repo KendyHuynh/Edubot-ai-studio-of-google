@@ -68,18 +68,9 @@ test('localStoreApi strips correctAnswer without teacher token and blocks anonym
       assert.equal(statusData.adminOnlyMode, true);
       assert.equal(statusData.canFirstRunSetup, false);
 
-      // Unauthenticated caller requesting role=teacher still gets NO answers
-      const spoofedRes = await handleLocalApi(
-        '/api/bootstrap?classId=LOP-5A&lang=vi&role=teacher',
-        { method: 'GET' },
-        storage,
-      );
-      assert.equal(spoofedRes.ok, true);
-      const spoofedData = spoofedRes.data as {
-        lessons: { questions: { correctAnswer?: string }[] }[];
-      };
-      assert.equal(spoofedData.lessons[0].questions.length, 15);
-      assert.equal(spoofedData.lessons[0].questions[0].correctAnswer, undefined);
+      // Fresh store starts completely clean with ZERO virtual demo classes (no LOP-5A/5B/6A!)
+      const freshBoot = await handleLocalApi('/api/bootstrap?lang=vi&role=student', { method: 'GET' }, storage);
+      assert.equal((freshBoot.data as { classes: unknown[] }).classes.length, 0);
 
       // Unauthenticated teacher mutation is rejected with 401
       const unauthCreate = await handleLocalApi(
@@ -89,17 +80,69 @@ test('localStoreApi strips correctAnswer without teacher token and blocks anonym
       );
       assert.equal(unauthCreate.status, 401);
 
-      // Authenticated teacher receives correctAnswer
+      // Authenticated teacher creates a real class & lesson
       const token = await seedAuthenticatedTeacherToken(storage);
+      await handleLocalApi(
+        '/api/sync/cloud-hydrate',
+        {
+          method: 'POST',
+          authToken: token,
+          body: JSON.stringify({
+            authoritativeCloud: true,
+            classes: [
+              { id: 'LOP-8A', name: 'Lớp 8A Thực tế', grade: 'Khối 8', teacherName: 'Cô Ý', createdAt: '2026-11-22T00:00:00Z' },
+            ],
+            lessons: [
+              {
+                id: 'lesson-real-1',
+                title: 'Bài 1 Thực tế',
+                topic: 'An toàn số',
+                sourceFileName: 'Bai1.txt',
+                summary: 'Tóm tắt',
+                assignedClassIds: ['LOP-8A'],
+                createdAt: '2026-11-22T00:00:00Z',
+                questions: [
+                  {
+                    id: 'q-real-1',
+                    type: 'multiple_choice',
+                    questionText: 'Mật khẩu mạnh là gì?',
+                    options: ['1234', 'SaoXanh#8A@2026!'],
+                    aiSearchKeywordHint: 'mật khẩu mạnh',
+                    correctAnswer: 'SaoXanh#8A@2026!',
+                    competencyId: '4.2',
+                    explanation: 'Cần chữ hoa, chữ thường, số và ký tự đặc biệt.',
+                  },
+                ],
+              },
+            ],
+          }),
+        },
+        storage,
+      );
+
+      // Unauthenticated caller requesting role=teacher still gets NO answers
+      const spoofedRes = await handleLocalApi(
+        '/api/bootstrap?classId=LOP-8A&lang=vi&role=teacher',
+        { method: 'GET' },
+        storage,
+      );
+      assert.equal(spoofedRes.ok, true);
+      const spoofedData = spoofedRes.data as {
+        lessons: { questions: { correctAnswer?: string }[] }[];
+      };
+      assert.equal(spoofedData.lessons[0].questions.length, 1);
+      assert.equal(spoofedData.lessons[0].questions[0].correctAnswer, undefined);
+
+      // Authenticated teacher receives correctAnswer
       const teacherRes = await handleLocalApi(
-        '/api/bootstrap?classId=LOP-5A&lang=vi&role=teacher',
+        '/api/bootstrap?classId=LOP-8A&lang=vi&role=teacher',
         { method: 'GET', authToken: token },
         storage,
       );
       const teacherData = teacherRes.data as {
         lessons: { questions: { correctAnswer?: string }[] }[];
       };
-      assert.ok(teacherData.lessons[0].questions[0].correctAnswer);
+      assert.equal(teacherData.lessons[0].questions[0].correctAnswer, 'SaoXanh#8A@2026!');
     },
   );
 });
@@ -1185,7 +1228,46 @@ test('localStoreApi saves true_false and true_false_multi via PUT /api/lessons/:
       const storage = createMemoryStorage();
       const token = await seedAuthenticatedTeacherToken(storage);
 
-      // Update seed lesson-ai-search with a true_false_multi (4 statements) and a single true_false question
+      // Hydrate a real teacher class + lesson first (no virtual demo LOP-5A auto-created)
+      await handleLocalApi(
+        '/api/sync/cloud-hydrate',
+        {
+          method: 'POST',
+          authToken: token,
+          body: JSON.stringify({
+            authoritativeCloud: true,
+            classes: [
+              { id: 'LOP-8A', name: 'Lớp 8A', grade: 'Khối 8', teacherName: 'Cô Ý', createdAt: '2026-11-22T00:00:00Z' },
+            ],
+            lessons: [
+              {
+                id: 'lesson-ai-search',
+                title: 'Bài 2',
+                topic: 'Đánh giá thông tin',
+                sourceFileName: 'Bai2.txt',
+                summary: 'Tóm tắt',
+                assignedClassIds: ['LOP-8A'],
+                createdAt: '2026-11-22T00:00:00Z',
+                questions: [
+                  {
+                    id: 'q-init',
+                    type: 'multiple_choice',
+                    questionText: 'Init?',
+                    options: ['A', 'B'],
+                    aiSearchKeywordHint: 'init',
+                    correctAnswer: 'A',
+                    competencyId: '1.2',
+                    explanation: 'Init',
+                  },
+                ],
+              },
+            ],
+          }),
+        },
+        storage,
+      );
+
+      // Update lesson-ai-search with a true_false_multi (4 statements) and a single true_false question
       const putRes = await handleLocalApi(
         '/api/lessons/lesson-ai-search',
         {
@@ -1195,6 +1277,7 @@ test('localStoreApi saves true_false and true_false_multi via PUT /api/lessons/:
             title: 'Bài 2: Đánh giá thông tin nâng cao',
             topic: 'Đánh giá thông tin số',
             summary: 'Luyện tập dạng Đúng/Sai nâng cao',
+            assignedClassIds: ['LOP-8A'],
             questions: [
               {
                 id: 'q-tfm-test',
@@ -1241,7 +1324,7 @@ test('localStoreApi saves true_false and true_false_multi via PUT /api/lessons/:
         {
           method: 'POST',
           body: JSON.stringify({
-            classId: 'LOP-5A',
+            classId: 'LOP-8A',
             tabletNumber: 1,
             groupName: 'Nhóm 3/4',
             lessonId: 'lesson-ai-search',
@@ -1269,7 +1352,7 @@ test('localStoreApi saves true_false and true_false_multi via PUT /api/lessons/:
         {
           method: 'POST',
           body: JSON.stringify({
-            classId: 'LOP-5A',
+            classId: 'LOP-8A',
             tabletNumber: 2,
             groupName: 'Nhóm 4/4',
             lessonId: 'lesson-ai-search',
@@ -1295,7 +1378,7 @@ test('localStoreApi saves true_false and true_false_multi via PUT /api/lessons/:
         {
           method: 'POST',
           body: JSON.stringify({
-            classId: 'LOP-5A',
+            classId: 'LOP-8A',
             tabletNumber: 2,
             groupName: 'Nhóm 4/4',
             lessonId: 'lesson-ai-search',
@@ -1311,6 +1394,91 @@ test('localStoreApi saves true_false and true_false_multi via PUT /api/lessons/:
       const sData = subSingle.data as { submission: { isCorrect: boolean; totalPoints: number } };
       assert.equal(sData.submission.isCorrect, true);
       assert.equal(sData.submission.totalPoints, 150);
+    },
+  );
+});
+
+test('localStoreApi purges legacy virtual LOP-5A seed artifacts, deduplicates repeated Firebase syncs, and preserves durable Sync Ledger snapshot', async () => {
+  await withMockFetch(
+    () => new Response(JSON.stringify({}), { status: 404 }),
+    async () => {
+      const backing = new Map<string, string>();
+      const storage: StorageLike = {
+        getItem: (k) => backing.get(k) ?? null,
+        setItem: (k, v) => {
+          backing.set(k, v);
+        },
+      };
+
+      // Simulate legacy localStorage polluted with fake demo LOP-5A + sub-seed-1 + notif-seed-1
+      backing.set(
+        'edubot_static_store_v1',
+        JSON.stringify({
+          classes: [
+            { id: 'LOP-5A', name: 'Lớp 5A', grade: 'Khối 5', teacherName: 'Cô Minh Anh', createdAt: '2026-01-01T00:00:00Z' },
+          ],
+          lessons: [],
+          submissions: [{ id: 'sub-seed-1', classId: 'LOP-5A', groupId: 'g1', tabletNumber: 1, groupName: 'g', lessonId: 'l', lessonTitle: 'l', questionId: 'q', competencyId: '1.1', userAnswer: 'a', isCorrect: true, basePoints: 100, speedBonus: 0, totalPoints: 100, elapsedMs: 1000, submittedAt: '2026-01-01T00:00:00Z', feedbackText: '', explanation: '' }],
+          notifications: [{ id: 'notif-seed-1', classId: 'LOP-5A', lessonId: 'l', title: 'Demo', message: 'Demo', createdAt: '2026-01-01T00:00:00Z', readByGroupIds: [] }],
+          activityLogs: [{ id: 'log-seed-1', classId: 'LOP-5A', groupId: 'g1', action: 'Demo', detail: '', timestamp: '2026-01-01T00:00:00Z' }],
+        }),
+      );
+
+      // Loading store IMMEDIATELY purges all fake demo LOP-5A & *-seed-* artifacts
+      const cleaned = loadLocalStore(storage);
+      assert.equal(cleaned.classes.length, 0);
+      assert.equal(cleaned.submissions.length, 0);
+      assert.equal(cleaned.notifications.length, 0);
+      assert.equal(cleaned.activityLogs.length, 0);
+
+      // Authoritative Firebase sync with duplicate entries + real classes deduplicates cleanly & records Sync Ledger
+      const token = await seedAuthenticatedTeacherToken(storage);
+      const syncPayload = {
+        authoritativeCloud: true,
+        workspaceId: 'WS-TEACHER-REAL',
+        ownerUid: 'uid-real-teacher',
+        ownerEmail: 'huynh.nhu.y1601@gmail.com',
+        classes: [
+          { id: 'LOP-8A', name: 'Lớp 8A', grade: 'Khối 8', teacherName: 'Cô Huỳnh Như Ý', createdAt: '2026-11-22T00:00:00Z' },
+          { id: 'LOP-8A', name: 'Lớp 8A (Cập nhật)', grade: 'Khối 8', teacherName: 'Cô Huỳnh Như Ý', createdAt: '2026-11-22T00:00:00Z' },
+          { id: 'LOP-9-5', name: 'Lớp 9/5', grade: 'Khối 9', teacherName: 'Cô Huỳnh Như Ý', createdAt: '2026-11-22T00:00:00Z' },
+          // Even if a legacy demo class snuck into payload, it is stripped!
+          { id: 'LOP-5A', name: 'Lớp 5A', grade: 'Khối 5', teacherName: 'Cô Minh Anh', createdAt: '2026-01-01T00:00:00Z' },
+        ],
+        lessons: [],
+        notifications: [
+          { id: 'n-real-1', classId: 'LOP-8A', lessonId: 'l1', title: 'Bài mới', message: 'Làm bài', createdAt: '2026-11-22T00:00:00Z', readByGroupIds: [] },
+          { id: 'n-real-1', classId: 'LOP-8A', lessonId: 'l1', title: 'Bài mới', message: 'Làm bài', createdAt: '2026-11-22T00:00:00Z', readByGroupIds: [] },
+        ],
+      };
+
+      const sync1 = await handleLocalApi(
+        '/api/sync/cloud-hydrate',
+        { method: 'POST', authToken: token, body: JSON.stringify(syncPayload) },
+        storage,
+      );
+      assert.equal(sync1.ok, true);
+
+      // Repeat the exact same sync -> still zero duplicates, revision increments to 2
+      const sync2 = await handleLocalApi(
+        '/api/sync/cloud-hydrate',
+        { method: 'POST', authToken: token, body: JSON.stringify(syncPayload) },
+        storage,
+      );
+      assert.equal(sync2.ok, true);
+      const meta = (sync2.data as { syncMeta: { syncRevision: number; classesCount: number; notificationsCount: number } }).syncMeta;
+      assert.equal(meta.syncRevision, 2);
+      assert.equal(meta.classesCount, 2);
+      assert.equal(meta.notificationsCount, 1);
+
+      // Even if primary key is cleared, durable Sync Snapshot restores exact synced Firebase classes (no data loss, no fake LOP-5A!)
+      backing.delete('edubot_static_store_v1');
+      const restored = loadLocalStore(storage);
+      assert.deepEqual(
+        restored.classes.map((c) => c.id),
+        ['LOP-8A', 'LOP-9-5'],
+      );
+      assert.equal(restored.syncMeta?.syncRevision, 2);
     },
   );
 });

@@ -31,6 +31,9 @@ import {
 } from './answerRecovery';
 import {
   DEFAULT_PUBLIC_WORKSPACE_ID,
+  dedupeById,
+  isDemoSeedArtifactId,
+  isDemoSeedClass,
   mergeLatestSubmissions,
   mergeSubmissionActivityLogs,
   sanitizeLessonFieldsForFirestore,
@@ -287,7 +290,7 @@ export async function saveSubmissionToFirestore(
       await setDoc(ref, {
         id: docId,
         ownerUid,
-        classId: (sub.classId || 'LOP-5A').slice(0, 64),
+        classId: (sub.classId || '').slice(0, 64),
         groupId: (sub.groupId || 'May-01').slice(0, 120),
         tabletNumber: Math.max(1, Math.min(10, Math.round(sub.tabletNumber || 1))),
         groupName: (sub.groupName || 'Nhóm 1').slice(0, 80),
@@ -362,7 +365,7 @@ export async function saveNotificationToFirestore(
       await setDoc(ref, {
         id: docId,
         ownerUid,
-        classId: (notif.classId || 'LOP-5A').slice(0, 64),
+        classId: (notif.classId || '').slice(0, 64),
         lessonId: toFirestoreDocId(notif.lessonId || 'lesson', 80),
         title: (notif.title || 'Thông báo').slice(0, 240),
         message: (notif.message || '').slice(0, 1000),
@@ -402,7 +405,7 @@ export async function saveActivityLogToFirestore(
       await setDoc(ref, {
         id: docId,
         ownerUid,
-        classId: (log.classId || 'LOP-5A').slice(0, 64),
+        classId: (log.classId || '').slice(0, 64),
         groupId: (log.groupId || 'Hệ thống').slice(0, 120),
         action: (log.action || 'Hoạt động').slice(0, 120),
         detail: (log.detail || '').slice(0, 500),
@@ -567,16 +570,26 @@ export async function fetchTeacherCloudData(ownerUid: string): Promise<{
       }
     }
 
-    const mergedSubmissions = mergeLatestSubmissions(submissions, publicSubmissions);
-    const mergedActivityLogs = mergeSubmissionActivityLogs(activityLogs, mergedSubmissions);
+    const cleanClasses = dedupeById(classes.filter((c) => !isDemoSeedClass(c)));
+    const cleanNotifs = dedupeById(
+      notifications.filter((n) => !isDemoSeedArtifactId(n.id)),
+    );
+    const mergedSubmissions = mergeLatestSubmissions(
+      submissions.filter((s) => !isDemoSeedArtifactId(s.id)),
+      publicSubmissions.filter((s) => !isDemoSeedArtifactId(s.id)),
+    );
+    const mergedActivityLogs = mergeSubmissionActivityLogs(
+      activityLogs.filter((l) => !isDemoSeedArtifactId(l.id)),
+      mergedSubmissions,
+    );
 
-    const healedLessons = recoverMissingCorrectAnswers(lessons);
+    const healedLessons = dedupeById(recoverMissingCorrectAnswers(lessons));
 
     return {
-      classes,
+      classes: cleanClasses,
       lessons: healedLessons,
       submissions: mergedSubmissions,
-      notifications,
+      notifications: cleanNotifs,
       activityLogs: mergedActivityLogs,
     };
   } catch (error) {
@@ -598,23 +611,32 @@ export async function pushWorkspaceToFirestore(
   },
   existingLogIds?: Set<string>,
 ): Promise<void> {
-  for (const cls of payload.classes) {
+  const realClasses = dedupeById(payload.classes.filter((c) => !isDemoSeedClass(c)));
+  for (const cls of realClasses) {
     if (!isActiveOwner(ownerUid)) return;
     await saveClassToFirestore(cls, ownerUid);
   }
-  for (const lesson of payload.lessons) {
+  const uniqueLessons = dedupeById(payload.lessons);
+  for (const lesson of uniqueLessons) {
     if (!isActiveOwner(ownerUid)) return;
     await saveLessonToFirestore(lesson, ownerUid);
   }
-  for (const sub of payload.submissions.slice(0, 40)) {
+  const realSubs = payload.submissions.filter((s) => !isDemoSeedArtifactId(s.id));
+  for (const sub of realSubs.slice(0, 40)) {
     if (!isActiveOwner(ownerUid)) return;
     await saveSubmissionToFirestore(sub, ownerUid);
   }
-  for (const notif of payload.notifications.slice(0, 20)) {
+  const realNotifs = dedupeById(
+    payload.notifications.filter((n) => !isDemoSeedArtifactId(n.id)),
+  );
+  for (const notif of realNotifs.slice(0, 20)) {
     if (!isActiveOwner(ownerUid)) return;
     await saveNotificationToFirestore(notif, ownerUid);
   }
-  for (const log of payload.activityLogs.slice(0, 30)) {
+  const realLogs = dedupeById(
+    payload.activityLogs.filter((l) => !isDemoSeedArtifactId(l.id)),
+  );
+  for (const log of realLogs.slice(0, 30)) {
     if (!isActiveOwner(ownerUid)) return;
     const docId = toFirestoreDocId(log.id, 80);
     const knownExists = existingLogIds ? existingLogIds.has(docId) : undefined;
@@ -676,18 +698,20 @@ export async function publishPublicWorkspace(
     } catch {
       // Non-fatal
     }
-    const healedLessons = recoverMissingCorrectAnswers(lessons, existingLessons);
+    const healedLessons = dedupeById(recoverMissingCorrectAnswers(lessons, existingLessons));
     // Hard anti-wipe guard: never publish student-sanitized lessons (all blank answers) to publicWorkspaces
     if (hasStrippedAnswers(healedLessons)) {
       return docId;
     }
-    const cleanClasses = classes.slice(0, 100).map((c) => ({
-      id: String(c.id).slice(0, 64),
-      name: String(c.name || c.id).slice(0, 160),
-      grade: String(c.grade || 'Khối 5').slice(0, 60),
-      teacherName: String(c.teacherName || 'Giáo viên').slice(0, 120),
-      createdAt: String(c.createdAt || new Date().toISOString()).slice(0, 64),
-    }));
+    const cleanClasses = dedupeById(classes.filter((c) => !isDemoSeedClass(c)))
+      .slice(0, 100)
+      .map((c) => ({
+        id: String(c.id).slice(0, 64),
+        name: String(c.name || c.id).slice(0, 160),
+        grade: String(c.grade || 'Khối 5').slice(0, 60),
+        teacherName: String(c.teacherName || 'Giáo viên').slice(0, 120),
+        createdAt: String(c.createdAt || new Date().toISOString()).slice(0, 64),
+      }));
     const cleanLessons = healedLessons.slice(0, 100).map((l) => {
       const lid = toFirestoreDocId(l.id, 80);
       return {
@@ -696,15 +720,19 @@ export async function publishPublicWorkspace(
         ...sanitizeLessonFieldsForFirestore(l, lid),
       };
     });
-    const cleanNotifications = notifications.slice(0, 50).map((n) => ({
-      id: toFirestoreDocId(n.id || 'notif', 80),
-      classId: String(n.classId || '').slice(0, 64),
-      lessonId: toFirestoreDocId(n.lessonId || 'lesson', 80),
-      title: String(n.title || 'Thông báo').slice(0, 240),
-      message: String(n.message || '').slice(0, 1000),
-      createdAt: String(n.createdAt || new Date().toISOString()).slice(0, 64),
-      readByGroupIds: (n.readByGroupIds ?? []).slice(0, 100).map((g) => String(g).slice(0, 120)),
-    }));
+    const cleanNotifications = dedupeById(
+      notifications.filter((n) => !isDemoSeedArtifactId(n.id)),
+    )
+      .slice(0, 50)
+      .map((n) => ({
+        id: toFirestoreDocId(n.id || 'notif', 80),
+        classId: String(n.classId || '').slice(0, 64),
+        lessonId: toFirestoreDocId(n.lessonId || 'lesson', 80),
+        title: String(n.title || 'Thông báo').slice(0, 240),
+        message: String(n.message || '').slice(0, 1000),
+        createdAt: String(n.createdAt || new Date().toISOString()).slice(0, 64),
+        readByGroupIds: (n.readByGroupIds ?? []).slice(0, 100).map((g) => String(g).slice(0, 120)),
+      }));
 
     await writeSinglePublicWorkspaceDoc(
       docId,

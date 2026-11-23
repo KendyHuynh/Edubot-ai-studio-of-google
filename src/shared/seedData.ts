@@ -28,6 +28,20 @@ export function createDefaultAdminSecurity(adminOnlyMode = false): AdminSecurity
   };
 }
 
+export interface SyncLedgerMeta {
+  lastSyncedAt: string;
+  source: 'firestore_teacher' | 'public_workspace' | 'local_edit';
+  workspaceId: string;
+  ownerUid?: string;
+  ownerEmail?: string;
+  classesCount: number;
+  lessonsCount: number;
+  submissionsCount: number;
+  notificationsCount: number;
+  learnersCount: number;
+  syncRevision: number;
+}
+
 export interface StoreData {
   classes: ClassRoom[];
   lessons: Lesson[];
@@ -38,6 +52,24 @@ export interface StoreData {
   learnerProfiles?: LearnerProfile[];
   assessmentAttempts?: AssessmentSessionAttempt[];
   teacherAwards?: TeacherAward[];
+  syncMeta?: SyncLedgerMeta;
+}
+
+/**
+ * Clean initial store with ZERO virtual/fake classes (no demo LOP-5A/5B/6A)
+ * and ZERO fake submissions/notifications/logs. Real data is synced directly from Firebase.
+ */
+export function createEmptyStore(): StoreData {
+  return {
+    classes: [],
+    lessons: [],
+    submissions: [],
+    notifications: [],
+    activityLogs: [],
+    learnerProfiles: [],
+    assessmentAttempts: [],
+    teacherAwards: [],
+  };
 }
 
 export function createSeedData(): StoreData {

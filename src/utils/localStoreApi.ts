@@ -14,7 +14,7 @@ import {
 import {
   AdminSecurityConfig,
   createDefaultAdminSecurity,
-  createSeedData,
+  createEmptyStore,
   PRIMARY_ADMIN_EMAIL,
   StoreData,
 } from '../shared/seedData';
@@ -42,12 +42,18 @@ import {
   upsertLearnerProfileInStore,
 } from '../shared/learnerStoreOps';
 import {
+  applyAuthoritativeCloudHydrate,
+  CloudHydratePayload,
+  dedupeById,
   DEFAULT_PUBLIC_WORKSPACE_ID,
   isDefaultSeedClassesOnly,
+  isDemoSeedArtifactId,
+  isDemoSeedClass,
   LEGACY_FALLBACK_WORKSPACE_ID,
   mergeLatestSubmissions,
   mergeSubmissionActivityLogs,
   normalizeClassCode,
+  sanitizeStoreRemoveDemoArtifacts,
 } from './firestoreHelpers';
 import {
   fetchPublicSubmissionsViaRest,
@@ -63,6 +69,7 @@ import { recoverMissingCorrectAnswers } from './answerRecovery';
 import { mergeLessonsPreservingCustom } from './aiLessonVault';
 
 const STATIC_STORE_KEY = 'edubot_static_store_v1';
+const SYNC_SNAPSHOT_KEY = 'edubot_cloud_sync_snapshot_v1';
 
 interface LocalAdminSession {
   role: 'admin' | 'teacher';
@@ -195,29 +202,53 @@ export function resetLocalHydrationCache(): void {
 }
 
 export function loadLocalStore(storage: StorageLike = defaultStorage): StoreData {
-  try {
-    const raw = storage.getItem(STATIC_STORE_KEY);
-    if (raw) {
+  const tryParse = (raw: string | null): StoreData | null => {
+    if (!raw) return null;
+    try {
       const parsed = JSON.parse(raw) as StoreData;
       if (Array.isArray(parsed.classes) && Array.isArray(parsed.lessons)) {
+        const { changed } = sanitizeStoreRemoveDemoArtifacts(parsed);
         parsed.lessons = recoverMissingCorrectAnswers(parsed.lessons);
+        if (changed) {
+          saveLocalStore(parsed, storage);
+        }
         return parsed;
       }
+    } catch {
+      // ignore corrupted entry
     }
-  } catch {
-    // Re-seed below
+    return null;
+  };
+
+  // 1) Primary local store
+  const primary = tryParse(storage.getItem(STATIC_STORE_KEY));
+  if (primary) return primary;
+
+  // 2) Restore from durable Cloud Sync Snapshot if primary store was cleared (prevents data loss!)
+  const snapshot = tryParse(storage.getItem(SYNC_SNAPSHOT_KEY));
+  if (snapshot) {
+    saveLocalStore(snapshot, storage);
+    return snapshot;
   }
-  const seed = createSeedData();
-  saveLocalStore(seed, storage);
-  return seed;
+
+  // 3) Clean empty store — NEVER create fake/virtual LOP-5A/5B/6A classes!
+  const empty = createEmptyStore();
+  saveLocalStore(empty, storage);
+  return empty;
 }
 
 export function saveLocalStore(
   data: StoreData,
   storage: StorageLike = defaultStorage,
 ): void {
+  sanitizeStoreRemoveDemoArtifacts(data);
   try {
-    storage.setItem(STATIC_STORE_KEY, JSON.stringify(data));
+    const serialized = JSON.stringify(data);
+    storage.setItem(STATIC_STORE_KEY, serialized);
+    // Keep a durable Cloud Sync Snapshot backup whenever real synced data exists
+    if (data.syncMeta || data.classes.length > 0 || data.lessons.length > 0) {
+      storage.setItem(SYNC_SNAPSHOT_KEY, serialized);
+    }
   } catch {
     // ignore storage quota errors
   }
@@ -245,18 +276,17 @@ async function hydrateLocalFromPublicWorkspace(
     let changed = false;
 
     if (snapshot && options.replaceContent) {
-      if (snapshot.classes.length > 0) {
-        const wasDemoSeedOnly = isDefaultSeedClassesOnly(store.classes);
-        store.classes = snapshot.classes;
-        if (wasDemoSeedOnly && !isDefaultSeedClassesOnly(snapshot.classes)) {
-          store.submissions = store.submissions.filter((s) => !s.id.startsWith('sub-seed-'));
-          store.activityLogs = store.activityLogs.filter((l) => !l.id.startsWith('log-seed-'));
-          store.notifications = store.notifications.filter((n) => !n.id.startsWith('notif-seed-'));
-        }
+      const cleanSnapClasses = dedupeById(
+        snapshot.classes.filter((c) => Boolean(c?.id && c?.name) && !isDemoSeedClass(c)),
+      );
+      if (cleanSnapClasses.length > 0) {
+        store.classes = cleanSnapClasses;
         changed = true;
       }
       if (snapshot.lessons.length > 0) {
-        store.lessons = recoverMissingCorrectAnswers(snapshot.lessons, store.lessons);
+        store.lessons = dedupeById(
+          recoverMissingCorrectAnswers(snapshot.lessons, store.lessons),
+        );
         changed = true;
       }
       if (snapshot.notifications && snapshot.notifications.length > 0) {
@@ -264,18 +294,25 @@ async function hydrateLocalFromPublicWorkspace(
         const readMap = new Map(
           store.notifications.map((n) => [n.id, new Set(n.readByGroupIds ?? [])]),
         );
-        store.notifications = snapshot.notifications
-          .filter((n) => !n.classId || activeClassIds.size === 0 || activeClassIds.has(n.classId))
-          .map((n) => {
-            const existingRead = readMap.get(n.id);
-            const mergedRead = Array.from(
-              new Set([
-                ...(n.readByGroupIds ?? []),
-                ...(existingRead ? Array.from(existingRead) : []),
-              ]),
-            );
-            return { ...n, readByGroupIds: mergedRead };
-          });
+        store.notifications = dedupeById(
+          snapshot.notifications
+            .filter(
+              (n) =>
+                Boolean(n?.id) &&
+                !isDemoSeedArtifactId(n.id) &&
+                (!n.classId || activeClassIds.size === 0 || activeClassIds.has(n.classId)),
+            )
+            .map((n) => {
+              const existingRead = readMap.get(n.id);
+              const mergedRead = Array.from(
+                new Set([
+                  ...(n.readByGroupIds ?? []),
+                  ...(existingRead ? Array.from(existingRead) : []),
+                ]),
+              );
+              return { ...n, readByGroupIds: mergedRead };
+            }),
+        );
         changed = true;
       }
     }
@@ -291,7 +328,9 @@ async function hydrateLocalFromPublicWorkspace(
     const cloudSubs: AnswerSubmission[] = [];
     for (const wsId of subSources) {
       const rows = await fetchPublicSubmissionsViaRest(firebaseConfig, wsId);
-      if (rows.length > 0) cloudSubs.push(...rows);
+      if (rows.length > 0) {
+        cloudSubs.push(...rows.filter((s) => !isDemoSeedArtifactId(s.id)));
+      }
     }
 
     if (cloudSubs.length > 0) {
@@ -300,7 +339,23 @@ async function hydrateLocalFromPublicWorkspace(
       changed = true;
     }
 
-    if (changed) {
+    const sanitized = sanitizeStoreRemoveDemoArtifacts(store);
+    if (sanitized.changed) changed = true;
+
+    if (changed || snapshot) {
+      store.syncMeta = {
+        lastSyncedAt: new Date().toISOString(),
+        source: 'public_workspace',
+        workspaceId: resolvedWsId,
+        ownerUid: store.syncMeta?.ownerUid,
+        ownerEmail: store.syncMeta?.ownerEmail,
+        classesCount: store.classes.length,
+        lessonsCount: store.lessons.length,
+        submissionsCount: store.submissions.length,
+        notificationsCount: store.notifications.length,
+        learnersCount: Array.isArray(store.learnerProfiles) ? store.learnerProfiles.length : 0,
+        syncRevision: (store.syncMeta?.syncRevision ?? 0) + (changed ? 1 : 0),
+      };
       saveLocalStore(store, storage);
     }
     hydratedWorkspaceCache.set(cacheKey, Date.now());
@@ -752,7 +807,7 @@ export async function handleLocalApi(
     const targetClassId =
       classId && store.classes.some((c) => c.id === classId)
         ? classId
-        : store.classes[0]?.id || 'LOP-8A';
+        : store.classes[0]?.id || '';
 
     // Strict class isolation for students: only expose lessons assigned to their class
     const visibleLessons =
@@ -836,6 +891,7 @@ export async function handleLocalApi(
         groupProgress,
         submissionsCount: store.submissions.length,
         activeWorkspaceId: resolvedWsId || activePublicWorkspaceId,
+        syncMeta: store.syncMeta ?? null,
         ...(includeAnswers ? { submissions: store.submissions } : {}),
       },
     };
@@ -919,43 +975,11 @@ export async function handleLocalApi(
 
   // POST /api/sync/cloud-hydrate
   if (pathname === '/api/sync/cloud-hydrate' && method === 'POST') {
-    const payload = body as Partial<StoreData>;
+    const payload = body as CloudHydratePayload;
     const store = loadLocalStore(storage);
-    // Replace classes & lessons with authoritative teacher Firestore records (avoid keeping deleted seed items)
-    if (Array.isArray(payload.classes) && payload.classes.length > 0) {
-      const validClasses = payload.classes.filter((c) => Boolean(c?.id && c?.name));
-      if (validClasses.length > 0) {
-        store.classes = validClasses;
-      }
-    }
-    if (Array.isArray(payload.lessons) && payload.lessons.length > 0) {
-      const validLessons = payload.lessons.filter(
-        (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
-      );
-      if (validLessons.length > 0) {
-        store.lessons = mergeLessonsPreservingCustom(store.lessons, validLessons);
-      }
-    }
-    if (Array.isArray(payload.submissions) && payload.submissions.length > 0) {
-      store.submissions = mergeLatestSubmissions(store.submissions, payload.submissions);
-    }
-    if (Array.isArray(payload.notifications) && payload.notifications.length > 0) {
-      const map = new Map(store.notifications.map((n) => [n.id, n]));
-      for (const n of payload.notifications) if (n?.id) map.set(n.id, n);
-      store.notifications = Array.from(map.values());
-    }
-    if (Array.isArray(payload.activityLogs) && payload.activityLogs.length > 0) {
-      const map = new Map(store.activityLogs.map((l) => [l.id, l]));
-      for (const l of payload.activityLogs) if (l?.id) map.set(l.id, l);
-      store.activityLogs = mergeSubmissionActivityLogs(
-        Array.from(map.values()),
-        store.submissions,
-      );
-    } else if (store.submissions.length > 0) {
-      store.activityLogs = mergeSubmissionActivityLogs(store.activityLogs, store.submissions);
-    }
+    const syncMeta = applyAuthoritativeCloudHydrate(store, payload);
     saveLocalStore(store, storage);
-    return { ok: true, status: 200, data: { ok: true } };
+    return { ok: true, status: 200, data: { ok: true, syncMeta } };
   }
 
   // POST /api/classes
@@ -1302,7 +1326,7 @@ export async function handleLocalApi(
       }
     }
     saveLocalStore(store, storage);
-    const classId = items?.[0]?.classId || store.classes[0]?.id || 'LOP-8A';
+    const classId = items?.[0]?.classId || store.classes[0]?.id || '';
     const leaderboard = buildLeaderboard(classId, store.submissions, resolvedLang);
     return { ok: true, status: 200, data: { synced, leaderboard } };
   }
@@ -1325,7 +1349,7 @@ export async function handleLocalApi(
   // GET /api/export
   if (pathname === '/api/export' && method === 'GET') {
     const store = loadLocalStore(storage);
-    const classId = parsedUrl.searchParams.get('classId') || store.classes[0]?.id || 'LOP-5A';
+    const classId = parsedUrl.searchParams.get('classId') || store.classes[0]?.id || '';
     const lang: Language = parsedUrl.searchParams.get('lang') === 'en' ? 'en' : 'vi';
     const leaderboard = buildLeaderboard(classId, store.submissions, lang);
     return {

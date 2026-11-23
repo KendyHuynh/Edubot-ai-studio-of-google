@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { createSeedData, StoreData } from '../src/shared/seedData';
+import { createEmptyStore, StoreData } from '../src/shared/seedData';
 import { recoverMissingCorrectAnswers } from '../src/utils/answerRecovery';
+import { sanitizeStoreRemoveDemoArtifacts } from '../src/utils/firestoreHelpers';
 
 export type { StoreData };
 
@@ -19,20 +20,15 @@ export function loadStore(): StoreData {
     if (fs.existsSync(STORE_PATH)) {
       const raw = fs.readFileSync(STORE_PATH, 'utf-8');
       const parsed = JSON.parse(raw) as StoreData;
-      // Upgrade built-in seed lessons if they still have < 15 questions from earlier demo
-      const seed = createSeedData();
       let upgraded = false;
-      for (const seedLesson of seed.lessons) {
-        const idx = parsed.lessons.findIndex((l) => l.id === seedLesson.id);
-        if (idx >= 0 && parsed.lessons[idx].questions.length < 15) {
-          parsed.lessons[idx] = {
-            ...seedLesson,
-            assignedClassIds: parsed.lessons[idx].assignedClassIds,
-          };
-          upgraded = true;
-        }
+
+      // Strip legacy virtual demo classes (LOP-5A/5B/6A) and *-seed-* ghosts & deduplicate
+      const sanitized = sanitizeStoreRemoveDemoArtifacts(parsed);
+      if (sanitized.changed) {
+        upgraded = true;
       }
-      const hadBlankAnswers = parsed.lessons.some((l) =>
+
+      const hadBlankAnswers = (parsed.lessons ?? []).some((l) =>
         (l.questions ?? []).some((q) => !q.correctAnswer?.trim()),
       );
       if (hadBlankAnswers) {
@@ -46,14 +42,15 @@ export function loadStore(): StoreData {
       return cachedStore;
     }
   } catch (err) {
-    console.error('Failed to read store file, re-seeding:', err);
+    console.error('Failed to read store file, initializing clean store:', err);
   }
-  cachedStore = createSeedData();
+  cachedStore = createEmptyStore();
   saveStore(cachedStore);
   return cachedStore;
 }
 
 export function saveStore(data: StoreData): void {
+  sanitizeStoreRemoveDemoArtifacts(data);
   cachedStore = data;
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });

@@ -19,6 +19,7 @@ import { TeacherStudio } from './components/TeacherStudio';
 import { ActiveTab, TopNav } from './components/TopNav';
 import { getCopy } from './shared/i18n';
 import { CompetencyCoverageStat, DomainHonorAward } from './shared/scoring';
+import type { SyncLedgerMeta } from './shared/seedData';
 import {
   ActivityLog,
   AnswerSubmission,
@@ -54,6 +55,7 @@ interface BootstrapResponse {
   activityLogs: ActivityLog[];
   groupProgress?: Record<string, GroupLessonProgress>;
   submissions?: AnswerSubmission[];
+  syncMeta?: SyncLedgerMeta | null;
   sharedAppUrl?: string;
 }
 
@@ -77,9 +79,9 @@ export default function App() {
   );
 
   const [session, setSession] = useState<SessionIdentity | null>(() => {
-    if (entryParams.autostart) {
+    if (entryParams.autostart && entryParams.classId) {
       const tab = entryParams.tabletNumber ?? 3;
-      const cls = entryParams.classId ?? 'LOP-5A';
+      const cls = entryParams.classId;
       return {
         classId: cls,
         tabletNumber: tab,
@@ -104,7 +106,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>(() => {
     if (entryParams.portal === 'teacher') return 'teacher';
     if (entryParams.experienceMode === 'home') return 'self_assess';
-    if (entryParams.autostart) return 'play';
+    if (entryParams.autostart && entryParams.classId) return 'play';
     return 'identity';
   });
 
@@ -118,6 +120,7 @@ export default function App() {
   const [notifications, setNotifications] = useState<PushNotification[]>([]);
   const [activityLogs, setActivityLogs] = useState<ActivityLog[]>([]);
   const [submissions, setSubmissions] = useState<AnswerSubmission[]>([]);
+  const [syncMeta, setSyncMeta] = useState<SyncLedgerMeta | null>(null);
   const [sharedAppUrl, setSharedAppUrl] = useState<string>('');
   const [workspaceCode, setWorkspaceCode] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null;
@@ -210,6 +213,9 @@ export default function App() {
         setGroupProgress(data.groupProgress ?? {});
         if (data.sharedAppUrl) {
           setSharedAppUrl(data.sharedAppUrl);
+        }
+        if (data.syncMeta !== undefined) {
+          setSyncMeta(data.syncMeta ?? null);
         }
         if (data.submissions) {
           setSubmissions(data.submissions);
@@ -637,6 +643,7 @@ export default function App() {
               activityLogs={activityLogs}
               submissions={submissions}
               notifications={notifications}
+              syncMeta={syncMeta}
               sharedAppUrl={sharedAppUrl}
               selectedClassId={activeClassId}
               onRefreshData={() => fetchBootstrap(true)}
