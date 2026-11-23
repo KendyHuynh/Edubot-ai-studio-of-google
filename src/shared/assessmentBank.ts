@@ -1,3 +1,4 @@
+import { ASSESSMENT_EXPANSION_48 } from './assessmentExpansionBank';
 import { AssessmentExercise, AssessmentLevel } from './types';
 
 export interface AssessmentLevelMeta {
@@ -1710,4 +1711,15 @@ export const ASSESSMENT_BANK_96: AssessmentExercise[] = [
     hint: 'Trong học thuật và khoa học, độ tin cậy và khả năng kiểm chứng luôn đứng trên hình thức hoa mỹ.',
     explanation: 'Đánh giá AI ở cấp độ Chuyên gia là nhìn xuyên qua lớp vỏ ngôn từ trôi chảy để thẩm định độ trung thực và khả năng kiểm chứng.',
   },
+];
+
+export { ASSESSMENT_EXPANSION_48 };
+
+/**
+ * Full progressive 144-exercise bank:
+ * 96 core exercises (24 competencies × 4 levels) + 48 unlockable higher-level expansion exercises.
+ */
+export const ASSESSMENT_BANK_ALL: AssessmentExercise[] = [
+  ...ASSESSMENT_BANK_96,
+  ...ASSESSMENT_EXPANSION_48,
 ];

@@ -180,8 +180,8 @@ export function IdentityGate({
                 </p>
                 <p className="text-xs text-slate-600 leading-relaxed">
                   {lang === 'vi'
-                    ? 'Đăng nhập Google cá nhân, nhập Tên · Lớp · Trường, luyện 96 bài tập đa dạng theo 4 cấp độ & nhận khen thưởng.'
-                    : 'Sign in with Google, enter Name · Class · School, try 96 interactive exercises across 4 levels & earn awards.'}
+                    ? 'Bắt buộc đăng nhập Google để lưu tiến độ & tránh xem trước đề. Kho 96 → 144 bài tập mở khóa thêm khi lên cấp cao hơn!'
+                    : 'Google Sign-In required to save progress & keep questions fair. Unlock 96 → 144 progressive exercises as you level up!'}
                 </p>
               </div>
             </div>

@@ -1,10 +1,17 @@
-import { ASSESSMENT_BANK_96, ASSESSMENT_LEVELS } from './assessmentBank';
+import {
+  ASSESSMENT_BANK_96,
+  ASSESSMENT_BANK_ALL,
+  ASSESSMENT_EXPANSION_48,
+  ASSESSMENT_LEVELS,
+} from './assessmentBank';
 import { COMPETENCIES_24, COMPETENCY_DOMAINS } from './competencies';
 import {
   AssessmentExercise,
   AssessmentExerciseOutcome,
   AssessmentLevel,
   CompetencyMasteryRecord,
+  ExerciseAttemptRecord,
+  ExerciseRetryScoringTier,
   LearnerGradeBand,
   LearnerProfile,
   PublicLearnerHonorEntry,
@@ -23,6 +30,25 @@ export function getLevelMeta(level: AssessmentLevel) {
   return (
     ASSESSMENT_LEVELS.find((l) => l.level === level) ?? ASSESSMENT_LEVELS[0]
   );
+}
+
+/**
+ * Base XP for an exercise.
+ * Higher-level Expansion Pack questions award a +20% challenge bonus over standard level XP
+ * (L2+ = 50 XP, L3+ = 75 XP, L4+ = 105 XP) to reward climbing to harder unlocked content.
+ */
+export function getExerciseBaseXp(
+  level: AssessmentLevel,
+  tier?: 'core' | 'expansion',
+): number {
+  const base = getLevelMeta(level).xpPerCorrect;
+  if (tier === 'expansion') {
+    if (level === 2) return 50;
+    if (level === 3) return 75;
+    if (level === 4) return 105;
+    return Math.round(base * 1.2);
+  }
+  return base;
 }
 
 export function getSuggestedStartLevel(gradeBand: LearnerGradeBand): AssessmentLevel {
@@ -69,6 +95,200 @@ export function createEmptyLearnerProfile(params: {
     createdAt: now,
     updatedAt: now,
     lastActiveAt: now,
+  };
+}
+
+/**
+ * Looks up a student's prior attempt history for a specific exerciseId.
+ */
+export function getExerciseAttemptRecord(
+  mastery: Record<string, CompetencyMasteryRecord> | undefined,
+  competencyId: string,
+  exerciseId: string,
+): ExerciseAttemptRecord | undefined {
+  return mastery?.[competencyId]?.exerciseHistory?.[exerciseId];
+}
+
+export interface RetryXpCalculationResult {
+  xpEarned: number;
+  baseXp: number;
+  comboBonus: number;
+  multiplierPercent: number;
+  retryTier: ExerciseRetryScoringTier;
+  badgeVi: string;
+  badgeEn: string;
+}
+
+/**
+ * Pedagogically fair anti-farming retry XP policy:
+ * 1. First-try mastery (brand-new question): 100% XP + combo bonus (+10 when streak >= 3)
+ * 2. Redemption mastery (previously answered wrong, now mastered): 80% XP + (+5 combo when streak >= 3)
+ * 3. First spaced review (already mastered once, 0 prior review bonuses): 25% XP (no combo)
+ * 4. Unlimited repeat practice (already mastered + review bonus claimed): 0 XP (prevents XP farming)
+ * 5. Wrong answer: +5 effort XP on first try only; 0 XP on repeated wrong attempts
+ */
+export function calculateExerciseXpWithRetryPolicy(params: {
+  level: AssessmentLevel;
+  tier?: 'core' | 'expansion';
+  isCorrect: boolean;
+  nextCombo?: number;
+  priorRecord?: ExerciseAttemptRecord;
+}): RetryXpCalculationResult {
+  const baseXp = getExerciseBaseXp(params.level, params.tier);
+  const priorAttempts = params.priorRecord?.attempts ?? 0;
+  const priorCorrect = params.priorRecord?.correctCount ?? 0;
+  const priorReviewBonuses = params.priorRecord?.reviewBonusCount ?? 0;
+  const streak = Math.max(0, params.nextCombo ?? 0);
+
+  if (!params.isCorrect) {
+    if (priorAttempts === 0) {
+      return {
+        xpEarned: 5,
+        baseXp,
+        comboBonus: 0,
+        multiplierPercent: 0,
+        retryTier: 'first_attempt_effort',
+        badgeVi: 'Nỗ lực lần đầu (+5 XP)',
+        badgeEn: 'First Attempt Effort (+5 XP)',
+      };
+    }
+    return {
+      xpEarned: 0,
+      baseXp,
+      comboBonus: 0,
+      multiplierPercent: 0,
+      retryTier: 'repeat_wrong_no_xp',
+      badgeVi: 'Thử lại chưa đúng (0 XP)',
+      badgeEn: 'Retry Missed (0 XP)',
+    };
+  }
+
+  // Case 1: Brand-new exercise mastered on first attempt -> 100% XP
+  if (priorAttempts === 0) {
+    const comboBonus = streak >= 3 ? 10 : 0;
+    return {
+      xpEarned: baseXp + comboBonus,
+      baseXp,
+      comboBonus,
+      multiplierPercent: 100,
+      retryTier: 'first_mastery',
+      badgeVi:
+        params.tier === 'expansion'
+          ? 'Chinh phục Câu Mở rộng · 100% XP'
+          : 'Chinh phục lần đầu · 100% XP',
+      badgeEn:
+        params.tier === 'expansion'
+          ? 'Expansion Mastered · 100% XP'
+          : 'First-Try Mastery · 100% XP',
+    };
+  }
+
+  // Case 2: Previously got it wrong, studied and now got it right -> 80% Redemption XP
+  if (priorCorrect === 0) {
+    const scaledBase = Math.round(baseXp * 0.8);
+    const comboBonus = streak >= 3 ? 5 : 0;
+    return {
+      xpEarned: scaledBase + comboBonus,
+      baseXp: scaledBase,
+      comboBonus,
+      multiplierPercent: 80,
+      retryTier: 'redemption_mastery',
+      badgeVi: 'Sửa sai thành công · 80% XP',
+      badgeEn: 'Mistake Fixed · 80% XP',
+    };
+  }
+
+  // Case 3: Already mastered once, first spaced-review reinforcement -> 25% XP (capped once per exercise)
+  if (priorReviewBonuses === 0) {
+    const reviewXp = Math.max(5, Math.round(baseXp * 0.25));
+    return {
+      xpEarned: reviewXp,
+      baseXp: reviewXp,
+      comboBonus: 0,
+      multiplierPercent: 25,
+      retryTier: 'review_bonus',
+      badgeVi: 'Ôn tập củng cố · 25% XP',
+      badgeEn: 'Spaced Review · 25% XP',
+    };
+  }
+
+  // Case 4: Already mastered & review bonus already earned -> Pure practice mode (0 XP)
+  return {
+    xpEarned: 0,
+    baseXp: 0,
+    comboBonus: 0,
+    multiplierPercent: 0,
+    retryTier: 'practice_no_xp',
+    badgeVi: 'Luyện tập không cộng điểm (0 XP)',
+    badgeEn: 'Free Practice Mode (0 XP)',
+  };
+}
+
+/**
+ * Returns all exercises unlocked for the student's current level:
+ * - All 96 core exercises (24 competencies × L1..L4) are always available.
+ * - Expansion packs unlock progressively as students climb:
+ *   Level 2 unlocks +12 (L2+), Level 3 unlocks +18 (L3+), Level 4 unlocks +18 (L4+).
+ */
+export function getUnlockedAssessmentBank(
+  currentLevel: AssessmentLevel = 1,
+): AssessmentExercise[] {
+  return ASSESSMENT_BANK_ALL.filter(
+    (ex) => ex.tier !== 'expansion' || (ex.unlockMinLevel ?? ex.level) <= currentLevel,
+  );
+}
+
+export interface ExpansionLevelPackInfo {
+  level: 2 | 3 | 4;
+  totalCount: number;
+  unlocked: boolean;
+  masteredCount: number;
+  remainingNewCount: number;
+  xpPerCorrect: number;
+}
+
+export interface ExpansionUnlockSummary {
+  coreTotal: number;
+  expansionTotal: number;
+  unlockedExpansionCount: number;
+  totalUnlockedBankSize: number;
+  masteredExpansionCount: number;
+  packs: ExpansionLevelPackInfo[];
+}
+
+export function getExpansionUnlockSummary(
+  currentLevel: AssessmentLevel,
+  mastery: Record<string, CompetencyMasteryRecord> = {},
+): ExpansionUnlockSummary {
+  const levels: Array<2 | 3 | 4> = [2, 3, 4];
+  const packs: ExpansionLevelPackInfo[] = levels.map((lvl) => {
+    const list = ASSESSMENT_EXPANSION_48.filter((ex) => ex.level === lvl);
+    const unlocked = currentLevel >= lvl;
+    const masteredCount = list.filter(
+      (ex) => (getExerciseAttemptRecord(mastery, ex.competencyId, ex.id)?.correctCount ?? 0) > 0,
+    ).length;
+    return {
+      level: lvl,
+      totalCount: list.length,
+      unlocked,
+      masteredCount,
+      remainingNewCount: Math.max(0, list.length - masteredCount),
+      xpPerCorrect: getExerciseBaseXp(lvl, 'expansion'),
+    };
+  });
+
+  const unlockedExpansionCount = packs
+    .filter((p) => p.unlocked)
+    .reduce((sum, p) => sum + p.totalCount, 0);
+  const masteredExpansionCount = packs.reduce((sum, p) => sum + p.masteredCount, 0);
+
+  return {
+    coreTotal: ASSESSMENT_BANK_96.length,
+    expansionTotal: ASSESSMENT_EXPANSION_48.length,
+    unlockedExpansionCount,
+    totalUnlockedBankSize: ASSESSMENT_BANK_96.length + unlockedExpansionCount,
+    masteredExpansionCount,
+    packs,
   };
 }
 
@@ -203,18 +423,38 @@ export function computeOverallLevel(
   return 1;
 }
 
-export function applyAssessmentOutcomesToProfile(
+const EXERCISE_BY_ID = new Map<string, AssessmentExercise>(
+  ASSESSMENT_BANK_ALL.map((ex) => [ex.id, ex]),
+);
+
+export interface ApplyOutcomesResult {
+  profile: LearnerProfile;
+  normalizedOutcomes: AssessmentExerciseOutcome[];
+  xpAdded: number;
+}
+
+/**
+ * Authoritatively applies session outcomes to a learner profile, updating per-exercise history
+ * and strictly enforcing the anti-farming retry XP caps server-side.
+ */
+export function applyAssessmentOutcomesDetailed(
   profile: LearnerProfile,
   outcomes: AssessmentExerciseOutcome[],
   maxCombo: number,
-): LearnerProfile {
+): ApplyOutcomesResult {
   const now = new Date().toISOString();
-  const nextMastery: Record<string, CompetencyMasteryRecord> = {
-    ...profile.masteryByCompetency,
-  };
+  const nextMastery: Record<string, CompetencyMasteryRecord> = {};
+  for (const [cid, rec] of Object.entries(profile.masteryByCompetency ?? {})) {
+    nextMastery[cid] = {
+      ...rec,
+      exerciseHistory: rec.exerciseHistory ? { ...rec.exerciseHistory } : {},
+    };
+  }
 
   let addedXp = 0;
   let addedCorrect = 0;
+  let runningCombo = 0;
+  const normalizedOutcomes: AssessmentExerciseOutcome[] = [];
 
   for (const out of outcomes) {
     const prev = nextMastery[out.competencyId] ?? {
@@ -224,10 +464,44 @@ export function applyAssessmentOutcomesToProfile(
       correctCount: 0,
       xp: 0,
       lastPracticedAt: now,
+      exerciseHistory: {},
+    };
+
+    const history = { ...(prev.exerciseHistory ?? {}) };
+    const priorEx = history[out.exerciseId];
+    const bankEx = EXERCISE_BY_ID.get(out.exerciseId);
+    const exLevel = bankEx?.level ?? out.level;
+    const exTier = bankEx?.tier;
+
+    runningCombo = out.isCorrect ? runningCombo + 1 : 0;
+
+    const policy = calculateExerciseXpWithRetryPolicy({
+      level: exLevel,
+      tier: exTier,
+      isCorrect: out.isCorrect,
+      nextCombo: Math.max(runningCombo, maxCombo >= 3 ? 3 : 0),
+      priorRecord: priorEx,
+    });
+
+    // Authoritative XP: never exceed the policy ceiling (prevents client spoofing & XP farming)
+    const requestedXp = Math.max(0, Math.round(out.xpEarned || 0));
+    const authoritativeXp =
+      requestedXp > 0
+        ? Math.min(requestedXp, policy.xpEarned)
+        : policy.retryTier === 'practice_no_xp' || policy.retryTier === 'repeat_wrong_no_xp'
+          ? 0
+          : policy.xpEarned;
+
+    history[out.exerciseId] = {
+      attempts: (priorEx?.attempts ?? 0) + 1,
+      correctCount: (priorEx?.correctCount ?? 0) + (out.isCorrect ? 1 : 0),
+      reviewBonusCount:
+        (priorEx?.reviewBonusCount ?? 0) + (policy.retryTier === 'review_bonus' ? 1 : 0),
+      lastAttemptAt: now,
     };
 
     const nextHighest = out.isCorrect
-      ? (Math.max(prev.highestLevel, out.level) as 0 | AssessmentLevel)
+      ? (Math.max(prev.highestLevel, exLevel) as 0 | AssessmentLevel)
       : prev.highestLevel;
 
     nextMastery[out.competencyId] = {
@@ -235,18 +509,26 @@ export function applyAssessmentOutcomesToProfile(
       highestLevel: nextHighest,
       attempts: prev.attempts + 1,
       correctCount: prev.correctCount + (out.isCorrect ? 1 : 0),
-      xp: prev.xp + Math.max(0, Math.round(out.xpEarned)),
+      xp: prev.xp + authoritativeXp,
       lastPracticedAt: now,
+      exerciseHistory: history,
     };
 
-    addedXp += Math.max(0, Math.round(out.xpEarned));
+    addedXp += authoritativeXp;
     if (out.isCorrect) addedCorrect += 1;
+
+    normalizedOutcomes.push({
+      ...out,
+      level: exLevel,
+      xpEarned: authoritativeXp,
+      retryTier: policy.retryTier,
+    });
   }
 
   const nextTotalXp = profile.totalXp + addedXp;
   const computedLevel = computeOverallLevel(nextMastery, nextTotalXp);
 
-  return {
+  const updatedProfile: LearnerProfile = {
     ...profile,
     currentLevel: Math.max(profile.currentLevel, computedLevel) as AssessmentLevel,
     totalXp: nextTotalXp,
@@ -257,24 +539,61 @@ export function applyAssessmentOutcomesToProfile(
     updatedAt: now,
     lastActiveAt: now,
   };
+
+  return {
+    profile: updatedProfile,
+    normalizedOutcomes,
+    xpAdded: addedXp,
+  };
+}
+
+export function applyAssessmentOutcomesToProfile(
+  profile: LearnerProfile,
+  outcomes: AssessmentExerciseOutcome[],
+  maxCombo: number,
+): LearnerProfile {
+  return applyAssessmentOutcomesDetailed(profile, outcomes, maxCombo).profile;
+}
+
+/**
+ * Helper to rank exercises so students always see fresh/unmastered questions first:
+ * 0 = never attempted (100% XP), 1 = attempted but missed (80% redemption XP),
+ * 2 = mastered once & eligible for 25% review, 3 = fully reviewed (0 XP practice).
+ */
+function exerciseFreshnessBucket(
+  ex: AssessmentExercise,
+  mastery: Record<string, CompetencyMasteryRecord>,
+): number {
+  const rec = getExerciseAttemptRecord(mastery, ex.competencyId, ex.id);
+  if (!rec || rec.attempts === 0) return 0;
+  if (rec.correctCount === 0) return 1;
+  if (rec.reviewBonusCount === 0) return 2;
+  return 3;
 }
 
 /**
  * 12-question Diagnostic Quick Test covering ALL 6 domains (2 per domain),
  * spanning Levels 1..4 and mixing all 5 interactive exercise types.
+ * Uses unlocked exercises and prefers fresh/unmastered items.
  */
-export function buildDiagnosticDeck(seed = 'diag'): AssessmentExercise[] {
+export function buildDiagnosticDeck(
+  seed = 'diag',
+  mastery: Record<string, CompetencyMasteryRecord> = {},
+  currentLevel: AssessmentLevel = 1,
+): AssessmentExercise[] {
+  const unlockedBank = getUnlockedAssessmentBank(currentLevel);
   const picked: AssessmentExercise[] = [];
   const usedIds = new Set<string>();
 
   for (const domain of COMPETENCY_DOMAINS) {
     const domainComps = COMPETENCIES_24.filter((c) => c.domainId === domain.id);
-    const domainPool = ASSESSMENT_BANK_96.filter((ex) =>
+    const domainPool = unlockedBank.filter((ex) =>
       domainComps.some((c) => c.id === ex.competencyId),
     );
-    const shuffled = deterministicShuffle(domainPool, `${seed}-${domain.id}`);
+    const shuffled = deterministicShuffle(domainPool, `${seed}-${domain.id}`).sort(
+      (a, b) => exerciseFreshnessBucket(a, mastery) - exerciseFreshnessBucket(b, mastery),
+    );
 
-    // Pick 1 foundational (L1 or L2) and 1 advanced (L3 or L4) with distinct competencies when possible
     const foundational =
       shuffled.find((e) => (e.level === 1 || e.level === 2) && !usedIds.has(e.id)) ??
       shuffled[0];
@@ -296,51 +615,84 @@ export function buildDiagnosticDeck(seed = 'diag'): AssessmentExercise[] {
     }
   }
 
-  // Sort progressively from Level 1 to Level 4 so the test feels like an engaging climb
   return picked.sort((a, b) => a.level - b.level);
 }
 
 /**
- * 10-question Level Challenge targeting a specific Level (1..4), prioritizing competencies
- * the student hasn't yet mastered at that level.
+ * 10-question Level Challenge targeting a specific Level (1..4).
+ * Pulls from BOTH core exercises AND unlocked expansion exercises at that level,
+ * prioritizing unattempted -> redemption -> review items.
  */
 export function buildLevelChallengeDeck(
   level: AssessmentLevel,
   mastery: Record<string, CompetencyMasteryRecord>,
   count = 10,
   seed = String(Date.now()),
+  currentLevel: AssessmentLevel = level,
 ): AssessmentExercise[] {
-  const pool = ASSESSMENT_BANK_96.filter((ex) => ex.level === level);
-  const unmastered = pool.filter(
-    (ex) => (mastery[ex.competencyId]?.highestLevel ?? 0) < level,
-  );
-  const mastered = pool.filter(
-    (ex) => (mastery[ex.competencyId]?.highestLevel ?? 0) >= level,
-  );
-  const ordered = [
-    ...deterministicShuffle(unmastered, `${seed}-u`),
-    ...deterministicShuffle(mastered, `${seed}-m`),
-  ];
+  const unlockedBank = getUnlockedAssessmentBank(currentLevel);
+  const pool = unlockedBank.filter((ex) => ex.level === level);
+  const ordered = deterministicShuffle(pool, `${seed}-lvl-${level}`).sort((a, b) => {
+    const bucketDiff = exerciseFreshnessBucket(a, mastery) - exerciseFreshnessBucket(b, mastery);
+    if (bucketDiff !== 0) return bucketDiff;
+    const compUnmasteredA = (mastery[a.competencyId]?.highestLevel ?? 0) < level ? 0 : 1;
+    const compUnmasteredB = (mastery[b.competencyId]?.highestLevel ?? 0) < level ? 0 : 1;
+    return compUnmasteredA - compUnmasteredB;
+  });
   return ordered.slice(0, Math.min(count, ordered.length));
 }
 
 /**
- * 4-question progressive climb (Level 1 -> Level 4) for one specific competency (1.1 .. 6.3).
+ * Dedicated Higher-Level Expansion Pack deck (Level 2+, 3+, 4+ unlocked questions).
+ * Always prioritizes brand-new unmastered expansion exercises at or below currentLevel.
  */
-export function buildCompetencyFocusDeck(competencyId: string): AssessmentExercise[] {
-  return ASSESSMENT_BANK_96.filter((ex) => ex.competencyId === competencyId).sort(
-    (a, b) => a.level - b.level,
+export function buildAdvancedExpansionDeck(
+  currentLevel: AssessmentLevel,
+  mastery: Record<string, CompetencyMasteryRecord>,
+  count = 10,
+  seed = String(Date.now()),
+): AssessmentExercise[] {
+  const unlockedExpansions = ASSESSMENT_EXPANSION_48.filter(
+    (ex) => (ex.unlockMinLevel ?? ex.level) <= currentLevel,
   );
+  if (unlockedExpansions.length === 0) return [];
+
+  const ordered = deterministicShuffle(unlockedExpansions, `${seed}-exp`).sort((a, b) => {
+    const bucketDiff = exerciseFreshnessBucket(a, mastery) - exerciseFreshnessBucket(b, mastery);
+    if (bucketDiff !== 0) return bucketDiff;
+    // Prefer exercises closest to the student's highest unlocked tier first
+    return b.level - a.level;
+  });
+
+  return ordered.slice(0, Math.min(count, ordered.length));
+}
+
+/**
+ * Progressive climb (Level 1 -> Level 4) for one specific competency (1.1 .. 6.3),
+ * automatically appending any unlocked higher-level expansion exercises for that competency!
+ */
+export function buildCompetencyFocusDeck(
+  competencyId: string,
+  currentLevel: AssessmentLevel = 1,
+): AssessmentExercise[] {
+  const unlockedBank = getUnlockedAssessmentBank(currentLevel);
+  return unlockedBank
+    .filter((ex) => ex.competencyId === competencyId)
+    .sort((a, b) => {
+      if (a.level !== b.level) return a.level - b.level;
+      return (a.tier === 'expansion' ? 1 : 0) - (b.tier === 'expansion' ? 1 : 0);
+    });
 }
 
 /**
  * 8-question Variety Sprint: guarantees a fresh mix of all 5 interactive exercise formats
- * prioritizing the student's least-practiced competencies so practice never feels repetitive.
+ * prioritizing unattempted & unlocked higher-level exercises so practice stays rewarding.
  */
 export function buildVarietySprintDeck(
   mastery: Record<string, CompetencyMasteryRecord>,
   count = 8,
   seed = String(Date.now()),
+  currentLevel: AssessmentLevel = 1,
 ): AssessmentExercise[] {
   const types: AssessmentExercise['type'][] = [
     'scenario_choice',
@@ -350,14 +702,19 @@ export function buildVarietySprintDeck(
     'classify',
   ];
 
-  // Score each exercise: prefer less-practiced competencies and next attainable level
-  const scoredPool = deterministicShuffle(ASSESSMENT_BANK_96, seed).sort((a, b) => {
+  const unlockedBank = getUnlockedAssessmentBank(currentLevel);
+
+  const scoredPool = deterministicShuffle(unlockedBank, seed).sort((a, b) => {
+    const bucketA = exerciseFreshnessBucket(a, mastery);
+    const bucketB = exerciseFreshnessBucket(b, mastery);
+    if (bucketA !== bucketB) return bucketA - bucketB;
+
     const recA = mastery[a.competencyId];
     const recB = mastery[b.competencyId];
     const attemptsA = recA?.attempts ?? 0;
     const attemptsB = recB?.attempts ?? 0;
-    const targetLevelA = Math.min(4, (recA?.highestLevel ?? 0) + 1);
-    const targetLevelB = Math.min(4, (recB?.highestLevel ?? 0) + 1);
+    const targetLevelA = Math.min(4, Math.max(currentLevel, (recA?.highestLevel ?? 0) + 1));
+    const targetLevelB = Math.min(4, Math.max(currentLevel, (recB?.highestLevel ?? 0) + 1));
     const distA = Math.abs(a.level - targetLevelA);
     const distB = Math.abs(b.level - targetLevelB);
     return attemptsA * 2 + distA - (attemptsB * 2 + distB);

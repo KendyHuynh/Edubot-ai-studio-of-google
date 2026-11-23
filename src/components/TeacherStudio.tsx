@@ -2497,7 +2497,16 @@ export function TeacherStudio({
                               {qObj?.correctAnswer || '—'}
                             </td>
                             <td className="py-3.5 px-4 text-right whitespace-nowrap">
-                              {sub.isCorrect ? (
+                              {sub.isCorrect && sub.basePoints > 0 && sub.basePoints < 100 ? (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-sky-50 border border-sky-200 text-sky-800 text-xs font-bold">
+                                  <CheckCircle2 className="w-3.5 h-3.5" />
+                                  <span>
+                                    {lang === 'vi'
+                                      ? `Gần đúng (${sub.basePoints}%) · +${sub.totalPoints}đ`
+                                      : `Partial (${sub.basePoints}%) · +${sub.totalPoints}`}
+                                  </span>
+                                </span>
+                              ) : sub.isCorrect ? (
                                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold">
                                   <CheckCircle2 className="w-3.5 h-3.5" />
                                   <span>+{sub.totalPoints}đ</span>
@@ -2510,7 +2519,26 @@ export function TeacherStudio({
                               )}
                             </td>
                             <td className="py-3.5 px-4 text-right whitespace-nowrap">
-                              {sub.isCorrect ? (
+                              {sub.isCorrect && sub.basePoints > 0 && sub.basePoints < 100 ? (
+                                <div className="inline-flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => handleOverrideSubmission(sub, true)}
+                                    className="px-2.5 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg disabled:opacity-50 cursor-pointer"
+                                  >
+                                    {lang === 'vi' ? 'Nâng 100%' : 'Full 100%'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => handleOverrideSubmission(sub, false)}
+                                    className="px-2.5 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg disabled:opacity-50 cursor-pointer"
+                                  >
+                                    {lang === 'vi' ? 'Sai (0đ)' : 'Wrong'}
+                                  </button>
+                                </div>
+                              ) : sub.isCorrect ? (
                                 <button
                                   type="button"
                                   disabled={busy}

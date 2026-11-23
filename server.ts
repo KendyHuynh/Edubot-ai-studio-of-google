@@ -17,13 +17,15 @@ import {
 } from './src/utils/publicFirestoreRest';
 import { getCompetencyById } from './src/shared/competencies';
 import {
+  AnswerEvaluation,
   buildCompetencyMatrix,
   buildDomainChampions,
+  buildGradingFeedback,
   buildLeaderboard,
   calculatePoints,
   clampElapsedMs,
+  evaluateAnswerMatch,
   formatGroupId,
-  isAnswerMatch,
 } from './src/shared/scoring';
 import { recoverMissingCorrectAnswers } from './src/utils/answerRecovery';
 import { mergeLessonsPreservingCustom } from './src/utils/aiLessonVault';
@@ -1142,7 +1144,12 @@ async function startServer() {
     lang: Language,
     syncedFromOffline = false,
   ): Promise<
-    | { status: 'ok'; submission: AnswerSubmission; alreadySubmitted?: boolean }
+    | {
+        status: 'ok';
+        submission: AnswerSubmission;
+        alreadySubmitted?: boolean;
+        evaluation?: AnswerEvaluation;
+      }
     | { status: 'forbidden' }
     | { status: 'not_found' }
   > {
@@ -1189,28 +1196,27 @@ async function startServer() {
     const comp = getCompetencyById(question.competencyId);
     const safeElapsedMs = clampElapsedMs(item.elapsedMs, question.type);
 
-    // 100% deterministic, instant forgiving grading using stored answer keys + synonyms — NO AI calls!
-    const isCorrect = isAnswerMatch(
+    // 100% deterministic, instant fuzzy grading with full & partial credit — NO AI calls!
+    const evaluation = evaluateAnswerMatch(
       item.userAnswer,
       resolvedCorrectAnswer,
       question.type,
       question.options,
     );
+    const isCorrect = evaluation.isCorrect;
     const explanation = question.explanation;
-    const breakdown = calculatePoints(isCorrect, safeElapsedMs, question.type);
-
-    const feedbackText =
-      lang === 'en'
-        ? isCorrect
-          ? breakdown.speedBonus >= 35
-            ? `Lightning fast, ${item.groupName}! +${breakdown.totalPoints} pts (including +${breakdown.speedBonus} speed bonus)!`
-            : `Spot on, ${item.groupName}! +${breakdown.totalPoints} pts!`
-          : `Nice try, ${item.groupName}! Check the Digital Citizen tip below and keep going!`
-        : isCorrect
-          ? breakdown.speedBonus >= 35
-            ? `Quá nhanh quá nguy hiểm! Nhóm ${item.groupName} ghi ngay +${breakdown.totalPoints} điểm (gồm +${breakdown.speedBonus} điểm tốc độ)!`
-            : `Chính xác tuyệt đối! Chúc mừng nhóm ${item.groupName} nhận +${breakdown.totalPoints} điểm!`
-          : `Suýt đúng rồi ${item.groupName} ơi! Xem bí kíp Công dân số bên dưới để ghi điểm câu sau nhé!`;
+    const breakdown = calculatePoints(
+      isCorrect,
+      safeElapsedMs,
+      question.type,
+      evaluation.creditFactor,
+    );
+    const feedbackText = buildGradingFeedback(
+      item.groupName,
+      evaluation,
+      breakdown,
+      lang,
+    );
 
     const submission: AnswerSubmission = {
       id: `sub-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -1237,16 +1243,21 @@ async function startServer() {
 
     store.submissions.push(submission);
 
+    const isPartial = evaluation.matchTier === 'fuzzy_partial';
     const log: ActivityLog = {
       id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       classId: submission.classId,
       groupId: submission.groupId,
       action: syncedFromOffline
         ? isCorrect
-          ? 'Đồng bộ ngoại tuyến · Đúng'
+          ? isPartial
+            ? 'Đồng bộ ngoại tuyến · Gần đúng'
+            : 'Đồng bộ ngoại tuyến · Đúng'
           : 'Đồng bộ ngoại tuyến · Chưa đúng'
         : isCorrect
-          ? 'Trả lời đúng'
+          ? isPartial
+            ? 'Trả lời gần đúng (Khuyến khích)'
+            : 'Trả lời đúng'
           : 'Trả lời chưa đúng',
       detail: `Năng lực ${comp.id} (${comp.nameVi}) · ${(submission.elapsedMs / 1000).toFixed(1)}s`,
       competencyId: submission.competencyId,
@@ -1256,7 +1267,7 @@ async function startServer() {
     store.activityLogs.unshift(log);
 
     saveStore(store);
-    return { status: 'ok', submission, alreadySubmitted: false };
+    return { status: 'ok', submission, alreadySubmitted: false, evaluation };
   }
 
   // Teacher manual grade review / override for any recorded student answer
@@ -1448,12 +1459,10 @@ async function startServer() {
   // PERSONAL HOME 24-COMPETENCY SELF-ASSESSMENT & TEACHER REWARDS API
   // =========================================================================
 
-  // POST /api/learners/profile — Register/update personal learner profile (Google verified or guest trial)
+  // POST /api/learners/profile — Register/update personal learner profile (Google Sign-In mandatory)
   app.post('/api/learners/profile', async (req, res) => {
     const body = req.body as {
       idToken?: string;
-      uid?: string;
-      authType?: 'google' | 'guest';
       photoUrl?: string;
       fullName?: string;
       className?: string;
@@ -1472,37 +1481,31 @@ async function startServer() {
       return;
     }
 
-    let resolvedUid = String(body.uid ?? '').trim();
-    let resolvedAuthType: 'google' | 'guest' = 'guest';
-    let resolvedEmail: string | undefined;
+    if (!body.idToken) {
+      res.status(401).json({
+        error:
+          'Tự đánh giá ở nhà bắt buộc đăng nhập Google để lưu tiến độ và đảm bảo công bằng (tránh xem trước câu hỏi và đáp án).',
+      });
+      return;
+    }
 
-    if (body.idToken) {
-      const cfg = readFirebaseConfig();
-      const verified = await verifyFirebaseIdTokenViaRest(
-        String(body.idToken),
-        cfg.apiKey || '',
-      );
-      if (!verified || !verified.emailVerified) {
-        res.status(401).json({
-          error: 'Không thể xác thực tài khoản Google của học sinh. Vui lòng đăng nhập lại.',
-        });
-        return;
-      }
-      resolvedUid = verified.uid;
-      resolvedEmail = verified.email;
-      resolvedAuthType = 'google';
-    } else {
-      if (!resolvedUid || !resolvedUid.startsWith('guest_')) {
-        resolvedUid = `guest_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      }
-      resolvedAuthType = 'guest';
+    const cfg = readFirebaseConfig();
+    const verified = await verifyFirebaseIdTokenViaRest(
+      String(body.idToken),
+      cfg.apiKey || '',
+    );
+    if (!verified || !verified.emailVerified) {
+      res.status(401).json({
+        error: 'Không thể xác thực tài khoản Google của học sinh. Vui lòng đăng nhập lại.',
+      });
+      return;
     }
 
     const store = loadStore();
     const profile = upsertLearnerProfileInStore(store, {
-      uid: resolvedUid,
-      authType: resolvedAuthType,
-      email: resolvedEmail,
+      uid: verified.uid,
+      authType: 'google',
+      email: verified.email,
       photoUrl: body.photoUrl,
       fullName,
       className,
@@ -1519,38 +1522,33 @@ async function startServer() {
     });
   });
 
-  // GET /api/learners/me — Fetch current learner profile, recent attempts, and teacher awards
+  // GET /api/learners/me — Fetch authenticated Google learner profile, recent attempts, and teacher awards
   app.get('/api/learners/me', async (req, res) => {
-    const queryUid = typeof req.query.uid === 'string' ? req.query.uid.trim() : '';
     const idToken =
       typeof req.headers['x-learner-token'] === 'string'
         ? req.headers['x-learner-token'].trim()
         : '';
 
-    let resolvedUid = queryUid;
-    if (idToken) {
-      const cfg = readFirebaseConfig();
-      const verified = await verifyFirebaseIdTokenViaRest(idToken, cfg.apiKey || '');
-      if (verified?.uid) {
-        resolvedUid = verified.uid;
-      }
+    if (!idToken) {
+      res.status(401).json({
+        error: 'Cần đăng nhập tài khoản Google để xem hồ sơ Tự đánh giá ở nhà.',
+      });
+      return;
     }
 
-    if (!resolvedUid) {
-      res.status(400).json({ error: 'Thiếu mã định danh học sinh.' });
+    const cfg = readFirebaseConfig();
+    const verified = await verifyFirebaseIdTokenViaRest(idToken, cfg.apiKey || '');
+    if (!verified?.uid || !verified.emailVerified) {
+      res.status(401).json({
+        error: 'Phiên đăng nhập Google không hợp lệ. Vui lòng đăng nhập lại.',
+      });
       return;
     }
 
     const store = loadStore();
     const { learnerProfiles, assessmentAttempts, teacherAwards } =
       ensureLearnerCollections(store);
-    const profile = learnerProfiles.find((p) => p.uid === resolvedUid) ?? null;
-
-    // Protect Google-backed profiles: require verified matching idToken unless guest
-    if (profile && profile.authType === 'google' && !idToken) {
-      res.status(401).json({ error: 'Cần xác thực tài khoản Google để xem hồ sơ cá nhân.' });
-      return;
-    }
+    const profile = learnerProfiles.find((p) => p.uid === verified.uid) ?? null;
 
     res.json({
       profile,
@@ -1561,11 +1559,10 @@ async function startServer() {
     });
   });
 
-  // POST /api/learners/assessment-submit — Record self-assessment session & update 24-competency mastery
+  // POST /api/learners/assessment-submit — Record self-assessment session (Google-verified & retry-capped)
   app.post('/api/learners/assessment-submit', async (req, res) => {
     const body = req.body as {
       idToken?: string;
-      learnerUid?: string;
       learnerName?: string;
       className?: string;
       schoolName?: string;
@@ -1577,35 +1574,33 @@ async function startServer() {
       maxCombo?: number;
     };
 
-    let resolvedUid = String(body.learnerUid ?? '').trim();
-    let resolvedAuthType: 'google' | 'guest' = 'guest';
-    let resolvedEmail: string | undefined;
-
-    if (body.idToken) {
-      const cfg = readFirebaseConfig();
-      const verified = await verifyFirebaseIdTokenViaRest(
-        String(body.idToken),
-        cfg.apiKey || '',
-      );
-      if (verified?.uid) {
-        resolvedUid = verified.uid;
-        resolvedEmail = verified.email;
-        resolvedAuthType = 'google';
-      }
+    if (!body.idToken) {
+      res.status(401).json({
+        error: 'Cần đăng nhập Google để lưu kết quả Tự đánh giá 24 Năng lực.',
+      });
+      return;
     }
 
-    if (!resolvedUid) {
-      resolvedUid = `guest_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const cfg = readFirebaseConfig();
+    const verified = await verifyFirebaseIdTokenViaRest(
+      String(body.idToken),
+      cfg.apiKey || '',
+    );
+    if (!verified?.uid || !verified.emailVerified) {
+      res.status(401).json({
+        error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.',
+      });
+      return;
     }
 
     const store = loadStore();
     const { profile, attempt } = recordAssessmentAttemptInStore(store, {
-      learnerUid: resolvedUid,
+      learnerUid: verified.uid,
       learnerName: body.learnerName,
       className: body.className,
       schoolName: body.schoolName,
-      authType: resolvedAuthType,
-      email: resolvedEmail,
+      authType: 'google',
+      email: verified.email,
       gradeBand: body.gradeBand,
       mode: body.mode || 'variety_sprint',
       targetLevel: body.targetLevel,

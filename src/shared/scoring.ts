@@ -27,6 +27,7 @@ export function stripVietnameseDiacritics(input: string): string {
 
 const STRICT_NEGATION_TOKENS = new Set([
   'không',
+  'khong',
   'đừng',
   'tránh',
   'chưa',
@@ -233,71 +234,201 @@ const VIETNAMESE_SYNONYM_GROUPS: string[][] = [
     'google docs',
     'google meet',
   ],
+  [
+    'dau chan so',
+    'digital footprint',
+    'dau vet so',
+    'lich su hoat dong mang',
+  ],
+  [
+    'ma doc',
+    'virus',
+    'malware',
+    'phan mem doc hai',
+    'trojan',
+    'ransomware',
+  ],
+  [
+    'sao luu',
+    'backup',
+    'sao luu du lieu',
+    'luu tru dam may',
+  ],
+  [
+    'ma hoa',
+    'encryption',
+    'ma hoa du lieu',
+    'https',
+  ],
 ];
 
-function levenshteinDistance(a: string, b: string): number {
+export type AnswerMatchTier =
+  | 'exact'
+  | 'synonym'
+  | 'fuzzy_full'
+  | 'fuzzy_partial'
+  | 'none';
+
+export interface AnswerEvaluation {
+  isCorrect: boolean;
+  /** 1.0 = full credit, 0.7..0.85 = partial credit for near-match/typos, 0 = wrong */
+  creditFactor: number;
+  /** 0..1 combined fuzzy similarity score */
+  similarity: number;
+  matchTier: AnswerMatchTier;
+  matchedVariant?: string;
+}
+
+/**
+ * Optimal String Alignment (Damerau-Levenshtein) distance.
+ * Treats insertion, deletion, substitution, AND adjacent character transposition
+ * (e.g. "bna quyen" -> "ban quyen", "passwrod" -> "password") as edit distance 1.
+ */
+export function damerauLevenshteinDistance(a: string, b: string): number {
   if (a === b) return 0;
-  if (!a.length) return b.length;
-  if (!b.length) return a.length;
-  const prev = new Array<number>(b.length + 1);
-  const curr = new Array<number>(b.length + 1);
-  for (let j = 0; j <= b.length; j++) prev[j] = j;
-  for (let i = 1; i <= a.length; i++) {
-    curr[0] = i;
-    for (let j = 1; j <= b.length; j++) {
+  const lenA = a.length;
+  const lenB = b.length;
+  if (!lenA) return lenB;
+  if (!lenB) return lenA;
+
+  const dp: number[][] = Array.from({ length: lenA + 1 }, () =>
+    new Array<number>(lenB + 1).fill(0),
+  );
+  for (let i = 0; i <= lenA; i++) dp[i][0] = i;
+  for (let j = 0; j <= lenB; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= lenA; i++) {
+    for (let j = 1; j <= lenB; j++) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+      let val = Math.min(
+        dp[i - 1][j] + 1, // deletion
+        dp[i][j - 1] + 1, // insertion
+        dp[i - 1][j - 1] + cost, // substitution
+      );
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        val = Math.min(val, dp[i - 2][j - 2] + 1); // adjacent transposition
+      }
+      dp[i][j] = val;
     }
-    for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
   }
-  return prev[b.length];
+  return dp[lenA][lenB];
 }
 
-function isFuzzyTokenMatch(a: string, b: string): boolean {
-  if (a === b) return true;
+function bigramDiceSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) {
+    return a === b ? 1 : 0;
+  }
+  const counts = new Map<string, number>();
+  for (let i = 0; i < a.length - 1; i++) {
+    const bg = a.slice(i, i + 2);
+    counts.set(bg, (counts.get(bg) ?? 0) + 1);
+  }
+  let intersection = 0;
+  for (let j = 0; j < b.length - 1; j++) {
+    const bg = b.slice(j, j + 2);
+    const n = counts.get(bg) ?? 0;
+    if (n > 0) {
+      intersection++;
+      counts.set(bg, n - 1);
+    }
+  }
+  return (2 * intersection) / (a.length - 1 + (b.length - 1));
+}
+
+/**
+ * Combined fuzzy string similarity (0..1) blending Damerau-Levenshtein similarity (65%)
+ * and character bigram Sørensen–Dice similarity (35%).
+ */
+export function normalizedFuzzySimilarity(a: string, b: string): number {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
   const maxLen = Math.max(a.length, b.length);
-  if (maxLen < 4) return false;
-  const dist = levenshteinDistance(a, b);
-  if (maxLen >= 8) return dist <= 2;
-  return dist <= 1;
+  const dist = damerauLevenshteinDistance(a, b);
+  const dlSim = Math.max(0, 1 - dist / maxLen);
+  const diceSim = bigramDiceSimilarity(a, b);
+  return Number((dlSim * 0.65 + diceSim * 0.35).toFixed(4));
 }
 
-function matchesSynonymGroup(foldedNormUser: string, foldedNormCorrect: string): boolean {
+function tokenEditMatchQuality(a: string, b: string): number {
+  if (a === b) return 1;
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen < 4) return 0;
+  const dist = damerauLevenshteinDistance(a, b);
+  if (dist <= 1) return 0.92;
+  if (maxLen >= 7 && dist <= 2) return 0.8;
+  return 0;
+}
+
+function matchSynonymGroupDetailed(
+  foldedNormUser: string,
+  foldedNormCorrect: string,
+): { tier: 'synonym' | 'fuzzy_partial'; similarity: number; creditFactor: number } | null {
+  let bestPartial: { tier: 'fuzzy_partial'; similarity: number; creditFactor: number } | null =
+    null;
+
   for (const group of VIETNAMESE_SYNONYM_GROUPS) {
     const refInGroup = group.some(
       (phrase) =>
         foldedNormCorrect === phrase ||
-        (phrase.length >= 4 && foldedNormCorrect.includes(phrase)) ||
-        (foldedNormCorrect.length >= 4 && phrase.includes(foldedNormCorrect)),
+        (phrase.length >= 4 && foldedNormCorrect.includes(phrase)),
     );
     if (!refInGroup) continue;
-    const userInGroup = group.some((phrase) => {
-      if (foldedNormUser === phrase) return true;
-      if (phrase.length >= 4 && foldedNormUser.includes(phrase)) return true;
-      if (foldedNormUser.length >= 4 && phrase.includes(foldedNormUser)) return true;
-      if (phrase.length >= 6 && Math.abs(foldedNormUser.length - phrase.length) <= 2) {
-        return levenshteinDistance(foldedNormUser, phrase) <= 2;
+
+    for (const phrase of group) {
+      if (phrase === foldedNormCorrect) continue;
+      if (
+        foldedNormUser === phrase ||
+        (phrase.length >= 4 && foldedNormUser.includes(phrase))
+      ) {
+        return { tier: 'synonym', similarity: 0.96, creditFactor: 1 };
       }
-      return false;
-    });
-    if (userInGroup) return true;
+
+      if (phrase.length >= 5 && Math.abs(foldedNormUser.length - phrase.length) <= 3) {
+        const dist = damerauLevenshteinDistance(foldedNormUser, phrase);
+        const sim = normalizedFuzzySimilarity(foldedNormUser, phrase);
+        if (dist <= 1 || (phrase.length >= 8 && dist <= 2 && sim >= 0.84)) {
+          return { tier: 'synonym', similarity: Math.max(0.88, sim), creditFactor: 1 };
+        }
+        if (sim >= 0.68 && dist <= Math.max(2, Math.floor(phrase.length * 0.32))) {
+          const creditFactor = sim >= 0.78 ? 0.8 : 0.7;
+          if (!bestPartial || sim > bestPartial.similarity) {
+            bestPartial = { tier: 'fuzzy_partial', similarity: sim, creditFactor };
+          }
+        }
+      }
+    }
   }
-  return false;
+
+  return bestPartial;
 }
 
-function matchSingleKeyVariant(
+function evaluateSingleKeyVariant(
   userAnswer: string,
   correctVariant: string,
   type: QuestionType,
   options?: string[],
-): boolean {
+): AnswerEvaluation {
+  const miss: AnswerEvaluation = {
+    isCorrect: false,
+    creditFactor: 0,
+    similarity: 0,
+    matchTier: 'none',
+  };
+
   const normUser = normalizeAnswer(userAnswer);
   const normCorrect = normalizeAnswer(correctVariant);
   if (!normUser || !normCorrect) {
-    return false;
+    return miss;
   }
   if (normUser === normCorrect) {
-    return true;
+    return {
+      isCorrect: true,
+      creditFactor: 1,
+      similarity: 1,
+      matchTier: 'exact',
+      matchedVariant: correctVariant,
+    };
   }
 
   const foldedUser = stripVietnameseDiacritics(userAnswer);
@@ -305,19 +436,29 @@ function matchSingleKeyVariant(
 
   if (type === 'multiple_choice') {
     if (foldedUser && foldedUser === foldedCorrect) {
-      return true;
+      return {
+        isCorrect: true,
+        creditFactor: 1,
+        similarity: 1,
+        matchTier: 'exact',
+        matchedVariant: correctVariant,
+      };
     }
-    // Support letter-only correctAnswer (e.g. "C") when options are provided
     const letterIdx = OPTION_LETTERS.indexOf(normCorrect);
     if (letterIdx >= 0 && Array.isArray(options) && options[letterIdx]) {
       if (
         normUser === normalizeAnswer(options[letterIdx]) ||
         foldedUser === stripVietnameseDiacritics(options[letterIdx])
       ) {
-        return true;
+        return {
+          isCorrect: true,
+          creditFactor: 1,
+          similarity: 1,
+          matchTier: 'exact',
+          matchedVariant: correctVariant,
+        };
       }
     }
-    // Support letter-prefixed correctAnswer (e.g. "C. SaoXanh#5A@2026!")
     const strippedCorrect = normalizeAnswer(
       correctVariant.trim().replace(/^[A-Fa-f][.):\-\s]+/, ''),
     );
@@ -326,7 +467,13 @@ function matchSingleKeyVariant(
       (normUser === strippedCorrect ||
         foldedUser === stripVietnameseDiacritics(strippedCorrect))
     ) {
-      return true;
+      return {
+        isCorrect: true,
+        creditFactor: 1,
+        similarity: 1,
+        matchTier: 'exact',
+        matchedVariant: correctVariant,
+      };
     }
     const strippedUser = normalizeAnswer(
       userAnswer.trim().replace(/^[A-Fa-f][.):\-\s]+/, ''),
@@ -336,58 +483,95 @@ function matchSingleKeyVariant(
       (strippedUser === normCorrect ||
         stripVietnameseDiacritics(strippedUser) === foldedCorrect)
     ) {
-      return true;
+      return {
+        isCorrect: true,
+        creditFactor: 1,
+        similarity: 1,
+        matchTier: 'exact',
+        matchedVariant: correctVariant,
+      };
     }
-    return false;
+    return miss;
   }
 
-  // Deterministic pre-keyed forgiving grading for fill_blank & short_answer (ZERO AI needed)
+  // Deterministic pre-keyed fuzzy grading for fill_blank & short_answer (ZERO AI needed)
   if (type === 'fill_blank' || type === 'short_answer') {
-    // Check negation polarity on exact Vietnamese tokens (handles multiple negations like "không ... chưa ...")
+    // Check negation polarity FIRST so opposite meanings never receive full or partial credit
     const exactRefTokens = normCorrect.split(' ').filter((t) => t.length > 1);
     const exactUserTokens = normUser.split(' ').filter((t) => t.length > 1);
     const refHasNeg = exactRefTokens.some((t) => STRICT_NEGATION_TOKENS.has(t));
     const userHasNeg = exactUserTokens.some((t) => STRICT_NEGATION_TOKENS.has(t));
     if (refHasNeg !== userHasNeg) {
-      return false;
+      return miss;
     }
 
     const numUser = normalizeNumberWords(foldedUser);
     const numCorrect = normalizeNumberWords(foldedCorrect);
 
-    // Exact, diacritic-insensitive, or number-word equivalent match ("hai bước" == "2 bước")
+    // 1. Exact, diacritic-insensitive, or number-word equivalent ("hai bước" == "2 bước")
     if (foldedUser === foldedCorrect || numUser === numCorrect) {
-      return true;
+      return {
+        isCorrect: true,
+        creditFactor: 1,
+        similarity: 1,
+        matchTier: 'exact',
+        matchedVariant: correctVariant,
+      };
     }
 
-    // Substring match if student wrote a full sentence containing the key phrase
+    // 2. Substring match when student writes a complete sentence containing the exact key phrase
     if (
       numCorrect.length >= 3 &&
       (normUser.includes(normCorrect) ||
         foldedUser.includes(foldedCorrect) ||
         numUser.includes(numCorrect))
     ) {
-      return true;
+      return {
+        isCorrect: true,
+        creditFactor: 1,
+        similarity: 1,
+        matchTier: 'exact',
+        matchedVariant: correctVariant,
+      };
     }
 
-    // Synonym / near-meaning equivalence match (e.g. "bảo mật hai lớp" <-> "2FA", "tác quyền" <-> "bản quyền")
-    if (matchesSynonymGroup(numUser, numCorrect)) {
-      return true;
+    // 3. Curated synonym / near-meaning equivalence (exact synonym = 100%, typo'd synonym = partial)
+    const synMatch = matchSynonymGroupDetailed(numUser, numCorrect);
+    if (synMatch && synMatch.creditFactor >= 1) {
+      return {
+        isCorrect: true,
+        creditFactor: 1,
+        similarity: synMatch.similarity,
+        matchTier: 'synonym',
+        matchedVariant: correctVariant,
+      };
     }
 
-    // Whole-phrase minor typo tolerance for fill_blank (e.g. "ban quyenn", "mat khau manhh")
-    if (
-      type === 'fill_blank' &&
-      numCorrect.length >= 5 &&
-      Math.abs(numUser.length - numCorrect.length) <= 2
-    ) {
-      const allowedEdits = Math.min(2, Math.max(1, Math.floor(numCorrect.length * 0.2)));
-      if (levenshteinDistance(numUser, numCorrect) <= allowedEdits) {
-        return true;
+    const maxLen = Math.max(numUser.length, numCorrect.length);
+    const wholeDist = damerauLevenshteinDistance(numUser, numCorrect);
+    const wholeSim = normalizedFuzzySimilarity(numUser, numCorrect);
+
+    // 4. Whole-phrase fuzzy spelling check (fill_blank):
+    //    Minor typo / adjacent transposition -> Full credit (100%)
+    if (type === 'fill_blank' && numCorrect.length >= 4) {
+      const fullAllowedEdits =
+        numCorrect.length >= 8 ? 2 : 1;
+      if (
+        wholeDist <= fullAllowedEdits &&
+        (wholeDist <= 1 || wholeSim >= 0.84) &&
+        Math.abs(numUser.length - numCorrect.length) <= 2
+      ) {
+        return {
+          isCorrect: true,
+          creditFactor: 1,
+          similarity: Math.max(0.86, wholeSim),
+          matchTier: 'fuzzy_full',
+          matchedVariant: correctVariant,
+        };
       }
     }
 
-    // Fuzzy typo-tolerant core keyword overlap (excluding filler stopwords)
+    // 5. Token-level fuzzy overlap (excluding filler stopwords)
     const refCore = numCorrect
       .split(' ')
       .filter((t) => t.length >= 1 && !STOPWORDS.has(t) && (t.length > 1 || /^\d+$/.test(t)));
@@ -395,21 +579,161 @@ function matchSingleKeyVariant(
       .split(' ')
       .filter((t) => t.length >= 1 && !STOPWORDS.has(t) && (t.length > 1 || /^\d+$/.test(t)));
 
-    if (refCore.length === 1) {
-      return userCore.some((ut) => isFuzzyTokenMatch(ut, refCore[0]));
-    }
-    if (refCore.length >= 2) {
-      const matched = refCore.filter((rt) =>
-        userCore.some((ut) => isFuzzyTokenMatch(ut, rt)),
-      ).length;
-      const ratio = matched / refCore.length;
-      if (type === 'short_answer') {
-        return ratio >= 0.55 || (refCore.length >= 5 && matched >= 3 && ratio >= 0.4);
+    let tokenWeightedSum = 0;
+    let tokenMatchedCount = 0;
+    for (const rt of refCore) {
+      let bestQ = 0;
+      for (const ut of userCore) {
+        const q = tokenEditMatchQuality(ut, rt);
+        if (q > bestQ) bestQ = q;
       }
-      return ratio >= 0.65;
+      if (bestQ > 0) {
+        tokenMatchedCount += 1;
+        tokenWeightedSum += bestQ;
+      }
+    }
+    const tokenRatio = refCore.length > 0 ? tokenMatchedCount / refCore.length : 0;
+    const tokenQualityAvg = refCore.length > 0 ? tokenWeightedSum / refCore.length : 0;
+
+    if (refCore.length === 1 && tokenMatchedCount === 1) {
+      return {
+        isCorrect: true,
+        creditFactor: tokenQualityAvg >= 0.9 ? 1 : 0.75,
+        similarity: Math.max(wholeSim, tokenQualityAvg),
+        matchTier: tokenQualityAvg >= 0.9 ? 'fuzzy_full' : 'fuzzy_partial',
+        matchedVariant: correctVariant,
+      };
+    }
+
+    if (refCore.length >= 2) {
+      if (type === 'short_answer') {
+        if (tokenRatio >= 0.55 || (refCore.length >= 5 && tokenMatchedCount >= 3 && tokenRatio >= 0.4)) {
+          return {
+            isCorrect: true,
+            creditFactor: 1,
+            similarity: Math.max(wholeSim, tokenQualityAvg),
+            matchTier: tokenRatio >= 0.8 ? 'fuzzy_full' : 'fuzzy_partial',
+            matchedVariant: correctVariant,
+          };
+        }
+      } else {
+        // fill_blank multi-word token scoring:
+        // >= 75% core tokens matched cleanly -> Full credit
+        if (tokenRatio >= 0.75 && tokenQualityAvg >= 0.7) {
+          return {
+            isCorrect: true,
+            creditFactor: 1,
+            similarity: Math.max(wholeSim, tokenQualityAvg),
+            matchTier: 'fuzzy_full',
+            matchedVariant: correctVariant,
+          };
+        }
+      }
+    }
+
+    // 6. Partial-credit tier for fill_blank (noticeable typos, fuzzy synonyms, or partial core phrase)
+    if (type === 'fill_blank') {
+      const candidates: AnswerEvaluation[] = [];
+
+      if (synMatch) {
+        candidates.push({
+          isCorrect: true,
+          creditFactor: synMatch.creditFactor,
+          similarity: synMatch.similarity,
+          matchTier: 'fuzzy_partial',
+          matchedVariant: correctVariant,
+        });
+      }
+
+      // Noticeable whole-phrase spelling variations (e.g. "xac thc 2 boc" vs "xac thuc 2 buoc")
+      const minAcceptableUserLen = numCorrect.length <= 4 ? 3 : 4;
+      const maxPartialEdits = Math.max(2, Math.floor(maxLen * 0.35));
+      if (
+        numCorrect.length >= 5 &&
+        numUser.length >= minAcceptableUserLen &&
+        wholeSim >= 0.65 &&
+        wholeDist <= maxPartialEdits
+      ) {
+        candidates.push({
+          isCorrect: true,
+          creditFactor: wholeSim >= 0.78 ? 0.8 : 0.7,
+          similarity: wholeSim,
+          matchTier: 'fuzzy_partial',
+          matchedVariant: correctVariant,
+        });
+      }
+
+      // Partial core-keyword coverage (e.g. "mật khẩu" for "mật khẩu mạnh", or 2/3 key words)
+      if (refCore.length >= 2 && tokenRatio >= 0.5) {
+        candidates.push({
+          isCorrect: true,
+          creditFactor: tokenRatio >= 0.65 ? 0.8 : 0.7,
+          similarity: Math.max(wholeSim, Number(tokenQualityAvg.toFixed(4))),
+          matchTier: 'fuzzy_partial',
+          matchedVariant: correctVariant,
+        });
+      }
+
+      if (candidates.length > 0) {
+        candidates.sort((a, b) =>
+          b.creditFactor !== a.creditFactor
+            ? b.creditFactor - a.creditFactor
+            : b.similarity - a.similarity,
+        );
+        return candidates[0];
+      }
+    }
+
+    return {
+      ...miss,
+      similarity: wholeSim,
+    };
+  }
+
+  return miss;
+}
+
+/**
+ * Evaluates a student's answer against stored teacher/AI answer keys (supporting `|`-separated variants),
+ * returning full credit (1.0), partial credit (0.7..0.85 for fuzzy fill-in-the-blank near-matches), or 0.
+ */
+export function evaluateAnswerMatch(
+  userAnswer: string,
+  correctAnswer: string,
+  type: QuestionType,
+  options?: string[],
+): AnswerEvaluation {
+  if (!userAnswer?.trim() || !correctAnswer?.trim()) {
+    return { isCorrect: false, creditFactor: 0, similarity: 0, matchTier: 'none' };
+  }
+  if (type === 'multiple_choice') {
+    return evaluateSingleKeyVariant(userAnswer, correctAnswer, type, options);
+  }
+  const variants = correctAnswer
+    .split('|')
+    .map((v) => v.trim())
+    .filter(Boolean);
+
+  let best: AnswerEvaluation = {
+    isCorrect: false,
+    creditFactor: 0,
+    similarity: 0,
+    matchTier: 'none',
+  };
+
+  for (const variant of variants) {
+    const res = evaluateSingleKeyVariant(userAnswer, variant, type, options);
+    if (res.creditFactor === 1 && res.matchTier === 'exact') {
+      return res;
+    }
+    if (
+      res.creditFactor > best.creditFactor ||
+      (res.creditFactor === best.creditFactor && res.similarity > best.similarity)
+    ) {
+      best = res;
     }
   }
-  return false;
+  return best;
 }
 
 /**
@@ -422,22 +746,7 @@ export function isAnswerMatch(
   type: QuestionType,
   options?: string[],
 ): boolean {
-  if (!userAnswer?.trim() || !correctAnswer?.trim()) {
-    return false;
-  }
-  if (type === 'multiple_choice') {
-    return matchSingleKeyVariant(userAnswer, correctAnswer, type, options);
-  }
-  const variants = correctAnswer
-    .split('|')
-    .map((v) => v.trim())
-    .filter(Boolean);
-  for (const variant of variants) {
-    if (matchSingleKeyVariant(userAnswer, variant, type, options)) {
-      return true;
-    }
-  }
-  return false;
+  return evaluateAnswerMatch(userAnswer, correctAnswer, type, options).isCorrect;
 }
 
 export interface PointsBreakdown {
@@ -486,37 +795,86 @@ export function clampElapsedMs(
 }
 
 /**
- * Standard accuracy points = 100 (never penalized for slow thoughtful research).
- * Fair fast-response bonus = up to +50 based on question type's reading & research window.
+ * Standard accuracy points = 100 (scaled by creditFactor for fuzzy partial credit, e.g. 70-80 pts).
+ * Fair fast-response bonus = up to +50 based on question type's reading & research window (also scaled).
  * Wrong answer = 0 points.
  */
 export function calculatePoints(
   isCorrect: boolean,
   elapsedMs: number,
   questionType: QuestionType = 'multiple_choice',
+  creditFactor = 1,
 ): PointsBreakdown {
-  if (!isCorrect) {
+  const clampedCredit = Math.max(0, Math.min(1, creditFactor));
+  if (!isCorrect || clampedCredit <= 0) {
     return { basePoints: 0, speedBonus: 0, totalPoints: 0 };
   }
   const rule = getTimingRuleForQuestionType(questionType);
   const safeMs = clampElapsedMs(elapsedMs, questionType);
   const graceMs = rule.graceSec * 1000;
   const endMs = rule.bonusEndSec * 1000;
-  const basePoints = 100;
+  const basePoints = Math.round(100 * clampedCredit);
 
-  let speedBonus = 0;
+  let rawSpeedBonus = 0;
   if (safeMs <= graceMs) {
-    speedBonus = 50;
+    rawSpeedBonus = 50;
   } else if (safeMs <= endMs) {
     const ratio = 1 - (safeMs - graceMs) / (endMs - graceMs);
-    speedBonus = Math.max(5, Math.round(ratio * 45) + 5);
-    speedBonus = Math.min(49, speedBonus);
+    rawSpeedBonus = Math.max(5, Math.round(ratio * 45) + 5);
+    rawSpeedBonus = Math.min(49, rawSpeedBonus);
   }
+  const speedBonus = Math.round(rawSpeedBonus * clampedCredit);
   return {
     basePoints,
     speedBonus,
     totalPoints: basePoints + speedBonus,
   };
+}
+
+/**
+ * Builds encouraging, transparent feedback messages distinguishing exact matches,
+ * synonym / minor-typo full credit, and fuzzy partial credit.
+ */
+export function buildGradingFeedback(
+  groupName: string,
+  evaluation: AnswerEvaluation,
+  breakdown: PointsBreakdown,
+  lang: Language = 'vi',
+): string {
+  if (!evaluation.isCorrect || breakdown.totalPoints <= 0) {
+    return lang === 'en'
+      ? `Nice try, ${groupName}! Check the Digital Citizen tip below and keep going!`
+      : `Suýt đúng rồi ${groupName} ơi! Xem bí kíp Công dân số bên dưới để ghi điểm câu sau nhé!`;
+  }
+
+  if (evaluation.matchTier === 'fuzzy_partial') {
+    const pct = Math.round(evaluation.creditFactor * 100);
+    return lang === 'en'
+      ? `Close match, ${groupName}! Awarded ${pct}% partial credit (+${breakdown.totalPoints} pts) so minor input slips don't hold you back.`
+      : `Gần đúng rồi ${groupName} ơi! Hệ thống ghi nhận ${pct}% điểm khuyến khích (+${breakdown.totalPoints} điểm) cho đáp án gần khớp / hơi sai chính tả.`;
+  }
+
+  if (evaluation.matchTier === 'synonym') {
+    return lang === 'en'
+      ? `Great synonym, ${groupName}! Full credit +${breakdown.totalPoints} pts${breakdown.speedBonus > 0 ? ` (+${breakdown.speedBonus} speed)` : ''}!`
+      : `Tuyệt vời ${groupName}! Hệ thống nhận diện từ đồng nghĩa và tặng trọn +${breakdown.totalPoints} điểm!`;
+  }
+
+  if (evaluation.matchTier === 'fuzzy_full') {
+    return lang === 'en'
+      ? `Correct, ${groupName}! Minor spelling variation accepted for full credit (+${breakdown.totalPoints} pts)!`
+      : `Chính xác ${groupName}! Lỗi gõ nhẹ được bỏ qua — nhận trọn +${breakdown.totalPoints} điểm!`;
+  }
+
+  if (lang === 'en') {
+    return breakdown.speedBonus >= 35
+      ? `Lightning fast, ${groupName}! +${breakdown.totalPoints} pts (including +${breakdown.speedBonus} speed bonus)!`
+      : `Spot on, ${groupName}! +${breakdown.totalPoints} pts!`;
+  }
+
+  return breakdown.speedBonus >= 35
+    ? `Quá nhanh quá nguy hiểm! Nhóm ${groupName} ghi ngay +${breakdown.totalPoints} điểm (gồm +${breakdown.speedBonus} điểm tốc độ)!`
+    : `Chính xác tuyệt đối! Chúc mừng nhóm ${groupName} nhận +${breakdown.totalPoints} điểm!`;
 }
 
 export function formatGroupId(tabletNumber: number, groupName: string): string {

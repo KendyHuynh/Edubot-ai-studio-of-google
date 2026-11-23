@@ -3,14 +3,15 @@ import { onAuthStateChanged, User } from 'firebase/auth';
 import {
   Award,
   CheckCircle2,
-  Compass,
   Edit3,
   Flame,
   Gift,
   GraduationCap,
   Layers,
+  Lock,
   LogOut,
   Play,
+  RotateCcw,
   School,
   ShieldCheck,
   Shuffle,
@@ -18,16 +19,19 @@ import {
   Star,
   Target,
   Trophy,
+  Unlock,
   UserCircle2,
   Zap,
 } from 'lucide-react';
 import { ASSESSMENT_LEVELS } from '../shared/assessmentBank';
 import {
+  buildAdvancedExpansionDeck,
   buildCompetencyFocusDeck,
   buildDiagnosticDeck,
   buildLevelChallengeDeck,
   buildVarietySprintDeck,
   computeDomainMasterySummary,
+  getExpansionUnlockSummary,
   getLevelMeta,
   getRecommendedCompetencies,
 } from '../shared/assessmentEngine';
@@ -60,7 +64,7 @@ import { AuthErrorBanner } from './AuthErrorBanner';
 import { GoogleSignInButton } from './GoogleSignInButton';
 import { SelfAssessmentRunner } from './SelfAssessmentRunner';
 
-const GUEST_UID_STORAGE_KEY = 'edubot_guest_learner_uid_v1';
+const LEGACY_GUEST_UID_STORAGE_KEY = 'edubot_guest_learner_uid_v1';
 
 interface SelfAssessmentHubProps {
   classes: ClassRoom[];
@@ -94,9 +98,8 @@ export function SelfAssessmentHub({
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuggestNewTab, setAuthSuggestNewTab] = useState(false);
 
-  // Onboarding / Edit profile modal state
+  // Onboarding / Edit profile modal state (Google-authenticated only)
   const [editingProfile, setEditingProfile] = useState(false);
-  const [guestModeIntent, setGuestModeIntent] = useState(false);
   const [formFullName, setFormFullName] = useState('');
   const [formClassName, setFormClassName] = useState('');
   const [formSchoolName, setFormSchoolName] = useState('');
@@ -172,28 +175,15 @@ export function SelfAssessmentHub({
           return;
         }
 
-        // Check if returning guest learner exists locally
-        const savedGuestUid =
-          typeof window !== 'undefined'
-            ? window.localStorage.getItem(GUEST_UID_STORAGE_KEY)
-            : null;
-        if (savedGuestUid) {
-          const res = await apiRequestJson<{
-            profile: LearnerProfile | null;
-            attempts: AssessmentSessionAttempt[];
-            awards: TeacherAward[];
-          }>(`/api/learners/me?uid=${encodeURIComponent(savedGuestUid)}`, {}, lang);
-          if (res.ok && res.data.profile) {
-            setProfile(res.data.profile);
-            setAttempts(res.data.attempts ?? []);
-            setAwards(res.data.awards ?? []);
-            setEditingProfile(false);
-            return;
-          }
+        // Clear any legacy local guest session so Home Self-Assessment strictly requires Google Sign-In
+        if (typeof window !== 'undefined') {
+          window.localStorage.removeItem(LEGACY_GUEST_UID_STORAGE_KEY);
         }
         setProfile(null);
         setAttempts([]);
         setAwards([]);
+        setEditingProfile(false);
+        setActiveRun(null);
       } finally {
         setLoading(false);
       }
@@ -213,7 +203,6 @@ export function SelfAssessmentHub({
     try {
       const result = await firebaseGoogleSignIn();
       if (result?.user) {
-        setGuestModeIntent(false);
         setGoogleUser(result.user);
       }
     } catch (err) {
@@ -230,14 +219,14 @@ export function SelfAssessmentHub({
       await logoutGoogle().catch(() => undefined);
     }
     if (typeof window !== 'undefined') {
-      window.localStorage.removeItem(GUEST_UID_STORAGE_KEY);
+      window.localStorage.removeItem(LEGACY_GUEST_UID_STORAGE_KEY);
     }
     setGoogleUser(null);
     setProfile(null);
     setAttempts([]);
     setAwards([]);
-    setGuestModeIntent(false);
     setEditingProfile(false);
+    setActiveRun(null);
   };
 
   const handleSaveProfile = async (e: React.FormEvent) => {
@@ -255,17 +244,19 @@ export function SelfAssessmentHub({
       return;
     }
 
+    if (!googleUser || !googleUser.emailVerified) {
+      setFormError(
+        lang === 'vi'
+          ? 'Vui lòng đăng nhập tài khoản Google trước khi lưu hồ sơ Tự đánh giá.'
+          : 'Please sign in with Google before saving your self-assessment profile.',
+      );
+      return;
+    }
+
     setFormError('');
     setSavingProfile(true);
     try {
-      let idToken: string | undefined;
-      if (googleUser) {
-        idToken = await googleUser.getIdToken();
-      }
-      const existingGuestUid =
-        !googleUser && typeof window !== 'undefined'
-          ? window.localStorage.getItem(GUEST_UID_STORAGE_KEY) || undefined
-          : undefined;
+      const idToken = await googleUser.getIdToken();
 
       const res = await apiRequestJson<{
         profile?: LearnerProfile;
@@ -279,9 +270,7 @@ export function SelfAssessmentHub({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             idToken,
-            uid: googleUser ? googleUser.uid : profile?.uid || existingGuestUid,
-            authType: googleUser ? 'google' : 'guest',
-            photoUrl: googleUser?.photoURL || undefined,
+            photoUrl: googleUser.photoURL || undefined,
             fullName: cleanName,
             className: cleanClass,
             schoolName: cleanSchool,
@@ -308,15 +297,8 @@ export function SelfAssessmentHub({
         res.data.awards && res.data.awards.length > prev.length ? res.data.awards : prev,
       );
 
-      if (saved.authType === 'guest' && typeof window !== 'undefined') {
-        window.localStorage.setItem(GUEST_UID_STORAGE_KEY, saved.uid);
-      }
-      if (saved.authType === 'google' && googleUser) {
-        void saveLearnerProfileToFirestore(saved);
-      }
-
+      void saveLearnerProfileToFirestore(saved);
       setEditingProfile(false);
-      setGuestModeIntent(false);
     } finally {
       setSavingProfile(false);
     }
@@ -367,6 +349,7 @@ export function SelfAssessmentHub({
   };
 
   const mastery = profile?.masteryByCompetency ?? {};
+  const currentLevel: AssessmentLevel = profile?.currentLevel ?? 1;
   const domainSummaries = useMemo(
     () => computeDomainMasterySummary(mastery),
     [mastery],
@@ -379,9 +362,13 @@ export function SelfAssessmentHub({
     () => Object.values(mastery).filter((m) => m.highestLevel >= 1).length,
     [mastery],
   );
+  const expansionSummary = useMemo(
+    () => getExpansionUnlockSummary(currentLevel, mastery),
+    [currentLevel, mastery],
+  );
 
-  // Active Interactive Assessment Runner View
-  if (activeRun) {
+  // Active Interactive Assessment Runner View (Strictly Google-Authenticated Only!)
+  if (activeRun && googleUser?.emailVerified && profile?.profileCompleted) {
     return (
       <SelfAssessmentRunner
         title={activeRun.title}
@@ -389,6 +376,7 @@ export function SelfAssessmentHub({
         targetLevel={activeRun.targetLevel}
         targetCompetencyId={activeRun.targetCompetencyId}
         exercises={activeRun.exercises}
+        mastery={mastery}
         onCompleteSession={handleCompleteRun}
         onExit={() => setActiveRun(null)}
         lang={lang}
@@ -407,8 +395,8 @@ export function SelfAssessmentHub({
     );
   }
 
-  // STEP A: Auth / Welcome Gate (when not signed in and no guest profile yet)
-  if (!profile && !editingProfile && !guestModeIntent) {
+  // STEP A: Mandatory Google Sign-In Gate (Prevents guest peeking at questions & answers!)
+  if (!googleUser || !googleUser.emailVerified) {
     return (
       <section className="max-w-4xl mx-auto space-y-6">
         <div className="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-6">
@@ -416,8 +404,8 @@ export function SelfAssessmentHub({
             <div className="space-y-2 max-w-2xl">
               <p className="text-xs font-bold uppercase tracking-wide text-emerald-700">
                 {lang === 'vi'
-                  ? 'Phân quyền Cá nhân · Tự học & Đánh giá 24 Năng lực ở nhà'
-                  : 'Personal Learner Space · Home 24-Competency Self-Assessment'}
+                  ? 'Tự học ở nhà · Bắt buộc Đăng nhập Google để bảo mật đề & lưu tiến độ'
+                  : 'Home Self-Assessment · Google Sign-In Required for Fairness & Cloud Sync'}
               </p>
               <h1 className="text-2xl sm:text-3xl font-bold text-slate-900">
                 {lang === 'vi'
@@ -426,54 +414,58 @@ export function SelfAssessmentHub({
               </h1>
               <p className="text-sm text-slate-600 leading-relaxed">
                 {lang === 'vi'
-                  ? 'Khám phá trình độ Công dân số (TT 02/2025) qua 96 bài tập đa dạng 5 hình thức (Tình huống, Đúng/Sai, Sắp xếp quy trình, Ghép cặp, Phân loại) chia theo 4 cấp độ. Đăng nhập Google để lưu hồ sơ Tên · Lớp · Trường và nhận huy hiệu khen thưởng từ Thầy/Cô!'
-                  : 'Discover your digital citizenship level across 96 interactive exercises (Scenarios, True/False, Step Puzzles, Matching, Sorting) across 4 levels. Sign in with Google to save your progress and receive Teacher Awards!'}
+                  ? 'Chinh phục 96 bài tập cốt lõi và mở khóa thêm 48 câu hỏi nâng cao (tổng 144 bài tập, 5 dạng trò chơi tương tác) khi em đạt các cấp độ cao hơn. Để đảm bảo công bằng — không tạo tài khoản khách xem trước câu hỏi và đáp án — học sinh cần đăng nhập Google trước khi mở kho đề.'
+                  : 'Master 96 core exercises and unlock 48 extra higher-level challenges (144 total across 5 interactive formats) as you level up. Google Sign-In is required before viewing questions to ensure fairness and save your cloud progress.'}
               </p>
             </div>
             <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-800">
-              <ShieldCheck className="w-4 h-4 shrink-0" />
+              <Lock className="w-4 h-4 shrink-0" />
               <span>
-                {lang === 'vi' ? 'Tài khoản Học sinh bảo mật' : 'Secure Student Role'}
+                {lang === 'vi' ? 'Chống xem trước đề · Lưu đám mây' : 'Anti-Peek · Cloud Sync'}
               </span>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* Option 1: Google Sign-In (Recommended) */}
-            <div className="p-5 rounded-2xl border-2 border-sky-200 bg-sky-50/40 flex flex-col justify-between gap-5">
-              <div className="space-y-2">
+          <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+            {/* Primary Mandatory Google Login Card */}
+            <div className="lg:col-span-3 p-5 sm:p-6 rounded-2xl border-2 border-sky-200 bg-sky-50/40 flex flex-col justify-between gap-5">
+              <div className="space-y-3">
                 <span className="inline-flex items-center gap-1.5 text-xs font-bold text-sky-700">
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>{lang === 'vi' ? 'Khuyên dùng · Đồng bộ cho Thầy/Cô khen thưởng' : 'Recommended · Syncs for Teacher Awards'}</span>
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>
+                    {lang === 'vi'
+                      ? 'Bước 1 · Xác thực tài khoản Học sinh bằng Google'
+                      : 'Step 1 · Verify Student Account with Google'}
+                  </span>
                 </span>
-                <h2 className="text-lg font-bold text-slate-900">
+                <h2 className="text-lg sm:text-xl font-bold text-slate-900">
                   {lang === 'vi'
-                    ? 'Đăng nhập bằng tài khoản Google'
-                    : 'Sign in with Google Account'}
+                    ? 'Đăng nhập Google để mở khóa bài tự đánh giá'
+                    : 'Sign in with Google to Unlock Exercises'}
                 </h2>
-                <ul className="text-xs sm:text-sm text-slate-600 space-y-1.5">
+                <ul className="text-xs sm:text-sm text-slate-700 space-y-2">
                   <li className="flex items-start gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                     <span>
                       {lang === 'vi'
-                        ? 'Bảo mật tài khoản cá nhân, tự động yêu cầu khai báo Tên, Lớp, Trường cho tài khoản mới.'
-                        : 'Secure personal account; new accounts register Name, Class & School.'}
+                        ? 'Công bằng tuyệt đối: Khóa hoàn toàn chế độ khách để học sinh không thể vào xem trước câu hỏi hay đáp án.'
+                        : 'Fair testing: Guest preview is disabled so students cannot peek at questions or answers beforehand.'}
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                     <span>
                       {lang === 'vi'
-                        ? 'Lưu trọn vẹn tiến độ 24 năng lực, Cấp độ 1–4 và nhận Huy hiệu khen thưởng từ Thầy/Cô.'
-                        : 'Saves all 24 competency levels and unlocks Teacher Praise Badges.'}
+                        ? 'Lưu vĩnh viễn lịch sử từng câu đã làm, điểm XP, Cấp độ 1–4 và Huy hiệu khen thưởng từ Thầy/Cô trên mọi thiết bị.'
+                        : 'Permanently syncs per-question history, XP, Levels 1–4, and Teacher Awards across devices.'}
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                     <span>
                       {lang === 'vi'
-                        ? 'Phân quyền chặt chẽ: tài khoản học sinh không thể vào Cổng Giáo Viên.'
-                        : 'Strict role separation: student accounts cannot access Teacher Admin.'}
+                        ? 'Phân quyền chặt chẽ: Tài khoản học sinh chỉ dùng để tự học, không thể truy cập Cổng Giáo Viên.'
+                        : 'Strict role separation: Student Google accounts cannot access the Teacher Admin Portal.'}
                     </span>
                   </li>
                 </ul>
@@ -492,40 +484,46 @@ export function SelfAssessmentHub({
               </div>
             </div>
 
-            {/* Option 2: Quick Trial Guest Mode */}
-            <div className="p-5 rounded-2xl border border-slate-200 bg-slate-50/60 flex flex-col justify-between gap-5">
-              <div className="space-y-2">
-                <span className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-600">
-                  <Compass className="w-3.5 h-3.5" />
-                  <span>{lang === 'vi' ? 'Trải nghiệm nhanh trên thiết bị này' : 'Quick Trial on This Device'}</span>
+            {/* Scoring & Progressive Unlock Overview Card */}
+            <div className="lg:col-span-2 p-5 rounded-2xl border border-slate-200 bg-slate-50/70 space-y-4">
+              <div className="space-y-1.5">
+                <span className="inline-flex items-center gap-1.5 text-xs font-bold text-indigo-700">
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>
+                    {lang === 'vi' ? 'Điểm làm lại công bằng & Mở khóa câu mới' : 'Fair Retry Scoring & Unlocks'}
+                  </span>
                 </span>
-                <h2 className="text-lg font-bold text-slate-900">
-                  {lang === 'vi'
-                    ? 'Kiểm tra thử ngay (Nhập Tên · Lớp · Trường)'
-                    : 'Quick Trial Check (Name · Class · School)'}
-                </h2>
-                <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
-                  {lang === 'vi'
-                    ? 'Nếu em chưa có sẵn tài khoản Google trên máy này, em vẫn có thể nhập Tên, Lớp và Trường để vào kiểm tra thử ngay cả 4 cấp độ & 24 năng lực, rồi liên kết Google sau.'
-                    : 'No Google account on this device? Enter your Name, Class & School to try all 4 levels & 24 competencies right away.'}
-                </p>
+                <h3 className="text-sm font-bold text-slate-900">
+                  {lang === 'vi' ? 'Càng lên cấp cao, kho đề càng phong phú!' : 'Level Up to Unlock More Questions!'}
+                </h3>
               </div>
 
-              <div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setGuestModeIntent(true);
-                    setEditingProfile(true);
-                  }}
-                  className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold text-slate-900 bg-white hover:bg-slate-100 border border-slate-300 rounded-xl cursor-pointer"
-                >
-                  <Play className="w-4 h-4 text-sky-600" />
-                  <span>
-                    {lang === 'vi' ? 'Vào Kiểm tra thử ngay' : 'Start Quick Trial'}
-                  </span>
-                </button>
-              </div>
+              <ul className="space-y-2 text-xs text-slate-700">
+                <li className="p-2.5 rounded-xl bg-white border border-slate-200">
+                  <strong className="text-emerald-700">100% XP</strong>{' '}
+                  {lang === 'vi'
+                    ? 'khi làm đúng lần đầu (câu mở rộng thưởng tới +105 XP/câu).'
+                    : 'for first-try mastery (up to +105 XP on expansion items).'}
+                </li>
+                <li className="p-2.5 rounded-xl bg-white border border-slate-200">
+                  <strong className="text-sky-700">80% XP</strong>{' '}
+                  {lang === 'vi'
+                    ? 'khi quay lại sửa đúng câu từng làm sai (khuyến khích tự ôn!).'
+                    : 'when mastering a previously missed exercise.'}
+                </li>
+                <li className="p-2.5 rounded-xl bg-white border border-slate-200">
+                  <strong className="text-amber-700">25% XP (1 lần) → 0 XP</strong>{' '}
+                  {lang === 'vi'
+                    ? 'khi ôn lại câu đã đạt để tránh cày điểm lặp lại.'
+                    : 'for 1 spaced review, then free 0 XP practice to prevent farming.'}
+                </li>
+                <li className="p-2.5 rounded-xl bg-indigo-50/70 border border-indigo-200 text-indigo-950">
+                  <strong>96 → 144 {lang === 'vi' ? 'câu' : 'items'}:</strong>{' '}
+                  {lang === 'vi'
+                    ? 'Đạt Cấp 2 mở +12 câu · Cấp 3 mở +18 câu · Cấp 4 mở +18 câu Chuyên gia!'
+                    : 'Level 2 unlocks +12 · Level 3 unlocks +18 · Level 4 unlocks +18 Master items!'}
+                </li>
+              </ul>
             </div>
           </div>
 
@@ -541,8 +539,8 @@ export function SelfAssessmentHub({
           <div className="pt-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
             <span>
               {lang === 'vi'
-                ? 'Đang học trên lớp với 10 máy tính bảng dùng chung?'
-                : 'In class on one of the 10 shared tablets?'}
+                ? 'Đang học trên lớp với 10 máy tính bảng dùng chung (không cần đăng nhập Google)?'
+                : 'In class on one of the 10 shared tablets (no Google sign-in needed)?'}
             </span>
             <button
               type="button"
@@ -776,16 +774,10 @@ export function SelfAssessmentHub({
                 >
                   {lang === 'vi' ? currentLevelMeta.nameVi : currentLevelMeta.nameEn}
                 </span>
-                {profile.authType === 'google' ? (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                    <ShieldCheck className="w-3 h-3" />
-                    <span>Google</span>
-                  </span>
-                ) : (
-                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-50 text-amber-800 border border-amber-200">
-                    {lang === 'vi' ? 'Chế độ Khách' : 'Guest Trial'}
-                  </span>
-                )}
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  <ShieldCheck className="w-3 h-3" />
+                  <span>Google</span>
+                </span>
               </div>
               <p className="text-xs sm:text-sm text-slate-600 mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
                 <span className="inline-flex items-center gap-1">
@@ -801,13 +793,6 @@ export function SelfAssessmentHub({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {profile.authType === 'guest' && (
-              <GoogleSignInButton
-                onClick={handleGoogleLogin}
-                loading={signingIn}
-                label={lang === 'vi' ? 'Liên kết Google' : 'Link Google'}
-              />
-            )}
             <button
               type="button"
               onClick={() => {
@@ -939,7 +924,7 @@ export function SelfAssessmentHub({
             </span>
             <h2 className="text-lg font-bold text-slate-900">
               {lang === 'vi'
-                ? 'Kiểm tra thử Toàn diện 24 Năng lực'
+                ? 'Kiểm tra Tổng hợp 24 Năng lực'
                 : '24-Competency Diagnostic Check'}
             </h2>
             <p className="text-sm text-slate-600 leading-relaxed">
@@ -948,150 +933,328 @@ export function SelfAssessmentHub({
                 : 'A balanced check across all 6 digital domains from Level 1 to Level 4 to pinpoint your strengths and next focus areas.'}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() =>
-              setActiveRun({
-                title:
-                  lang === 'vi'
-                    ? 'Kiểm tra thử Toàn diện 24 Năng lực'
-                    : '24-Competency Diagnostic Check',
-                mode: 'diagnostic',
-                exercises: buildDiagnosticDeck(`diag-${Date.now()}`),
-              })
-            }
-            className="inline-flex items-center justify-center gap-2 px-5 py-3 text-sm font-semibold text-white bg-sky-600 hover:bg-sky-700 rounded-xl cursor-pointer"
-          >
-            <Play className="w-4 h-4" />
-            <span>
-              {lang === 'vi' ? 'Bắt đầu Kiểm tra thử (12 câu)' : 'Start Diagnostic (12 items)'}
-            </span>
-          </button>
-        </div>
-
-        {/* Variety Sprint (All 5 Interactive Game Mechanics!) */}
-        <div className="bg-white border border-slate-200 rounded-2xl p-6 flex flex-col justify-between gap-4">
-          <div className="space-y-2">
-            <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full">
-              <Shuffle className="w-3.5 h-3.5" />
-              <span>{lang === 'vi' ? '8 câu · Đủ 5 trò chơi tương tác · Không chán!' : '8 items · All 5 Game Formats'}</span>
-            </span>
-            <h2 className="text-lg font-bold text-slate-900">
-              {lang === 'vi'
-                ? 'Thử thách Đa dạng Siêu tốc (5 dạng bài)'
-                : 'Multi-Format Variety Sprint'}
-            </h2>
-            <p className="text-sm text-slate-600 leading-relaxed">
-              {lang === 'vi'
-                ? 'Luôn đổi mới mỗi lượt chơi! Tự động ưu tiên các năng lực em chưa luyện và kết hợp đủ 5 dạng: Tình huống, Đúng/Sai, Sắp xếp 4 bước, Ghép cặp, Phân loại.'
-                : 'Always fresh! Prioritizes unpracticed competencies and mixes Scenarios, True/False, Step Ordering, Pair Matching, and Sorting.'}
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() =>
-              setActiveRun({
-                title:
-                  lang === 'vi'
-                    ? 'Thử thách Đa dạng Siêu tốc (5 dạng bài)'
-                    : 'Multi-Format Variety Sprint',
-                mode: 'variety_sprint',
-                exercises: buildVarietySprintDeck(mastery, 8, `sprint-${Date.now()}`),
-              })
-            }
-            className="inline-flex items-center justify-center gap-2 px-5 py-3 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl cursor-pointer"
-          >
-            <Zap className="w-4 h-4" />
-            <span>
-              {lang === 'vi' ? 'Chơi Thử thách Đa dạng (8 câu)' : 'Play Variety Sprint (8 items)'}
-            </span>
-          </button>
-        </div>
-      </div>
-
-      {/* Level Challenges (Level 1 -> Level 4) */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-              <Layers className="w-5 h-5 text-sky-600" />
+            <button
+              type="button"
+              onClick={() =>
+                setActiveRun({
+                  title:
+                    lang === 'vi'
+                      ? 'Kiểm tra Toàn diện 24 Năng lực'
+                      : '24-Competency Diagnostic Check',
+                  mode: 'diagnostic',
+                  exercises: buildDiagnosticDeck(`diag-${Date.now()}`, mastery, currentLevel),
+                })
+              }
+              className="inline-flex items-center justify-center gap-2 px-5 py-3 text-sm font-semibold text-white bg-sky-600 hover:bg-sky-700 rounded-xl cursor-pointer"
+            >
+              <Play className="w-4 h-4" />
               <span>
-                {lang === 'vi'
-                  ? 'Chinh phục 4 Cấp độ Năng lực Số'
-                  : 'Conquer 4 Digital Competency Levels'}
+                {lang === 'vi' ? 'Bắt đầu Kiểm tra Tổng hợp (12 câu)' : 'Start Diagnostic (12 items)'}
               </span>
-            </h2>
-            <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
-              {lang === 'vi'
-                ? 'Chọn cấp độ phù hợp với bản thân để luyện bộ 10 bài tập đa dạng và mở khóa huy hiệu cấp cao hơn.'
-                : 'Pick your target level to practice 10 varied exercises and unlock higher mastery tiers.'}
-            </p>
+            </button>
+          </div>
+
+          {/* Variety Sprint (All 5 Interactive Game Mechanics!) */}
+          <div className="bg-white border border-slate-200 rounded-2xl p-6 flex flex-col justify-between gap-4">
+            <div className="space-y-2">
+              <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full">
+                <Shuffle className="w-3.5 h-3.5" />
+                <span>{lang === 'vi' ? '8 câu · Ưu tiên câu mới · Đủ 5 dạng bài' : '8 items · Fresh First · All 5 Formats'}</span>
+              </span>
+              <h2 className="text-lg font-bold text-slate-900">
+                {lang === 'vi'
+                  ? 'Thử thách Đa dạng Siêu tốc (5 dạng bài)'
+                  : 'Multi-Format Variety Sprint'}
+              </h2>
+              <p className="text-sm text-slate-600 leading-relaxed">
+                {lang === 'vi'
+                  ? 'Tự động chọn các câu em CHƯA làm đúng từ kho bài tập đã mở khóa (96 → 144 câu) kết hợp đủ 5 dạng: Tình huống, Đúng/Sai, Sắp xếp 4 bước, Ghép cặp, Phân loại.'
+                  : 'Automatically prioritizes unmastered exercises from your unlocked bank (96 → 144 items) across all 5 interactive formats.'}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() =>
+                setActiveRun({
+                  title:
+                    lang === 'vi'
+                      ? 'Thử thách Đa dạng Siêu tốc (5 dạng bài)'
+                      : 'Multi-Format Variety Sprint',
+                  mode: 'variety_sprint',
+                  exercises: buildVarietySprintDeck(mastery, 8, `sprint-${Date.now()}`, currentLevel),
+                })
+              }
+              className="inline-flex items-center justify-center gap-2 px-5 py-3 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl cursor-pointer"
+            >
+              <Zap className="w-4 h-4" />
+              <span>
+                {lang === 'vi' ? 'Chơi Thử thách Đa dạng (8 câu)' : 'Play Variety Sprint (8 items)'}
+              </span>
+            </button>
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
-          {ASSESSMENT_LEVELS.map((lvl) => {
-            const clearedAtLevel = Object.values(mastery).filter(
-              (m) => m.highestLevel >= lvl.level,
-            ).length;
-            const pct = Math.round((clearedAtLevel / 24) * 100);
-            return (
-              <button
-                key={lvl.level}
-                type="button"
-                onClick={() =>
-                  setActiveRun({
-                    title: lang === 'vi' ? `Thử thách ${lvl.nameVi}` : `${lvl.nameEn} Challenge`,
-                    mode: 'level_challenge',
-                    targetLevel: lvl.level,
-                    exercises: buildLevelChallengeDeck(
-                      lvl.level,
-                      mastery,
-                      10,
-                      `lvl-${lvl.level}-${Date.now()}`,
-                    ),
-                  })
-                }
-                className="text-left p-4 rounded-xl border border-slate-200 hover:border-sky-400 hover:bg-sky-50/30 transition-all flex flex-col justify-between gap-3 cursor-pointer"
-              >
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span
-                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${lvl.badgeClass}`}
-                    >
-                      {lvl.code}
-                    </span>
-                    <span className="font-mono-num text-xs font-bold text-slate-500">
-                      +{lvl.xpPerCorrect} XP/câu
-                    </span>
-                  </div>
-                  <h3 className="text-sm sm:text-base font-bold text-slate-900">
-                    {lang === 'vi' ? lvl.nameVi : lvl.nameEn}
-                  </h3>
-                  <p className="text-xs text-slate-600 leading-relaxed">
-                    {lang === 'vi' ? lvl.subtitleVi : lvl.subtitleEn}
-                  </p>
-                </div>
-
-                <div className="space-y-1.5 pt-2 border-t border-slate-100">
-                  <div className="flex items-center justify-between text-[11px] font-semibold text-slate-600 tabular-nums">
-                    <span>
-                      {lang === 'vi' ? 'Đã đạt' : 'Cleared'}: {clearedAtLevel}/24
-                    </span>
-                    <span>{pct}%</span>
-                  </div>
-                  <div className="w-full h-1.5 rounded-full bg-slate-100 overflow-hidden">
-                    <div
-                      className="h-full rounded-full transition-all"
-                      style={{ width: `${pct}%`, backgroundColor: lvl.accentHex }}
-                    />
-                  </div>
-                </div>
-              </button>
-            );
-          })}
+        {/* Fair Retry Scoring Policy Strip */}
+        <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-xl bg-white border border-slate-200 text-sky-700 flex items-center justify-center shrink-0">
+              <RotateCcw className="w-4 h-4" />
+            </div>
+            <div className="space-y-0.5">
+              <p className="text-sm font-bold text-slate-900">
+                {lang === 'vi'
+                  ? 'Quy tắc tính điểm làm lại công bằng (Chống cày điểm lặp lại)'
+                  : 'Fair Anti-Farming Retry XP Policy'}
+              </p>
+              <p className="text-xs text-slate-600">
+                {lang === 'vi'
+                  ? 'Khuyến khích học sinh chinh phục câu mới & lên cấp cao hơn thay vì làm lặp lại câu dễ.'
+                  : 'Rewards conquering new & higher-level questions instead of repeating easy ones.'}
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
+            <span className="px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-800 border border-emerald-200">
+              {lang === 'vi' ? 'Câu mới lần đầu: 100% XP' : 'First Try: 100% XP'}
+            </span>
+            <span className="px-2.5 py-1 rounded-lg bg-sky-50 text-sky-800 border border-sky-200">
+              {lang === 'vi' ? 'Sửa câu từng sai: 80% XP' : 'Fix Missed: 80% XP'}
+            </span>
+            <span className="px-2.5 py-1 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
+              {lang === 'vi' ? 'Ôn tập 1 lần: 25% XP' : '1st Review: 25% XP'}
+            </span>
+            <span className="px-2.5 py-1 rounded-lg bg-white text-slate-600 border border-slate-200">
+              {lang === 'vi' ? 'Lặp lại thêm: 0 XP (Luyện tự do)' : 'Further Repeats: 0 XP'}
+            </span>
+          </div>
         </div>
-      </div>
+
+        {/* Progressive Higher-Level Expansion Bank (96 -> 144 Questions!) */}
+        <div className="bg-indigo-50/50 border border-indigo-200 rounded-2xl p-6 space-y-4">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="space-y-1">
+              <div className="inline-flex items-center gap-1.5 text-xs font-bold text-indigo-700">
+                <Sparkles className="w-4 h-4" />
+                <span>
+                  {lang === 'vi'
+                    ? `Kho Mở Rộng Theo Cấp Độ · Đã mở ${expansionSummary.totalUnlockedBankSize} / ${expansionSummary.coreTotal + expansionSummary.expansionTotal} bài tập`
+                    : `Progressive Expansion Bank · ${expansionSummary.totalUnlockedBankSize} / ${expansionSummary.coreTotal + expansionSummary.expansionTotal} Unlocked`}
+                </span>
+              </div>
+              <h2 className="text-lg font-bold text-slate-900">
+                {lang === 'vi'
+                  ? 'Lên cấp cao hơn để mở thêm +48 câu hỏi thực chiến chuyên sâu (+20% XP)'
+                  : 'Level Up to Unlock +48 Deeper Practice Challenges (+20% XP)'}
+              </h2>
+              <p className="text-xs sm:text-sm text-slate-600 max-w-2xl">
+                {lang === 'vi'
+                  ? 'Ngoài 96 câu hỏi cốt lõi (đủ 24 năng lực × 4 cấp), mỗi khi em thăng hạng lên Cấp 2, Cấp 3 và Cấp 4, hệ thống sẽ tự động mở khóa thêm các gói câu hỏi nâng cao thưởng XP cao hơn để em luyện tập càng nhiều càng giỏi!'
+                  : 'Beyond the 96 core items, reaching Levels 2, 3, and 4 automatically unlocks bonus expansion packs with +20% XP for deeper practice!'}
+              </p>
+            </div>
+
+            <button
+              type="button"
+              disabled={expansionSummary.unlockedExpansionCount === 0}
+              onClick={() =>
+                setActiveRun({
+                  title:
+                    lang === 'vi'
+                      ? `Kho Mở Rộng Cấp ${currentLevel} (+20% XP)`
+                      : `Level ${currentLevel} Expansion Pack (+20% XP)`,
+                  mode: 'advanced_pack',
+                  targetLevel: currentLevel,
+                  exercises: buildAdvancedExpansionDeck(
+                    currentLevel,
+                    mastery,
+                    10,
+                    `adv-${Date.now()}`,
+                  ),
+                })
+              }
+              className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 disabled:text-slate-600 rounded-xl cursor-pointer disabled:cursor-not-allowed shrink-0"
+            >
+              {expansionSummary.unlockedExpansionCount > 0 ? (
+                <>
+                  <Unlock className="w-4 h-4" />
+                  <span>
+                    {lang === 'vi'
+                      ? `Luyện Kho Mở Rộng (${expansionSummary.unlockedExpansionCount} câu)`
+                      : `Play Expansion Pack (${expansionSummary.unlockedExpansionCount})`}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <Lock className="w-4 h-4" />
+                  <span>
+                    {lang === 'vi' ? 'Đạt Cấp 2 để mở khóa' : 'Reach Level 2 to Unlock'}
+                  </span>
+                </>
+              )}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {expansionSummary.packs.map((pack) => (
+              <div
+                key={pack.level}
+                className={`p-4 rounded-xl border flex flex-col justify-between gap-2.5 ${
+                  pack.unlocked
+                    ? 'bg-white border-indigo-200'
+                    : 'bg-white/60 border-slate-200 opacity-80'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span
+                    className={`inline-flex items-center gap-1.5 text-xs font-bold px-2.5 py-0.5 rounded-full border ${
+                      pack.unlocked
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-slate-100 text-slate-600 border-slate-200'
+                    }`}
+                  >
+                    {pack.unlocked ? (
+                      <Unlock className="w-3 h-3" />
+                    ) : (
+                      <Lock className="w-3 h-3" />
+                    )}
+                    <span>
+                      {pack.unlocked
+                        ? lang === 'vi'
+                          ? `Gói Cấp ${pack.level}+ · Đã mở`
+                          : `Level ${pack.level}+ · Unlocked`
+                        : lang === 'vi'
+                          ? `Gói Cấp ${pack.level}+ · Khóa`
+                          : `Level ${pack.level}+ · Locked`}
+                    </span>
+                  </span>
+                  <span className="font-mono-num text-xs font-bold text-indigo-700">
+                    +{pack.xpPerCorrect} XP/câu
+                  </span>
+                </div>
+                <p className="text-sm font-bold text-slate-900">
+                  +{pack.totalCount}{' '}
+                  {lang === 'vi'
+                    ? pack.level === 2
+                      ? 'câu Thực hành mở rộng (đủ 6 miền)'
+                      : pack.level === 3
+                        ? 'câu Thành thạo chuyên sâu (đủ 6 miền)'
+                        : 'câu Chuyên gia Số & Đạo đức AI'
+                    : `Level ${pack.level}+ Expansion Exercises`}
+                </p>
+                <p className="text-xs text-slate-600 tabular-nums">
+                  {pack.unlocked
+                    ? lang === 'vi'
+                      ? `Đã chinh phục: ${pack.masteredCount}/${pack.totalCount} câu (Còn ${pack.remainingNewCount} câu mới)`
+                      : `Mastered: ${pack.masteredCount}/${pack.totalCount} (${pack.remainingNewCount} new left)`
+                    : lang === 'vi'
+                      ? `Đạt Cấp độ ${pack.level} để tự động mở khóa thêm ${pack.totalCount} câu hỏi mới.`
+                      : `Reach Level ${pack.level} to unlock ${pack.totalCount} new questions.`}
+                </p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Level Challenges (Level 1 -> Level 4) */}
+        <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                <Layers className="w-5 h-5 text-sky-600" />
+                <span>
+                  {lang === 'vi'
+                    ? 'Chinh phục 4 Cấp độ Năng lực Số'
+                    : 'Conquer 4 Digital Competency Levels'}
+                </span>
+              </h2>
+              <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
+                {lang === 'vi'
+                  ? 'Mỗi lượt tự động ưu tiên câu chưa làm đúng và tự động trộn thêm các câu Mở rộng đã mở khóa ở cấp độ tương ứng.'
+                  : 'Prioritizes unmastered questions and automatically mixes in unlocked higher-level expansion items.'}
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+            {ASSESSMENT_LEVELS.map((lvl) => {
+              const clearedAtLevel = Object.values(mastery).filter(
+                (m) => m.highestLevel >= lvl.level,
+              ).length;
+              const pct = Math.round((clearedAtLevel / 24) * 100);
+              const expPack = expansionSummary.packs.find((p) => p.level === lvl.level);
+              return (
+                <button
+                  key={lvl.level}
+                  type="button"
+                  onClick={() =>
+                    setActiveRun({
+                      title: lang === 'vi' ? `Thử thách ${lvl.nameVi}` : `${lvl.nameEn} Challenge`,
+                      mode: 'level_challenge',
+                      targetLevel: lvl.level,
+                      exercises: buildLevelChallengeDeck(
+                        lvl.level,
+                        mastery,
+                        10,
+                        `lvl-${lvl.level}-${Date.now()}`,
+                        currentLevel,
+                      ),
+                    })
+                  }
+                  className="text-left p-4 rounded-xl border border-slate-200 hover:border-sky-400 hover:bg-sky-50/30 transition-all flex flex-col justify-between gap-3 cursor-pointer"
+                >
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span
+                        className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${lvl.badgeClass}`}
+                      >
+                        {lvl.code}
+                      </span>
+                      <span className="font-mono-num text-xs font-bold text-slate-500">
+                        +{lvl.xpPerCorrect} XP/câu
+                      </span>
+                    </div>
+                    <h3 className="text-sm sm:text-base font-bold text-slate-900">
+                      {lang === 'vi' ? lvl.nameVi : lvl.nameEn}
+                    </h3>
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      {lang === 'vi' ? lvl.subtitleVi : lvl.subtitleEn}
+                    </p>
+                    {expPack && (
+                      <p
+                        className={`text-[11px] font-semibold ${
+                          expPack.unlocked ? 'text-indigo-700' : 'text-slate-500'
+                        }`}
+                      >
+                        {expPack.unlocked
+                          ? lang === 'vi'
+                            ? `Đã mở thêm +${expPack.totalCount} câu nâng cao (${24 + expPack.totalCount} câu)`
+                            : `+${expPack.totalCount} expansion unlocked (${24 + expPack.totalCount} total)`
+                          : lang === 'vi'
+                            ? `Đạt Cấp ${lvl.level} để mở thêm +${expPack.totalCount} câu`
+                            : `Reach L${lvl.level} for +${expPack.totalCount} more`}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="space-y-1.5 pt-2 border-t border-slate-100">
+                    <div className="flex items-center justify-between text-[11px] font-semibold text-slate-600 tabular-nums">
+                      <span>
+                        {lang === 'vi' ? 'Đã đạt' : 'Cleared'}: {clearedAtLevel}/24
+                      </span>
+                      <span>{pct}%</span>
+                    </div>
+                    <div className="w-full h-1.5 rounded-full bg-slate-100 overflow-hidden">
+                      <div
+                        className="h-full rounded-full transition-all"
+                        style={{ width: `${pct}%`, backgroundColor: lvl.accentHex }}
+                      />
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
 
       {/* Recommended Next Competencies */}
       {recommendedCompIds.length > 0 && (
@@ -1119,14 +1282,14 @@ export function SelfAssessmentHub({
                 <button
                   key={cid}
                   type="button"
-                  onClick={() =>
-                    setActiveRun({
-                      title: `${comp.id} · ${lang === 'vi' ? comp.nameVi : comp.nameEn}`,
-                      mode: 'competency_focus',
-                      targetCompetencyId: comp.id,
-                      exercises: buildCompetencyFocusDeck(comp.id),
-                    })
-                  }
+                    onClick={() =>
+                      setActiveRun({
+                        title: `${comp.id} · ${lang === 'vi' ? comp.nameVi : comp.nameEn}`,
+                        mode: 'competency_focus',
+                        targetCompetencyId: comp.id,
+                        exercises: buildCompetencyFocusDeck(comp.id, currentLevel),
+                      })
+                    }
                   className="text-left p-3.5 rounded-xl bg-white border border-sky-200 hover:border-sky-500 transition-colors cursor-pointer space-y-1.5"
                 >
                   <div className="flex items-center justify-between">
@@ -1211,7 +1374,7 @@ export function SelfAssessmentHub({
                             title: `${comp.id} · ${lang === 'vi' ? comp.nameVi : comp.nameEn}`,
                             mode: 'competency_focus',
                             targetCompetencyId: comp.id,
-                            exercises: buildCompetencyFocusDeck(comp.id),
+                            exercises: buildCompetencyFocusDeck(comp.id, currentLevel),
                           })
                         }
                         className={`text-left p-4 rounded-xl border transition-all cursor-pointer flex flex-col justify-between gap-3 ${
@@ -1287,19 +1450,23 @@ export function SelfAssessmentHub({
                   <p className="font-semibold text-slate-900">
                     {att.mode === 'diagnostic'
                       ? lang === 'vi'
-                        ? 'Kiểm tra thử Toàn diện 24 Năng lực'
+                        ? 'Kiểm tra Tổng hợp 24 Năng lực'
                         : '24-Competency Diagnostic'
-                      : att.mode === 'level_challenge'
+                      : att.mode === 'advanced_pack'
                         ? lang === 'vi'
-                          ? `Thử thách Cấp độ ${att.targetLevel ?? ''}`
-                          : `Level ${att.targetLevel ?? ''} Challenge`
-                        : att.mode === 'competency_focus'
+                          ? `Kho Mở Rộng Cấp ${att.targetLevel ?? ''}+`
+                          : `Level ${att.targetLevel ?? ''}+ Expansion Pack`
+                        : att.mode === 'level_challenge'
                           ? lang === 'vi'
-                            ? `Luyện chuyên sâu Năng lực ${att.targetCompetencyId ?? ''}`
-                            : `Skill Focus ${att.targetCompetencyId ?? ''}`
-                          : lang === 'vi'
-                            ? 'Thử thách Đa dạng Siêu tốc'
-                            : 'Variety Sprint'}
+                            ? `Thử thách Cấp độ ${att.targetLevel ?? ''}`
+                            : `Level ${att.targetLevel ?? ''} Challenge`
+                          : att.mode === 'competency_focus'
+                            ? lang === 'vi'
+                              ? `Luyện chuyên sâu Năng lực ${att.targetCompetencyId ?? ''}`
+                              : `Skill Focus ${att.targetCompetencyId ?? ''}`
+                            : lang === 'vi'
+                              ? 'Thử thách Đa dạng Siêu tốc'
+                              : 'Variety Sprint'}
                   </p>
                   <p className="text-xs text-slate-500">
                     {new Date(att.completedAt).toLocaleString('vi-VN')} ·{' '}

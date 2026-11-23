@@ -919,5 +919,264 @@ test('localStoreApi supports personal 24-competency self-assessment, Google prof
   );
 });
 
+test('localStoreApi awards partial credit for fuzzy fill_blank near-match and allows teacher upgrade to 100%', async () => {
+  await withMockFetch(
+    () => new Response(JSON.stringify({}), { status: 404 }),
+    async () => {
+      const storage = createMemoryStorage();
+      const token = await seedAuthenticatedTeacherToken(storage);
+
+      await handleLocalApi(
+        '/api/workspace/import',
+        {
+          method: 'POST',
+          authToken: token,
+          body: JSON.stringify({
+            classes: [
+              { id: 'LOP-9A', name: 'Lớp 9A', grade: 'Khối 9', teacherName: 'Cô Ý', createdAt: '2026-11-22T00:00:00Z' },
+            ],
+            lessons: [
+              {
+                id: 'lesson-fuzzy-9a',
+                title: 'Bài kiểm tra điền chỗ trống',
+                topic: 'Bản quyền số',
+                sourceFileName: 'banquyen.txt',
+                summary: 'Ôn tập bản quyền',
+                assignedClassIds: ['LOP-9A'],
+                createdAt: '2026-11-22T00:00:00Z',
+                questions: [
+                  {
+                    id: 'q-fuzzy-1',
+                    type: 'fill_blank',
+                    questionText: 'Khi sử dụng hình ảnh trên mạng cần tôn trọng ___ của tác giả.',
+                    aiSearchKeywordHint: 'bản quyền tác giả',
+                    correctAnswer: 'bản quyền',
+                    competencyId: '3.3',
+                    competencyIds: ['3.3'],
+                    explanation: 'Tôn trọng bản quyền và ghi rõ nguồn khi sử dụng nội dung số.',
+                  },
+                ],
+              },
+            ],
+          }),
+        },
+        storage,
+      );
+
+      // Student types moderate spelling variation ("ban qyn") -> receives partial credit (70% base + scaled speed)
+      const subRes = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-9A',
+            tabletNumber: 5,
+            groupName: 'Bình Minh',
+            lessonId: 'lesson-fuzzy-9a',
+            questionId: 'q-fuzzy-1',
+            userAnswer: 'ban qyn',
+            elapsedMs: 12000,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(subRes.ok, true);
+      const subData = subRes.data as {
+        submission: {
+          id: string;
+          isCorrect: boolean;
+          basePoints: number;
+          speedBonus: number;
+          totalPoints: number;
+          feedbackText: string;
+        };
+      };
+      assert.equal(subData.submission.isCorrect, true);
+      assert.equal(subData.submission.basePoints, 70);
+      assert.equal(subData.submission.speedBonus, 35);
+      assert.equal(subData.submission.totalPoints, 105);
+      assert.match(subData.submission.feedbackText, /70%/);
+
+      // Teacher upgrades partial credit submission to 100% full credit via override endpoint
+      const upgradeRes = await handleLocalApi(
+        `/api/submissions/${encodeURIComponent(subData.submission.id)}/override`,
+        {
+          method: 'POST',
+          authToken: token,
+          body: JSON.stringify({ isCorrect: true }),
+        },
+        storage,
+      );
+      assert.equal(upgradeRes.ok, true);
+      const upData = upgradeRes.data as {
+        submission: { basePoints: number; speedBonus: number; totalPoints: number };
+      };
+      assert.equal(upData.submission.basePoints, 100);
+      assert.equal(upData.submission.speedBonus, 50);
+      assert.equal(upData.submission.totalPoints, 150);
+    },
+  );
+});
+
+test('localStoreApi requires verified Google login (rejects guest with 401) and enforces anti-farming retry XP caps on assessment-submit', async () => {
+  const storage = createMemoryStorage();
+  await withMockFetch(
+    async (input, init) => {
+      const url = String(input);
+      if (url.includes('identitytoolkit.googleapis.com/v1/accounts:lookup')) {
+        const parsed = JSON.parse(String(init?.body ?? '{}')) as { idToken?: string };
+        if (parsed.idToken === 'verified-student-token') {
+          return new Response(
+            JSON.stringify({
+              users: [
+                {
+                  localId: 'uid-google-student-2',
+                  email: 'baochau@gmail.com',
+                  emailVerified: true,
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    },
+    async () => {
+      // 1) Guest / anonymous calls without verified Google idToken MUST be rejected with 401
+      const guestProfileRes = await handleLocalApi(
+        '/api/learners/profile',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            uid: 'guest-peek-1',
+            fullName: 'Khách xem trộm',
+            className: '5A',
+            schoolName: 'TH Test',
+          }),
+        },
+        storage,
+      );
+      assert.equal(guestProfileRes.status, 401);
+
+      const guestMeRes = await handleLocalApi(
+        '/api/learners/me?uid=guest-peek-1',
+        { method: 'GET' },
+        storage,
+      );
+      assert.equal(guestMeRes.status, 401);
+
+      const guestSubmitRes = await handleLocalApi(
+        '/api/learners/assessment-submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            uid: 'guest-peek-1',
+            mode: 'diagnostic',
+            maxCombo: 1,
+            outcomes: [
+              { exerciseId: 'ex-1.1-l1', competencyId: '1.1', level: 1, type: 'scenario_choice', isCorrect: true, xpEarned: 25 },
+            ],
+          }),
+        },
+        storage,
+      );
+      assert.equal(guestSubmitRes.status, 401);
+
+      // 2) Verified Google student completes profile
+      const profileRes = await handleLocalApi(
+        '/api/learners/profile',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idToken: 'verified-student-token',
+            fullName: 'Nguyễn Bảo Châu',
+            className: '6B',
+            schoolName: 'THCS Lê Quý Đôn',
+            gradeBand: 'middle',
+          }),
+        },
+        storage,
+      );
+      assert.equal(profileRes.ok, true);
+
+      // 3) 1st submission: ex-1.1-l2 correct (40 XP), ex-4.2-l2 wrong (+5 effort XP)
+      const run1 = await handleLocalApi(
+        '/api/learners/assessment-submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idToken: 'verified-student-token',
+            mode: 'variety_sprint',
+            maxCombo: 1,
+            outcomes: [
+              { exerciseId: 'ex-1.1-l2', competencyId: '1.1', level: 2, type: 'match_pairs', isCorrect: true, xpEarned: 40 },
+              { exerciseId: 'ex-4.2-l2', competencyId: '4.2', level: 2, type: 'scenario_choice', isCorrect: false, xpEarned: 5 },
+            ],
+          }),
+        },
+        storage,
+      );
+      assert.equal(run1.ok, true);
+      assert.equal((run1.data as { profile: { totalXp: number } }).profile.totalXp, 45);
+
+      // 4) 2nd submission: repeating ex-1.1-l2 (spoofing 40 XP -> capped to 25% = 10 XP) + fixing ex-4.2-l2 (80% = 32 XP)
+      const run2 = await handleLocalApi(
+        '/api/learners/assessment-submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idToken: 'verified-student-token',
+            mode: 'variety_sprint',
+            maxCombo: 2,
+            outcomes: [
+              { exerciseId: 'ex-1.1-l2', competencyId: '1.1', level: 2, type: 'match_pairs', isCorrect: true, xpEarned: 40 },
+              { exerciseId: 'ex-4.2-l2', competencyId: '4.2', level: 2, type: 'scenario_choice', isCorrect: true, xpEarned: 40 },
+            ],
+          }),
+        },
+        storage,
+      );
+      assert.equal(run2.ok, true);
+      const run2Data = run2.data as {
+        profile: { totalXp: number };
+        attempt: { xpEarned: number; outcomes: Array<{ retryTier?: string; xpEarned: number }> };
+      };
+      assert.equal(run2Data.attempt.xpEarned, 42);
+      assert.equal(run2Data.attempt.outcomes[0].retryTier, 'review_bonus');
+      assert.equal(run2Data.attempt.outcomes[0].xpEarned, 10);
+      assert.equal(run2Data.attempt.outcomes[1].retryTier, 'redemption_mastery');
+      assert.equal(run2Data.attempt.outcomes[1].xpEarned, 32);
+      assert.equal(run2Data.profile.totalXp, 87);
+
+      // 5) 3rd submission: repeating ex-1.1-l2 again -> 0 XP practice mode!
+      const run3 = await handleLocalApi(
+        '/api/learners/assessment-submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idToken: 'verified-student-token',
+            mode: 'variety_sprint',
+            maxCombo: 1,
+            outcomes: [
+              { exerciseId: 'ex-1.1-l2', competencyId: '1.1', level: 2, type: 'match_pairs', isCorrect: true, xpEarned: 40 },
+            ],
+          }),
+        },
+        storage,
+      );
+      assert.equal(run3.ok, true);
+      const run3Data = run3.data as {
+        profile: { totalXp: number };
+        attempt: { xpEarned: number; outcomes: Array<{ retryTier?: string; xpEarned: number }> };
+      };
+      assert.equal(run3Data.attempt.xpEarned, 0);
+      assert.equal(run3Data.attempt.outcomes[0].retryTier, 'practice_no_xp');
+      assert.equal(run3Data.profile.totalXp, 87);
+    },
+  );
+});
+
 
 

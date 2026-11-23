@@ -1,13 +1,15 @@
 import firebaseConfig from '../../firebase-applet-config.json';
 import { getCompetencyById } from '../shared/competencies';
 import {
+  AnswerEvaluation,
   buildCompetencyMatrix,
   buildDomainChampions,
+  buildGradingFeedback,
   buildLeaderboard,
   calculatePoints,
   clampElapsedMs,
+  evaluateAnswerMatch,
   formatGroupId,
-  isAnswerMatch,
 } from '../shared/scoring';
 import {
   AdminSecurityConfig,
@@ -309,7 +311,12 @@ async function hydrateLocalFromPublicWorkspace(
 }
 
 type LocalGradeResult =
-  | { status: 'ok'; submission: AnswerSubmission; alreadySubmitted?: boolean }
+  | {
+      status: 'ok';
+      submission: AnswerSubmission;
+      alreadySubmitted?: boolean;
+      evaluation?: AnswerEvaluation;
+    }
   | { status: 'forbidden' }
   | { status: 'not_found' };
 
@@ -376,26 +383,25 @@ function gradeOneLocally(
 
   const comp = getCompetencyById(question.competencyId);
   const safeElapsedMs = clampElapsedMs(item.elapsedMs, question.type);
-  const isCorrect = isAnswerMatch(
+  const evaluation = evaluateAnswerMatch(
     item.userAnswer,
     resolvedCorrectAnswer,
     question.type,
     question.options,
   );
-  const breakdown = calculatePoints(isCorrect, safeElapsedMs, question.type);
-
-  const feedbackText =
-    lang === 'en'
-      ? isCorrect
-        ? breakdown.speedBonus >= 35
-          ? `Lightning fast, ${item.groupName}! +${breakdown.totalPoints} pts (including +${breakdown.speedBonus} speed bonus)!`
-          : `Spot on, ${item.groupName}! +${breakdown.totalPoints} pts!`
-        : `Nice try, ${item.groupName}! Check the Digital Citizen tip below and keep going!`
-      : isCorrect
-        ? breakdown.speedBonus >= 35
-          ? `Quá nhanh quá nguy hiểm! Nhóm ${item.groupName} ghi ngay +${breakdown.totalPoints} điểm (gồm +${breakdown.speedBonus} điểm tốc độ)!`
-          : `Chính xác tuyệt đối! Chúc mừng nhóm ${item.groupName} nhận +${breakdown.totalPoints} điểm!`
-        : `Suýt đúng rồi ${item.groupName} ơi! Xem bí kíp Công dân số bên dưới để ghi điểm câu sau nhé!`;
+  const isCorrect = evaluation.isCorrect;
+  const breakdown = calculatePoints(
+    isCorrect,
+    safeElapsedMs,
+    question.type,
+    evaluation.creditFactor,
+  );
+  const feedbackText = buildGradingFeedback(
+    item.groupName,
+    evaluation,
+    breakdown,
+    lang,
+  );
 
   const submission: AnswerSubmission = {
     id: `sub-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -422,16 +428,21 @@ function gradeOneLocally(
 
   store.submissions.push(submission);
 
+  const isPartial = evaluation.matchTier === 'fuzzy_partial';
   store.activityLogs.unshift({
     id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     classId: submission.classId,
     groupId: submission.groupId,
     action: syncedFromOffline
       ? isCorrect
-        ? 'Đồng bộ ngoại tuyến · Đúng'
+        ? isPartial
+          ? 'Đồng bộ ngoại tuyến · Gần đúng'
+          : 'Đồng bộ ngoại tuyến · Đúng'
         : 'Đồng bộ ngoại tuyến · Chưa đúng'
       : isCorrect
-        ? 'Trả lời đúng'
+        ? isPartial
+          ? 'Trả lời gần đúng (Khuyến khích)'
+          : 'Trả lời đúng'
         : 'Trả lời chưa đúng',
     detail: `Năng lực ${comp.id} (${comp.nameVi}) · ${(submission.elapsedMs / 1000).toFixed(1)}s`,
     competencyId: submission.competencyId,
@@ -439,7 +450,7 @@ function gradeOneLocally(
     timestamp: submission.submittedAt,
   });
 
-  return { status: 'ok', submission };
+  return { status: 'ok', submission, evaluation };
 }
 
 export interface LocalApiResult {
@@ -1331,12 +1342,10 @@ export async function handleLocalApi(
     };
   }
 
-  // POST /api/learners/profile
+  // POST /api/learners/profile (Google Sign-In mandatory)
   if (pathname === '/api/learners/profile' && method === 'POST') {
     const pBody = body as {
       idToken?: string;
-      uid?: string;
-      authType?: 'google' | 'guest';
       photoUrl?: string;
       fullName?: string;
       className?: string;
@@ -1354,31 +1363,31 @@ export async function handleLocalApi(
       };
     }
 
-    let resolvedUid = String(pBody.uid ?? '').trim();
-    let resolvedAuthType: 'google' | 'guest' = 'guest';
-    let resolvedEmail: string | undefined;
+    if (!pBody.idToken) {
+      return {
+        ok: false,
+        status: 401,
+        data: {
+          error:
+            'Tự đánh giá ở nhà bắt buộc đăng nhập Google để lưu tiến độ và đảm bảo công bằng (tránh xem trước câu hỏi và đáp án).',
+        },
+      };
+    }
 
-    if (pBody.idToken) {
-      const verified = await verifyGoogleIdTokenStatic(String(pBody.idToken));
-      if (!verified || !verified.emailVerified) {
-        return {
-          ok: false,
-          status: 401,
-          data: { error: 'Không thể xác thực tài khoản Google của học sinh.' },
-        };
-      }
-      resolvedUid = verified.uid;
-      resolvedEmail = verified.email;
-      resolvedAuthType = 'google';
-    } else if (!resolvedUid || !resolvedUid.startsWith('guest_')) {
-      resolvedUid = `guest_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const verified = await verifyGoogleIdTokenStatic(String(pBody.idToken));
+    if (!verified || !verified.emailVerified) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Không thể xác thực tài khoản Google của học sinh.' },
+      };
     }
 
     const store = loadLocalStore(storage);
     const profile = upsertLearnerProfileInStore(store, {
-      uid: resolvedUid,
-      authType: resolvedAuthType,
-      email: resolvedEmail,
+      uid: verified.uid,
+      authType: 'google',
+      email: verified.email,
       photoUrl: pBody.photoUrl,
       fullName,
       className,
@@ -1398,27 +1407,27 @@ export async function handleLocalApi(
     };
   }
 
-  // GET /api/learners/me
+  // GET /api/learners/me (Google Sign-In mandatory)
   if (pathname === '/api/learners/me' && method === 'GET') {
-    let resolvedUid = (parsedUrl.searchParams.get('uid') || '').trim();
-    if (options.learnerToken) {
-      const verified = await verifyGoogleIdTokenStatic(options.learnerToken);
-      if (verified?.uid) resolvedUid = verified.uid;
+    if (!options.learnerToken) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Cần đăng nhập tài khoản Google để xem hồ sơ Tự đánh giá ở nhà.' },
+      };
     }
-    if (!resolvedUid) {
-      return { ok: false, status: 400, data: { error: 'Thiếu mã định danh học sinh.' } };
+    const verified = await verifyGoogleIdTokenStatic(options.learnerToken);
+    if (!verified?.uid || !verified.emailVerified) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Phiên đăng nhập Google không hợp lệ. Vui lòng đăng nhập lại.' },
+      };
     }
     const store = loadLocalStore(storage);
     const { learnerProfiles, assessmentAttempts, teacherAwards } =
       ensureLearnerCollections(store);
-    const profile = learnerProfiles.find((p) => p.uid === resolvedUid) ?? null;
-    if (profile && profile.authType === 'google' && !options.learnerToken) {
-      return {
-        ok: false,
-        status: 401,
-        data: { error: 'Cần xác thực tài khoản Google để xem hồ sơ cá nhân.' },
-      };
-    }
+    const profile = learnerProfiles.find((p) => p.uid === verified.uid) ?? null;
     return {
       ok: true,
       status: 200,
@@ -1432,11 +1441,10 @@ export async function handleLocalApi(
     };
   }
 
-  // POST /api/learners/assessment-submit
+  // POST /api/learners/assessment-submit (Google Sign-In mandatory & retry-capped)
   if (pathname === '/api/learners/assessment-submit' && method === 'POST') {
     const aBody = body as {
       idToken?: string;
-      learnerUid?: string;
       learnerName?: string;
       className?: string;
       schoolName?: string;
@@ -1447,30 +1455,30 @@ export async function handleLocalApi(
       outcomes?: AssessmentExerciseOutcome[];
       maxCombo?: number;
     };
-    let resolvedUid = String(aBody.learnerUid ?? '').trim();
-    let resolvedAuthType: 'google' | 'guest' = 'guest';
-    let resolvedEmail: string | undefined;
-
-    if (aBody.idToken) {
-      const verified = await verifyGoogleIdTokenStatic(String(aBody.idToken));
-      if (verified?.uid) {
-        resolvedUid = verified.uid;
-        resolvedEmail = verified.email;
-        resolvedAuthType = 'google';
-      }
+    if (!aBody.idToken) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Cần đăng nhập Google để lưu kết quả Tự đánh giá 24 Năng lực.' },
+      };
     }
-    if (!resolvedUid) {
-      resolvedUid = `guest_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const verified = await verifyGoogleIdTokenStatic(String(aBody.idToken));
+    if (!verified?.uid || !verified.emailVerified) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.' },
+      };
     }
 
     const store = loadLocalStore(storage);
     const { profile, attempt } = recordAssessmentAttemptInStore(store, {
-      learnerUid: resolvedUid,
+      learnerUid: verified.uid,
       learnerName: aBody.learnerName,
       className: aBody.className,
       schoolName: aBody.schoolName,
-      authType: resolvedAuthType,
-      email: resolvedEmail,
+      authType: 'google',
+      email: verified.email,
       gradeBand: aBody.gradeBand,
       mode: aBody.mode || 'variety_sprint',
       targetLevel: aBody.targetLevel,

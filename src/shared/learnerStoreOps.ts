@@ -1,5 +1,5 @@
 import {
-  applyAssessmentOutcomesToProfile,
+  applyAssessmentOutcomesDetailed,
   buildPublicLearnerHonorList,
   createEmptyLearnerProfile,
 } from './assessmentEngine';
@@ -133,22 +133,22 @@ export function recordAssessmentAttemptInStore(
   }
 
   const safeOutcomes = (Array.isArray(input.outcomes) ? input.outcomes : []).slice(0, 50);
-  const updatedProfile = applyAssessmentOutcomesToProfile(
+  const {
+    profile: updatedProfile,
+    normalizedOutcomes,
+    xpAdded,
+  } = applyAssessmentOutcomesDetailed(
     learnerProfiles[idx],
     safeOutcomes,
     Math.max(0, Math.round(input.maxCombo || 0)),
   );
   learnerProfiles[idx] = updatedProfile;
 
-  const totalQuestions = safeOutcomes.length;
-  const correctCount = safeOutcomes.filter((o) => o.isCorrect).length;
+  const totalQuestions = normalizedOutcomes.length;
+  const correctCount = normalizedOutcomes.filter((o) => o.isCorrect).length;
   const accuracyPercent =
     totalQuestions > 0 ? Math.round((correctCount / totalQuestions) * 100) : 0;
-  const xpEarned = safeOutcomes.reduce(
-    (sum, o) => sum + Math.max(0, Math.round(o.xpEarned || 0)),
-    0,
-  );
-  const competencyIds = Array.from(new Set(safeOutcomes.map((o) => o.competencyId)));
+  const competencyIds = Array.from(new Set(normalizedOutcomes.map((o) => o.competencyId)));
   const now = new Date().toISOString();
 
   const attempt: AssessmentSessionAttempt = {
@@ -163,10 +163,10 @@ export function recordAssessmentAttemptInStore(
     totalQuestions,
     correctCount,
     accuracyPercent,
-    xpEarned,
+    xpEarned: xpAdded,
     maxCombo: Math.max(0, Math.round(input.maxCombo || 0)),
     competencyIds,
-    outcomes: safeOutcomes,
+    outcomes: normalizedOutcomes,
     completedAt: now,
   };
 

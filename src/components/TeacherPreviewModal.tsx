@@ -13,9 +13,10 @@ import {
 } from 'lucide-react';
 import { getCompetencyById, getDomainByCompetencyId } from '../shared/competencies';
 import {
+  AnswerMatchTier,
   calculatePoints,
+  evaluateAnswerMatch,
   getTimingRuleForQuestionType,
-  isAnswerMatch,
 } from '../shared/scoring';
 import { Language, Lesson, Question } from '../shared/types';
 
@@ -29,6 +30,9 @@ interface SandboxResult {
   questionId: string;
   userAnswer: string;
   isCorrect: boolean;
+  matchTier: AnswerMatchTier;
+  creditFactor: number;
+  similarity: number;
   totalPoints: number;
   speedBonus: number;
   elapsedMs: number;
@@ -93,19 +97,27 @@ export function TeacherPreviewModal({
     e.preventDefault();
     if (!currentQuestion || !answerValue.trim()) return;
     const finalElapsed = Math.max(500, Date.now() - startTimeRef.current);
-    const isCorrect = isAnswerMatch(
+    const evaluation = evaluateAnswerMatch(
       answerValue.trim(),
       currentQuestion.correctAnswer ?? '',
       currentQuestion.type,
       currentQuestion.options,
     );
-    const breakdown = calculatePoints(isCorrect, finalElapsed, currentQuestion.type);
+    const breakdown = calculatePoints(
+      evaluation.isCorrect,
+      finalElapsed,
+      currentQuestion.type,
+      evaluation.creditFactor,
+    );
     setResults((prev) => ({
       ...prev,
       [currentQuestion.id]: {
         questionId: currentQuestion.id,
         userAnswer: answerValue.trim(),
-        isCorrect,
+        isCorrect: evaluation.isCorrect,
+        matchTier: evaluation.matchTier,
+        creditFactor: evaluation.creditFactor,
+        similarity: evaluation.similarity,
         totalPoints: breakdown.totalPoints,
         speedBonus: breakdown.speedBonus,
         elapsedMs: finalElapsed,
@@ -427,20 +439,39 @@ export function TeacherPreviewModal({
               {currentResult && (
                 <div
                   className={`rounded-xl border p-4 space-y-3 ${
-                    currentResult.isCorrect
-                      ? 'bg-emerald-50 border-emerald-200'
-                      : 'bg-rose-50 border-rose-200'
+                    currentResult.matchTier === 'fuzzy_partial'
+                      ? 'bg-sky-50 border-sky-200'
+                      : currentResult.isCorrect
+                        ? 'bg-emerald-50 border-emerald-200'
+                        : 'bg-rose-50 border-rose-200'
                   }`}
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 font-bold text-sm">
-                      {currentResult.isCorrect ? (
+                    <div className="flex flex-wrap items-center gap-2 font-bold text-sm">
+                      {currentResult.matchTier === 'fuzzy_partial' ? (
+                        <>
+                          <CheckCircle2 className="w-5 h-5 text-sky-700" />
+                          <span className="text-sky-900">
+                            {lang === 'vi'
+                              ? `Hệ thống chấm: GẦN ĐÚNG — Điểm khuyến khích ${Math.round(currentResult.creditFactor * 100)}% (Tương đồng ${Math.round(currentResult.similarity * 100)}%)`
+                              : `Grader Result: PARTIAL CREDIT ${Math.round(currentResult.creditFactor * 100)}% (${Math.round(currentResult.similarity * 100)}% match)`}
+                          </span>
+                        </>
+                      ) : currentResult.isCorrect ? (
                         <>
                           <CheckCircle2 className="w-5 h-5 text-emerald-700" />
                           <span className="text-emerald-900">
-                            {lang === 'vi'
-                              ? 'Hệ thống chấm: CHÍNH XÁC'
-                              : 'Grader Result: CORRECT'}
+                            {currentResult.matchTier === 'synonym'
+                              ? lang === 'vi'
+                                ? 'Hệ thống chấm: CHÍNH XÁC 100% (Nhận diện từ đồng nghĩa)'
+                                : 'Grader Result: 100% CORRECT (Synonym match)'
+                              : currentResult.matchTier === 'fuzzy_full'
+                                ? lang === 'vi'
+                                  ? `Hệ thống chấm: CHÍNH XÁC 100% (Lỗi gõ nhẹ · Tương đồng ${Math.round(currentResult.similarity * 100)}%)`
+                                  : `Grader Result: 100% CORRECT (Minor typo accepted · ${Math.round(currentResult.similarity * 100)}%)`
+                                : lang === 'vi'
+                                  ? 'Hệ thống chấm: CHÍNH XÁC 100%'
+                                  : 'Grader Result: 100% CORRECT'}
                           </span>
                         </>
                       ) : (
@@ -448,8 +479,8 @@ export function TeacherPreviewModal({
                           <XCircle className="w-5 h-5 text-rose-700" />
                           <span className="text-rose-900">
                             {lang === 'vi'
-                              ? 'Hệ thống chấm: CHƯA KHỚP ĐÁP ÁN'
-                              : 'Grader Result: NOT MATCHED'}
+                              ? `Hệ thống chấm: CHƯA KHỚP ĐÁP ÁN${currentResult.similarity > 0 ? ` (Tương đồng ${Math.round(currentResult.similarity * 100)}%)` : ''}`
+                              : `Grader Result: NOT MATCHED${currentResult.similarity > 0 ? ` (${Math.round(currentResult.similarity * 100)}%)` : ''}`}
                           </span>
                         </>
                       )}

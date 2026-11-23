@@ -152,7 +152,16 @@ export type AssessmentSessionMode =
   | 'diagnostic'
   | 'level_challenge'
   | 'competency_focus'
-  | 'variety_sprint';
+  | 'variety_sprint'
+  | 'advanced_pack';
+
+export type ExerciseRetryScoringTier =
+  | 'first_mastery'
+  | 'redemption_mastery'
+  | 'review_bonus'
+  | 'practice_no_xp'
+  | 'first_attempt_effort'
+  | 'repeat_wrong_no_xp';
 
 export interface MatchPairItem {
   id: string;
@@ -171,6 +180,8 @@ export interface AssessmentExercise {
   competencyId: string; // 1.1 .. 6.3
   level: AssessmentLevel; // 1 = Khám phá, 2 = Thực hành, 3 = Thành thạo, 4 = Chuyên gia
   type: AssessmentExerciseType;
+  tier?: 'core' | 'expansion'; // expansion questions unlock at higher levels (L2/L3/L4)
+  unlockMinLevel?: AssessmentLevel;
   contextBadge: string;
   prompt: string;
   options?: string[]; // scenario_choice
@@ -185,6 +196,13 @@ export interface AssessmentExercise {
   explanation: string;
 }
 
+export interface ExerciseAttemptRecord {
+  attempts: number;
+  correctCount: number;
+  reviewBonusCount: number;
+  lastAttemptAt: string;
+}
+
 export interface CompetencyMasteryRecord {
   competencyId: string;
   highestLevel: 0 | AssessmentLevel;
@@ -192,6 +210,7 @@ export interface CompetencyMasteryRecord {
   correctCount: number;
   xp: number;
   lastPracticedAt: string;
+  exerciseHistory?: Record<string, ExerciseAttemptRecord>;
 }
 
 export interface LearnerProfile {
@@ -223,6 +242,7 @@ export interface AssessmentExerciseOutcome {
   type: AssessmentExerciseType;
   isCorrect: boolean;
   xpEarned: number;
+  retryTier?: ExerciseRetryScoringTier;
 }
 
 export interface AssessmentSessionAttempt {

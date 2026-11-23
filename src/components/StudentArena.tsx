@@ -55,6 +55,8 @@ interface LocalFeedbackState {
   alreadySubmitted?: boolean;
   isError?: boolean;
   isCorrect?: boolean;
+  isPartialCredit?: boolean;
+  creditPercent?: number;
   totalPoints?: number;
   speedBonus?: number;
   feedbackText: string;
@@ -427,6 +429,10 @@ export function StudentArena({
 
       const submission = res.data.submission;
       const alreadySubmitted = Boolean(res.data.alreadySubmitted);
+      const isPartialCredit =
+        submission.isCorrect &&
+        submission.basePoints > 0 &&
+        submission.basePoints < 100;
       onOnlineSubmission(submission);
       if (!alreadySubmitted) {
         setSessionScore((prev) => prev + submission.totalPoints);
@@ -435,6 +441,8 @@ export function StudentArena({
         isOfflineQueued: false,
         alreadySubmitted,
         isCorrect: submission.isCorrect,
+        isPartialCredit,
+        creditPercent: isPartialCredit ? submission.basePoints : 100,
         totalPoints: submission.totalPoints,
         speedBonus: submission.speedBonus,
         feedbackText: submission.feedbackText,
@@ -723,9 +731,11 @@ export function StudentArena({
             className={`rounded-xl border p-5 space-y-3 ${
               feedback.isOfflineQueued || feedback.alreadySubmitted
                 ? 'bg-amber-50 border-amber-200'
-                : feedback.isCorrect
-                  ? 'bg-emerald-50 border-emerald-200'
-                  : 'bg-rose-50 border-rose-200'
+                : feedback.isPartialCredit
+                  ? 'bg-sky-50 border-sky-200'
+                  : feedback.isCorrect
+                    ? 'bg-emerald-50 border-emerald-200'
+                    : 'bg-rose-50 border-rose-200'
             }`}
           >
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -746,6 +756,15 @@ export function StudentArena({
                       {lang === 'vi'
                         ? 'Câu này đã được ghi điểm ở lần nộp đầu tiên'
                         : 'First Official Attempt Already Locked'}
+                    </span>
+                  </>
+                ) : feedback.isPartialCredit ? (
+                  <>
+                    <CheckCircle2 className="w-5 h-5 text-sky-700" />
+                    <span className="text-sky-900">
+                      {lang === 'vi'
+                        ? `Gần đúng — Điểm khuyến khích (${feedback.creditPercent ?? 75}%)!`
+                        : `Close Match — Partial Credit (${feedback.creditPercent ?? 75}%)!`}
                     </span>
                   </>
                 ) : feedback.isCorrect ? (
