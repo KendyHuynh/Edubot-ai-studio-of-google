@@ -1,5 +1,5 @@
 # EduBot Công Dân Số (TT 02/2025)
-
+https://kendyhuynh.github.io/Edubot-ai-studio-of-google/
 Ứng dụng trò chơi học tập & tự đánh giá **24 năng lực Công dân số** với 3 phân quyền tách biệt rõ ràng:
 1. **Chế độ Tập trung Trên lớp (10 máy tính bảng dùng chung):** Học sinh vào đúng **Lớp học** và **Số máy (01–10)** để nhận thông báo trực tiếp và làm bài tập Thầy/Cô giao, tự động ẩn mục tự học ngoài lớp để tập trung tuyệt đối.
 2. **Chế độ Cá nhân Ở nhà (Tự đánh giá 24 Năng lực theo 4 Cấp độ):** Học sinh đăng nhập **tài khoản Google cá nhân** (tài khoản mới bắt buộc khai báo **Họ tên · Lớp học · Trường học**), luyện tập **96 bài tập tương tác đa dạng 5 hình thức** (Tình huống, Đúng/Sai, Sắp xếp quy trình 4 bước, Ghép cặp, Phân loại) trải đều 24 năng lực (1.1 → 6.3) và nhận **Huy hiệu khen thưởng** từ Thầy/Cô.
