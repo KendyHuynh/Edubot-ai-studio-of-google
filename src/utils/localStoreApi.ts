@@ -67,7 +67,10 @@ import {
   verifyPinWebCrypto,
 } from './pinCrypto';
 import { recoverMissingCorrectAnswers } from './answerRecovery';
-import { mergeLessonsPreservingCustom } from './aiLessonVault';
+import {
+  loadStudentPublicMemory,
+  saveStudentPublicMemory,
+} from './studentPublicMemory';
 
 const STATIC_STORE_KEY = 'edubot_static_store_v1';
 const SYNC_SNAPSHOT_KEY = 'edubot_cloud_sync_snapshot_v1';
@@ -232,7 +235,18 @@ export function loadLocalStore(storage: StorageLike = defaultStorage): StoreData
     return snapshot;
   }
 
-  // 3) Clean empty store — NEVER create fake/virtual LOP-5A/5B/6A classes!
+  // 3) Restore from dedicated Student Public Memory if available (decoupled from Admin session!)
+  const studentMem = loadStudentPublicMemory(storage);
+  if (studentMem) {
+    const hydratedFromStudentMem = createEmptyStore();
+    hydratedFromStudentMem.classes = studentMem.classes;
+    hydratedFromStudentMem.lessons = studentMem.lessons;
+    hydratedFromStudentMem.notifications = studentMem.notifications;
+    saveLocalStore(hydratedFromStudentMem, storage);
+    return hydratedFromStudentMem;
+  }
+
+  // 4) Clean empty store — NEVER create fake/virtual LOP-5A/5B/6A classes!
   const empty = createEmptyStore();
   saveLocalStore(empty, storage);
   return empty;
@@ -274,6 +288,7 @@ async function hydrateLocalFromPublicWorkspace(
     }
 
     const store = loadLocalStore(storage);
+    const studentMem = loadStudentPublicMemory(storage);
     let changed = false;
 
     if (snapshot && options.replaceContent) {
@@ -286,8 +301,15 @@ async function hydrateLocalFromPublicWorkspace(
       }
       if (snapshot.lessons.length > 0) {
         store.lessons = dedupeById(
-          recoverMissingCorrectAnswers(snapshot.lessons, store.lessons),
+          recoverMissingCorrectAnswers(snapshot.lessons, [
+            ...store.lessons,
+            ...(studentMem?.lessons ?? []),
+          ]),
         );
+        changed = true;
+      } else if (store.lessons.length === 0 && studentMem && studentMem.lessons.length > 0) {
+        // Cloud had classes but 0 lessons yet — preserve dedicated Student Public Memory lessons
+        store.lessons = dedupeById(studentMem.lessons);
         changed = true;
       }
       if (snapshot.notifications && snapshot.notifications.length > 0) {
@@ -314,6 +336,33 @@ async function hydrateLocalFromPublicWorkspace(
               return { ...n, readByGroupIds: mergedRead };
             }),
         );
+        changed = true;
+      }
+
+      // Mirror freshly fetched cloud data into dedicated Student Public Memory for offline/admin-disconnected resilience
+      if (store.classes.length > 0 || store.lessons.length > 0) {
+        saveStudentPublicMemory(
+          {
+            classes: store.classes,
+            lessons: store.lessons,
+            notifications: store.notifications,
+            workspaceId: resolvedWsId,
+          },
+          storage,
+        );
+      }
+    } else if (!snapshot && options.replaceContent && studentMem) {
+      // Cloud unavailable / Admin disconnected -> fall back cleanly to dedicated Student Public Memory!
+      if (store.classes.length === 0 && studentMem.classes.length > 0) {
+        store.classes = studentMem.classes;
+        changed = true;
+      }
+      if (store.lessons.length === 0 && studentMem.lessons.length > 0) {
+        store.lessons = studentMem.lessons;
+        changed = true;
+      }
+      if (store.notifications.length === 0 && studentMem.notifications.length > 0) {
+        store.notifications = studentMem.notifications;
         changed = true;
       }
     }
@@ -878,6 +927,7 @@ export async function handleLocalApi(
       .filter((l) => !classId || l.classId === classId)
       .slice(0, 60);
 
+    const studentMem = loadStudentPublicMemory(storage);
     return {
       ok: true,
       status: 200,
@@ -893,7 +943,51 @@ export async function handleLocalApi(
         submissionsCount: store.submissions.length,
         activeWorkspaceId: resolvedWsId || activePublicWorkspaceId,
         syncMeta: store.syncMeta ?? null,
+        studentMemoryMeta: studentMem
+          ? {
+              revision: studentMem.revision,
+              publishedAt: studentMem.publishedAt,
+              publishedBy: studentMem.publishedBy,
+              workspaceId: studentMem.workspaceId,
+              classesCount: studentMem.classes.length,
+              lessonsCount: studentMem.lessons.length,
+            }
+          : null,
         ...(includeAnswers ? { submissions: store.submissions } : {}),
+      },
+    };
+  }
+
+  // GET /api/student-memory (Public zero-login read of dedicated Student Public Memory — strips answer keys!)
+  if (pathname === '/api/student-memory' && method === 'GET') {
+    const mem = loadStudentPublicMemory(storage);
+    const classId = parsedUrl.searchParams.get('classId') || '';
+    if (!mem) {
+      return { ok: true, status: 200, data: { memory: null } };
+    }
+    const visibleLessons = classId
+      ? mem.lessons.filter((l) => isLessonAssignedToClass(l, classId))
+      : mem.lessons;
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        memory: {
+          version: mem.version,
+          revision: mem.revision,
+          publishedAt: mem.publishedAt,
+          workspaceId: mem.workspaceId,
+          classesCount: mem.classes.length,
+          lessonsCount: mem.lessons.length,
+          classes: mem.classes,
+          lessons: visibleLessons.map((lesson) => ({
+            ...lesson,
+            questions: lesson.questions.map((q) => ({ ...q, correctAnswer: undefined })),
+          })),
+          notifications: classId
+            ? mem.notifications.filter((n) => n.classId === normalizeClassCode(classId))
+            : mem.notifications,
+        },
       },
     };
   }
@@ -901,6 +995,7 @@ export async function handleLocalApi(
   const isTeacherOnlyPath =
     pathname.startsWith('/api/workspace/') ||
     pathname === '/api/sync/cloud-hydrate' ||
+    pathname === '/api/student-memory/publish' ||
     pathname.startsWith('/api/classes') ||
     pathname.startsWith('/api/lessons') ||
     pathname.startsWith('/api/submissions/');
@@ -917,6 +1012,55 @@ export async function handleLocalApi(
         },
       };
     }
+  }
+
+  // POST /api/student-memory/publish (Teacher-authenticated publish into dedicated Student Public Memory)
+  if (pathname === '/api/student-memory/publish' && method === 'POST') {
+    const store = loadLocalStore(storage);
+    const payload = body as {
+      classes?: ClassRoom[];
+      lessons?: Lesson[];
+      notifications?: PushNotification[];
+      workspaceId?: string;
+      publishedBy?: string;
+    };
+    const nextClasses = Array.isArray(payload.classes) && payload.classes.length > 0
+      ? payload.classes
+      : store.classes;
+    const nextLessons = Array.isArray(payload.lessons) && payload.lessons.length > 0
+      ? payload.lessons
+      : store.lessons;
+    const nextNotifs = Array.isArray(payload.notifications)
+      ? payload.notifications
+      : store.notifications;
+
+    const saved = saveStudentPublicMemory(
+      {
+        classes: nextClasses,
+        lessons: nextLessons,
+        notifications: nextNotifs,
+        workspaceId: payload.workspaceId || store.syncMeta?.workspaceId || activePublicWorkspaceId,
+        publishedBy: payload.publishedBy || store.syncMeta?.ownerEmail,
+      },
+      storage,
+    );
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        ok: true,
+        memory: saved
+          ? {
+              revision: saved.revision,
+              publishedAt: saved.publishedAt,
+              publishedBy: saved.publishedBy,
+              workspaceId: saved.workspaceId,
+              classesCount: saved.classes.length,
+              lessonsCount: saved.lessons.length,
+            }
+          : null,
+      },
+    };
   }
 
   // GET /api/workspace/export
@@ -971,6 +1115,15 @@ export async function handleLocalApi(
     }
 
     saveLocalStore(store, storage);
+    saveStudentPublicMemory(
+      {
+        classes: store.classes,
+        lessons: store.lessons,
+        notifications: store.notifications,
+        workspaceId: store.syncMeta?.workspaceId || activePublicWorkspaceId,
+      },
+      storage,
+    );
     return { ok: true, status: 200, data: { ok: true, importedClasses, importedLessons } };
   }
 
@@ -980,7 +1133,34 @@ export async function handleLocalApi(
     const store = loadLocalStore(storage);
     const syncMeta = applyAuthoritativeCloudHydrate(store, payload);
     saveLocalStore(store, storage);
-    return { ok: true, status: 200, data: { ok: true, syncMeta } };
+    const studentMemory = saveStudentPublicMemory(
+      {
+        classes: store.classes,
+        lessons: store.lessons,
+        notifications: store.notifications,
+        workspaceId: syncMeta.workspaceId,
+        publishedBy: syncMeta.ownerEmail,
+      },
+      storage,
+    );
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        ok: true,
+        syncMeta,
+        studentMemoryMeta: studentMemory
+          ? {
+              revision: studentMemory.revision,
+              publishedAt: studentMemory.publishedAt,
+              publishedBy: studentMemory.publishedBy,
+              workspaceId: studentMemory.workspaceId,
+              classesCount: studentMemory.classes.length,
+              lessonsCount: studentMemory.lessons.length,
+            }
+          : null,
+      },
+    };
   }
 
   // POST /api/classes

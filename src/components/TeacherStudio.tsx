@@ -89,7 +89,13 @@ import {
   isLessonAssignedToClass,
   normalizeClassCode,
 } from '../utils/firestoreHelpers';
+import firebaseConfig from '../../firebase-applet-config.json';
 import type { SyncLedgerMeta } from '../shared/seedData';
+import { fetchPublicWorkspaceSnapshot } from '../utils/publicFirestoreRest';
+import {
+  saveStudentPublicMemory,
+  StudentMemoryMeta,
+} from '../utils/studentPublicMemory';
 import { AdminSecurityPanel } from './AdminSecurityPanel';
 import { AuthErrorBanner } from './AuthErrorBanner';
 import { GoogleDrivePanel } from './GoogleDrivePanel';
@@ -105,6 +111,7 @@ interface TeacherStudioProps {
   submissions?: AnswerSubmission[];
   notifications?: PushNotification[];
   syncMeta?: SyncLedgerMeta | null;
+  studentMemoryMeta?: StudentMemoryMeta | null;
   sharedAppUrl?: string;
   selectedClassId: string;
   onRefreshData: () => Promise<void>;
@@ -127,6 +134,7 @@ export function TeacherStudio({
   submissions = [],
   notifications = [],
   syncMeta = null,
+  studentMemoryMeta = null,
   sharedAppUrl,
   selectedClassId,
   onRefreshData,
@@ -205,8 +213,99 @@ export function TeacherStudio({
   } | null>(null);
   const [publicPublishInfo, setPublicPublishInfo] =
     useState<PublishPublicWorkspaceResult | null>(null);
+  const [localStudentMemMeta, setLocalStudentMemMeta] =
+    useState<StudentMemoryMeta | null>(studentMemoryMeta);
+  const [publishingStudentMem, setPublishingStudentMem] = useState(false);
+  const [incognitoVerify, setIncognitoVerify] = useState<{
+    ok: boolean;
+    workspaceId: string;
+    classesCount: number;
+    lessonsCount: number;
+    checkedAt: string;
+  } | null>(null);
   const cloudSyncingRef = useRef(false);
   const hydratedUidRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (studentMemoryMeta) {
+      setLocalStudentMemMeta(studentMemoryMeta);
+    }
+  }, [studentMemoryMeta]);
+
+  const persistDedicatedStudentMemory = useCallback(
+    async (payload: {
+      classes: ClassRoom[];
+      lessons: Lesson[];
+      notifications: PushNotification[];
+      workspaceId?: string;
+      publishedBy?: string;
+    }): Promise<StudentMemoryMeta | null> => {
+      // 1) Persist directly into browser's dedicated Student Public Memory (independent of Admin session!)
+      const localSaved = saveStudentPublicMemory(payload);
+      let resolvedMeta: StudentMemoryMeta | null = localSaved
+        ? {
+            revision: localSaved.revision,
+            publishedAt: localSaved.publishedAt,
+            publishedBy: localSaved.publishedBy,
+            workspaceId: localSaved.workspaceId,
+            classesCount: localSaved.classes.length,
+            lessonsCount: localSaved.lessons.length,
+          }
+        : null;
+
+      // 2) Persist into server's dedicated data/student-public-memory.json (works for ALL incognito tabs on the server!)
+      try {
+        const res = await apiRequestJson<{ ok?: boolean; memory?: StudentMemoryMeta | null }>(
+          '/api/student-memory/publish',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          },
+          lang,
+        );
+        if (res.ok && res.data?.memory) {
+          resolvedMeta = res.data.memory;
+        }
+      } catch {
+        // Non-fatal: browser dedicated memory still saved
+      }
+
+      if (resolvedMeta) {
+        setLocalStudentMemMeta(resolvedMeta);
+      }
+      return resolvedMeta;
+    },
+    [lang],
+  );
+
+  const verifyZeroLoginCloudRead = useCallback(async () => {
+    try {
+      const snap = await fetchPublicWorkspaceSnapshot(firebaseConfig, null);
+      if (snap && (snap.classes.length > 0 || snap.lessons.length > 0)) {
+        const info = {
+          ok: snap.classes.length > 0 && snap.lessons.length > 0,
+          workspaceId: snap.workspaceId,
+          classesCount: snap.classes.length,
+          lessonsCount: snap.lessons.length,
+          checkedAt: new Date().toISOString(),
+        };
+        setIncognitoVerify(info);
+        return info;
+      }
+      const emptyInfo = {
+        ok: false,
+        workspaceId: 'default',
+        classesCount: 0,
+        lessonsCount: 0,
+        checkedAt: new Date().toISOString(),
+      };
+      setIncognitoVerify(emptyInfo);
+      return emptyInfo;
+    } catch {
+      return null;
+    }
+  }, []);
 
   const [jsonLessonId, setJsonLessonId] = useState<string | null>(null);
   const [revealJsonAnswer, setRevealJsonAnswer] = useState(false);
@@ -301,21 +400,34 @@ export function TeacherStudio({
         ) {
           return null;
         }
+
+        const wsCode = defaultShareCodeForUid(uid);
+        // 1) Always write to website's dedicated Student Public Memory (server + browser) decoupled from Admin
+        await persistDedicatedStudentMemory({
+          classes: nextClasses,
+          lessons: safeLessons,
+          notifications: nextNotifications,
+          workspaceId: wsCode,
+          publishedBy: auth.currentUser?.email ?? undefined,
+        });
+
+        // 2) Publish to Cloud publicWorkspaces (`WS-<uid>` AND `default` with automatic legacy-rules fallback)
         const pubRes = await publishPublicWorkspace(
-          defaultShareCodeForUid(uid),
+          wsCode,
           uid,
           nextClasses,
           safeLessons,
           nextNotifications,
         );
         setPublicPublishInfo(pubRes);
+        await verifyZeroLoginCloudRead();
         if (!pubRes.publishedDefault && pubRes.defaultError) {
           setCloudNotice({
             type: 'err',
             text:
               lang === 'vi'
-                ? `Đã lưu riêng tư nhưng chưa cập nhật được kho công khai (publicWorkspaces/default) cho học sinh không đăng nhập: ${pubRes.defaultError}`
-                : `Saved privately, but failed to publish publicWorkspaces/default for zero-login students: ${pubRes.defaultError}`,
+                ? `Đã ghi vào Bộ nhớ Học sinh nội bộ nhưng chưa cập nhật được kho Cloud mặc định (publicWorkspaces/default) cho học sinh ẩn danh máy khác: ${pubRes.defaultError}`
+                : `Saved to local Student Public Memory, but failed to update Cloud publicWorkspaces/default: ${pubRes.defaultError}`,
           });
         }
         return pubRes;
@@ -330,8 +442,103 @@ export function TeacherStudio({
         return null;
       }
     },
-    [classes, lang, lessons, notifications],
+    [classes, lang, lessons, notifications, persistDedicatedStudentMemory, verifyZeroLoginCloudRead],
   );
+
+  const handlePublishStudentMemoryNow = useCallback(async () => {
+    if (publishingStudentMem) return;
+    setPublishingStudentMem(true);
+    setCloudNotice(null);
+    try {
+      let nextClasses = classes;
+      let nextLessons = lessons;
+      let nextNotifications = notifications;
+      try {
+        const exportRes = await apiRequestJson<{
+          classes?: ClassRoom[];
+          lessons?: Lesson[];
+        }>('/api/workspace/export', {}, lang);
+        if (exportRes.ok && Array.isArray(exportRes.data?.classes) && Array.isArray(exportRes.data?.lessons)) {
+          nextClasses = exportRes.data.classes;
+          nextLessons = exportRes.data.lessons;
+        }
+      } catch {
+        // use props
+      }
+      const realClasses = dedupeById(nextClasses.filter((c) => !isDemoSeedClass(c)));
+      const safeLessons = dedupeById(
+        recoverMissingCorrectAnswers(nextLessons, loadRememberedAiLessons()),
+      );
+      const wsCode = cloudUser ? defaultShareCodeForUid(cloudUser.uid) : 'default';
+
+      const memMeta = await persistDedicatedStudentMemory({
+        classes: realClasses,
+        lessons: safeLessons,
+        notifications: nextNotifications,
+        workspaceId: wsCode,
+        publishedBy: cloudUser?.email ?? undefined,
+      });
+
+      let pubRes: PublishPublicWorkspaceResult | null = null;
+      if (cloudUser && auth.currentUser?.uid === cloudUser.uid && cloudUser.emailVerified) {
+        pubRes = await publishPublicWorkspace(
+          wsCode,
+          cloudUser.uid,
+          realClasses,
+          safeLessons,
+          nextNotifications,
+        );
+        setPublicPublishInfo(pubRes);
+      }
+
+      const verified = await verifyZeroLoginCloudRead();
+      if (pubRes && !pubRes.publishedDefault && pubRes.defaultError) {
+        setCloudNotice({
+          type: 'err',
+          text:
+            lang === 'vi'
+              ? `Đã ghi Bộ nhớ Học sinh nội bộ (#${memMeta?.revision ?? 1}: ${realClasses.length} lớp, ${safeLessons.length} bài), nhưng Cloud công khai (default) bị chặn quyền: ${pubRes.defaultError}. Học sinh máy khác cần mở link kèm ?ws=${wsCode} hoặc Admin chính đăng nhập để mở mặc định.`
+              : `Saved local Student Memory (#${memMeta?.revision ?? 1}), but Cloud default was blocked: ${pubRes.defaultError}.`,
+        });
+      } else if (verified && verified.classesCount > 0 && verified.lessonsCount > 0) {
+        setCloudNotice({
+          type: 'ok',
+          text:
+            lang === 'vi'
+              ? `Đã ghi nhớ vào Bộ nhớ riêng Học sinh (#${memMeta?.revision ?? 1}) & kiểm tra ẩn danh THÀNH CÔNG: Học sinh không cần đăng nhập thấy ngay ${verified.classesCount} lớp và ${verified.lessonsCount} bài học (${verified.workspaceId})!`
+              : `Published to Student Public Memory (#${memMeta?.revision ?? 1}) & verified zero-login access: ${verified.classesCount} classes, ${verified.lessonsCount} lessons (${verified.workspaceId})!`,
+        });
+        window.setTimeout(() => setCloudNotice(null), 7000);
+      } else {
+        setCloudNotice({
+          type: 'ok',
+          text:
+            lang === 'vi'
+              ? `Đã ghi nhớ ${realClasses.length} lớp và ${safeLessons.length} bài học vào Bộ nhớ riêng Học sinh trên trang web (#${memMeta?.revision ?? 1}). Học sinh trên thiết bị/máy chủ này vẫn dùng bình thường ngay cả khi ngắt Admin!`
+              : `Saved ${realClasses.length} classes and ${safeLessons.length} lessons to dedicated Student Public Memory (#${memMeta?.revision ?? 1}).`,
+        });
+        window.setTimeout(() => setCloudNotice(null), 6000);
+      }
+      await onRefreshData();
+    } catch (err) {
+      setCloudNotice({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Lỗi ghi nhớ sang Bộ nhớ Học sinh.',
+      });
+    } finally {
+      setPublishingStudentMem(false);
+    }
+  }, [
+    classes,
+    cloudUser,
+    lang,
+    lessons,
+    notifications,
+    onRefreshData,
+    persistDedicatedStudentMemory,
+    publishingStudentMem,
+    verifyZeroLoginCloudRead,
+  ]);
 
   const syncWithCloud = useCallback(
     async (user: User, manual = false) => {
@@ -348,8 +555,8 @@ export function TeacherStudio({
             type: 'err',
             text:
               lang === 'vi'
-                ? 'Firestore đang ngoại tuyến, dữ liệu vẫn được lưu trên máy chủ cục bộ.'
-                : 'Firestore offline; using local server storage.',
+                ? 'Firestore đang ngoại tuyến, dữ liệu vẫn được lưu trên Bộ nhớ Học sinh nội bộ.'
+                : 'Firestore offline; using dedicated local Student Public Memory.',
           });
           return;
         }
@@ -451,6 +658,15 @@ export function TeacherStudio({
           rememberAiLessons(safeLessons);
         }
 
+        // Mirror immediately into website's dedicated Student Public Memory (works even when Admin disconnects!)
+        await persistDedicatedStudentMemory({
+          classes: effectiveClasses,
+          lessons: effectiveLessons,
+          notifications: freshNotifications,
+          workspaceId: wsCode,
+          publishedBy: user.email ?? undefined,
+        });
+
         const existingLogIds = new Set(cloudData.activityLogs.map((l) => l.id));
         await pushWorkspaceToFirestore(
           user.uid,
@@ -478,6 +694,7 @@ export function TeacherStudio({
           );
           setPublicPublishInfo(pubRes);
         }
+        const verified = await verifyZeroLoginCloudRead();
         hydratedUidRef.current = user.uid;
 
         if (pubRes && !pubRes.publishedDefault && pubRes.defaultError) {
@@ -485,18 +702,22 @@ export function TeacherStudio({
             type: 'err',
             text:
               lang === 'vi'
-                ? `Đã đồng bộ kho riêng tư (${effectiveClasses.length} lớp, ${effectiveLessons.length} bài) nhưng CHƯA xuất bản được kho công khai (default) cho học sinh ẩn danh: ${pubRes.defaultError}. Hãy dùng tài khoản Admin chính hoặc gửi link kèm ?ws=${wsCode}.`
-                : `Synced private store (${effectiveClasses.length} classes, ${effectiveLessons.length} lessons) but failed to publish default public workspace: ${pubRes.defaultError}.`,
+                ? `Đã ghi Bộ nhớ Học sinh nội bộ (${effectiveClasses.length} lớp, ${effectiveLessons.length} bài) nhưng CHƯA cập nhật được Cloud công khai (default) cho học sinh ẩn danh máy khác: ${pubRes.defaultError}. Hãy dùng tài khoản Admin chính hoặc gửi link kèm ?ws=${wsCode}.`
+                : `Saved local Student Memory (${effectiveClasses.length} classes, ${effectiveLessons.length} lessons) but failed to publish default public workspace: ${pubRes.defaultError}.`,
           });
         } else if (manual) {
           setCloudNotice({
             type: 'ok',
             text:
               lang === 'vi'
-                ? `Đã đồng bộ & xuất bản công khai cho học sinh (không cần đăng nhập): ${effectiveClasses.length} lớp thật, ${effectiveLessons.length} bài học, ${freshSubmissions.length} bài làm (default + ${wsCode})!`
-                : `Synced & published for zero-login students: ${effectiveClasses.length} classes, ${effectiveLessons.length} lessons, ${freshSubmissions.length} submissions (default + ${wsCode})!`,
+                ? `Đã đồng bộ & ghi nhớ sang Bộ nhớ Học sinh (${effectiveClasses.length} lớp thật, ${effectiveLessons.length} bài học, ${freshSubmissions.length} bài làm). ${
+                    verified && verified.classesCount > 0
+                      ? `Kiểm tra ẩn danh: thấy ngay ${verified.classesCount} lớp · ${verified.lessonsCount} bài!`
+                      : `Mã chia sẻ: ${wsCode}.`
+                  }`
+                : `Synced & saved to Student Public Memory (${effectiveClasses.length} classes, ${effectiveLessons.length} lessons, ${freshSubmissions.length} submissions).`,
           });
-          window.setTimeout(() => setCloudNotice(null), 6000);
+          window.setTimeout(() => setCloudNotice(null), 7000);
         }
       } catch (err) {
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) {
@@ -511,7 +732,7 @@ export function TeacherStudio({
         setCloudSyncing(false);
       }
     },
-    [lang, onRefreshData],
+    [lang, onRefreshData, persistDedicatedStudentMemory, verifyZeroLoginCloudRead],
   );
 
   const syncWithCloudRef = useRef(syncWithCloud);
@@ -1232,30 +1453,76 @@ export function TeacherStudio({
                     </span>
                   </p>
                 )}
-                {publicPublishInfo && (
+                {localStudentMemMeta && (
+                  <p className="text-[11px] font-medium text-indigo-800 bg-indigo-50 border border-indigo-200 rounded-lg px-2.5 py-1 inline-flex flex-wrap items-center gap-x-1.5 gap-y-0.5 tabular-nums">
+                    <span>
+                      {lang === 'vi'
+                        ? `Bộ nhớ riêng Học sinh #${localStudentMemMeta.revision}: ${localStudentMemMeta.classesCount} lớp · ${localStudentMemMeta.lessonsCount} bài (dùng độc lập khi ngắt Admin)`
+                        : `Student Public Memory #${localStudentMemMeta.revision}: ${localStudentMemMeta.classesCount} classes · ${localStudentMemMeta.lessonsCount} lessons`}
+                    </span>
+                  </p>
+                )}
+                {incognitoVerify ? (
                   <p
                     className={`text-[11px] font-medium rounded-lg px-2.5 py-1 border inline-flex items-center gap-1.5 tabular-nums ${
-                      publicPublishInfo.publishedDefault
+                      incognitoVerify.ok
                         ? 'text-sky-800 bg-sky-50 border-sky-200'
                         : 'text-amber-900 bg-amber-50 border-amber-300'
                     }`}
                   >
                     <span>
-                      {publicPublishInfo.publishedDefault
+                      {incognitoVerify.ok
                         ? lang === 'vi'
-                          ? `Công khai ẩn danh (không cần đăng nhập): ${publicPublishInfo.classesCount} lớp · ${publicPublishInfo.lessonsCount} bài đã mở`
-                          : `Zero-login student view live: ${publicPublishInfo.classesCount} classes · ${publicPublishInfo.lessonsCount} lessons`
+                          ? `Ẩn danh Cloud (${incognitoVerify.workspaceId}): đã xác nhận ${incognitoVerify.classesCount} lớp · ${incognitoVerify.lessonsCount} bài`
+                          : `Incognito Cloud (${incognitoVerify.workspaceId}): verified ${incognitoVerify.classesCount} classes · ${incognitoVerify.lessonsCount} lessons`
                         : lang === 'vi'
-                          ? `Chưa xuất bản mặc định (chỉ có mã ${publicPublishInfo.workspaceId}) — bấm Đồng bộ bằng Admin chính`
-                          : `Default public workspace not updated (${publicPublishInfo.workspaceId} only)`}
+                          ? `Ẩn danh Cloud (${incognitoVerify.workspaceId}): mới có ${incognitoVerify.classesCount} lớp · ${incognitoVerify.lessonsCount} bài — bấm "Ghi nhớ sang Bộ nhớ Học sinh"`
+                          : `Incognito Cloud (${incognitoVerify.workspaceId}): ${incognitoVerify.classesCount} classes · ${incognitoVerify.lessonsCount} lessons`}
                     </span>
                   </p>
+                ) : (
+                  publicPublishInfo && (
+                    <p
+                      className={`text-[11px] font-medium rounded-lg px-2.5 py-1 border inline-flex items-center gap-1.5 tabular-nums ${
+                        publicPublishInfo.publishedDefault
+                          ? 'text-sky-800 bg-sky-50 border-sky-200'
+                          : 'text-amber-900 bg-amber-50 border-amber-300'
+                      }`}
+                    >
+                      <span>
+                        {publicPublishInfo.publishedDefault
+                          ? lang === 'vi'
+                            ? `Công khai ẩn danh (không cần đăng nhập): ${publicPublishInfo.classesCount} lớp · ${publicPublishInfo.lessonsCount} bài đã mở`
+                            : `Zero-login student view live: ${publicPublishInfo.classesCount} classes · ${publicPublishInfo.lessonsCount} lessons`
+                          : lang === 'vi'
+                            ? `Chưa xuất bản mặc định (chỉ có mã ${publicPublishInfo.workspaceId}) — bấm Đồng bộ bằng Admin chính`
+                            : `Default public workspace not updated (${publicPublishInfo.workspaceId} only)`}
+                      </span>
+                    </p>
+                  )
                 )}
               </div>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={publishingStudentMem || cloudSyncing}
+              onClick={handlePublishStudentMemoryNow}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-xl disabled:opacity-50 cursor-pointer"
+            >
+              <CheckCircle2 className={`w-3.5 h-3.5 ${publishingStudentMem ? 'animate-pulse' : ''}`} />
+              <span>
+                {publishingStudentMem
+                  ? lang === 'vi'
+                    ? 'Đang ghi Bộ nhớ Học sinh...'
+                    : 'Publishing Student Memory...'
+                  : lang === 'vi'
+                    ? 'Ghi nhớ sang Bộ nhớ Học sinh'
+                    : 'Save to Student Memory'}
+              </span>
+            </button>
             {cloudUser ? (
               <>
                 <button

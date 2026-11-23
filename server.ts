@@ -60,7 +60,12 @@ import {
   upsertLearnerProfileInStore,
 } from './src/shared/learnerStoreOps';
 import { generateLessonQuestions, QuestionStylePreset } from './server/gemini';
-import { loadStore, saveStore } from './server/store';
+import {
+  loadStore,
+  loadStudentPublicMemoryServer,
+  saveStore,
+  saveStudentPublicMemoryServer,
+} from './server/store';
 import {
   AdminTokenPayload,
   checkPinRateLimit,
@@ -145,6 +150,7 @@ async function hydrateFromPublicWorkspace(
     }
 
     const store = loadStore();
+    const studentMem = loadStudentPublicMemoryServer();
     let changed = false;
 
     if (snapshot && options.replaceContent) {
@@ -157,8 +163,14 @@ async function hydrateFromPublicWorkspace(
       }
       if (snapshot.lessons.length > 0) {
         store.lessons = dedupeById(
-          recoverMissingCorrectAnswers(snapshot.lessons, store.lessons),
+          recoverMissingCorrectAnswers(snapshot.lessons, [
+            ...store.lessons,
+            ...(studentMem?.lessons ?? []),
+          ]),
         );
+        changed = true;
+      } else if (store.lessons.length === 0 && studentMem && studentMem.lessons.length > 0) {
+        store.lessons = dedupeById(studentMem.lessons);
         changed = true;
       }
       if (snapshot.notifications && snapshot.notifications.length > 0) {
@@ -185,6 +197,27 @@ async function hydrateFromPublicWorkspace(
               return { ...n, readByGroupIds: mergedRead };
             }),
         );
+        changed = true;
+      }
+      if (store.classes.length > 0 || store.lessons.length > 0) {
+        saveStudentPublicMemoryServer({
+          classes: store.classes,
+          lessons: store.lessons,
+          notifications: store.notifications,
+          workspaceId: resolvedWsId,
+        });
+      }
+    } else if (!snapshot && options.replaceContent && studentMem) {
+      if (store.classes.length === 0 && studentMem.classes.length > 0) {
+        store.classes = studentMem.classes;
+        changed = true;
+      }
+      if (store.lessons.length === 0 && studentMem.lessons.length > 0) {
+        store.lessons = studentMem.lessons;
+        changed = true;
+      }
+      if (store.notifications.length === 0 && studentMem.notifications.length > 0) {
+        store.notifications = studentMem.notifications;
         changed = true;
       }
     }
@@ -694,6 +727,7 @@ async function startServer() {
       ? rawAppUrl.replace('ais-dev-', 'ais-pre-')
       : rawAppUrl;
 
+    const studentMem = loadStudentPublicMemoryServer();
     res.json({
       classes: store.classes,
       lessons: sanitizedLessons,
@@ -706,8 +740,89 @@ async function startServer() {
       submissionsCount: store.submissions.length,
       activeWorkspaceId: resolvedWsId,
       syncMeta: store.syncMeta ?? null,
+      studentMemoryMeta: studentMem
+        ? {
+            revision: studentMem.revision,
+            publishedAt: studentMem.publishedAt,
+            publishedBy: studentMem.publishedBy,
+            workspaceId: studentMem.workspaceId,
+            classesCount: studentMem.classes.length,
+            lessonsCount: studentMem.lessons.length,
+          }
+        : null,
       sharedAppUrl,
       ...(includeAnswers ? { submissions: store.submissions } : {}),
+    });
+  });
+
+  // Public zero-login read of the website's dedicated Student Public Memory (strictly strips answer keys!)
+  app.get('/api/student-memory', (req, res) => {
+    const mem = loadStudentPublicMemoryServer();
+    const classId = typeof req.query.classId === 'string' ? req.query.classId : '';
+    if (!mem) {
+      res.json({ memory: null });
+      return;
+    }
+    const visibleLessons = classId
+      ? mem.lessons.filter((l) => isLessonAssignedToClass(l, classId))
+      : mem.lessons;
+    res.json({
+      memory: {
+        version: mem.version,
+        revision: mem.revision,
+        publishedAt: mem.publishedAt,
+        workspaceId: mem.workspaceId,
+        classesCount: mem.classes.length,
+        lessonsCount: mem.lessons.length,
+        classes: mem.classes,
+        lessons: visibleLessons.map((lesson) => ({
+          ...lesson,
+          questions: lesson.questions.map((q) => ({ ...q, correctAnswer: undefined })),
+        })),
+        notifications: classId
+          ? mem.notifications.filter((n) => n.classId === normalizeClassCode(classId))
+          : mem.notifications,
+      },
+    });
+  });
+
+  // Teacher-authenticated publish into the website's dedicated Student Public Memory (independent of Admin session!)
+  app.post('/api/student-memory/publish', requireTeacherAuth, (req, res) => {
+    const store = loadStore();
+    const payload = req.body as {
+      classes?: ClassRoom[];
+      lessons?: Lesson[];
+      notifications?: PushNotification[];
+      workspaceId?: string;
+      publishedBy?: string;
+    };
+    const nextClasses =
+      Array.isArray(payload.classes) && payload.classes.length > 0 ? payload.classes : store.classes;
+    const nextLessons =
+      Array.isArray(payload.lessons) && payload.lessons.length > 0 ? payload.lessons : store.lessons;
+    const nextNotifs = Array.isArray(payload.notifications)
+      ? payload.notifications
+      : store.notifications;
+
+    const saved = saveStudentPublicMemoryServer({
+      classes: nextClasses,
+      lessons: nextLessons,
+      notifications: nextNotifs,
+      workspaceId: payload.workspaceId || store.syncMeta?.workspaceId || activePublicWorkspaceId,
+      publishedBy: payload.publishedBy || store.syncMeta?.ownerEmail,
+    });
+    res.json({
+      ok: true,
+      memory: saved
+        ? {
+            revision: saved.revision,
+            publishedAt: saved.publishedAt,
+            publishedBy: saved.publishedBy,
+            workspaceId: saved.workspaceId,
+            classesCount: saved.classes.length,
+            lessonsCount: saved.lessons.length,
+          }
+        : null,
     });
   });
 
@@ -1065,9 +1180,26 @@ async function startServer() {
     const store = loadStore();
     const syncMeta = applyAuthoritativeCloudHydrate(store, payload);
     saveStore(store);
+    const studentMemory = saveStudentPublicMemoryServer({
+      classes: store.classes,
+      lessons: store.lessons,
+      notifications: store.notifications,
+      workspaceId: syncMeta.workspaceId,
+      publishedBy: syncMeta.ownerEmail,
+    });
     res.json({
       ok: true,
       syncMeta,
+      studentMemoryMeta: studentMemory
+        ? {
+            revision: studentMemory.revision,
+            publishedAt: studentMemory.publishedAt,
+            publishedBy: studentMemory.publishedBy,
+            workspaceId: studentMemory.workspaceId,
+            classesCount: studentMemory.classes.length,
+            lessonsCount: studentMemory.lessons.length,
+          }
+        : null,
       counts: {
         classes: store.classes.length,
         lessons: store.lessons.length,

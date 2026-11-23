@@ -1583,6 +1583,111 @@ test('incognito student selecting LOP-9-5 sees lessons with zero login even when
   );
 });
 
+test('dedicated Student Public Memory serves classes & lessons to students with zero login even when Admin disconnects and Cloud is offline', async () => {
+  await withMockFetch(
+    () => new Response(JSON.stringify({}), { status: 404 }),
+    async () => {
+      resetLocalHydrationCache();
+      const backing = new Map<string, string>();
+      const storage = {
+        getItem: (k: string) => backing.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          backing.set(k, v);
+        },
+      };
+
+      const token = await seedAuthenticatedTeacherToken(storage);
+
+      // 1) Admin publishes classes + lessons into the website's dedicated Student Public Memory
+      const pubRes = await handleLocalApi(
+        '/api/student-memory/publish',
+        {
+          method: 'POST',
+          authToken: token,
+          body: JSON.stringify({
+            workspaceId: 'WS-TEACHER-REAL',
+            publishedBy: 'huynh.nhu.y1601@gmail.com',
+            classes: [
+              {
+                id: 'LOP-9-5',
+                name: 'Lớp 9/5',
+                grade: 'Khối 9',
+                teacherName: 'Cô Huỳnh Như Ý',
+                createdAt: '2026-11-23T00:00:00Z',
+              },
+            ],
+            lessons: [
+              {
+                id: 'lesson-95-student-mem',
+                title: 'Kỹ năng số lớp 9-5',
+                topic: 'Công dân số',
+                sourceFileName: 'bai95.txt',
+                summary: 'Lưu trong bộ nhớ riêng học sinh',
+                assignedClassIds: ['LOP-9-5'],
+                createdAt: '2026-11-23T00:00:00Z',
+                questions: [
+                  {
+                    id: 'q-sm-1',
+                    type: 'multiple_choice',
+                    questionText: 'Nên bảo mật tài khoản bằng cách nào?',
+                    options: ['Xác thực 2 bước (2FA)', 'Đặt mật khẩu 123456'],
+                    aiSearchKeywordHint: '2FA',
+                    correctAnswer: 'Xác thực 2 bước (2FA)',
+                    competencyId: '4.1',
+                    competencyIds: ['4.1'],
+                    explanation: '2FA tăng cường bảo mật.',
+                  },
+                ],
+              },
+            ],
+          }),
+        },
+        storage,
+      );
+      assert.equal(pubRes.ok, true);
+      assert.ok(backing.has('edubot_student_public_memory_v1'));
+
+      // 2) Simulate Admin disconnected + primary store & sync cache cleared + Cloud offline (404)
+      backing.delete('edubot_static_store_v1');
+      backing.delete('edubot_cloud_sync_snapshot_v1');
+      resetLocalHydrationCache();
+
+      // 3) Unauthenticated student opens Student Portal for LOP-9-5 -> STILL works seamlessly!
+      const studentBoot = await handleLocalApi(
+        '/api/bootstrap?classId=LOP-9-5&lang=vi&role=student&refresh=1',
+        { method: 'GET' },
+        storage,
+      );
+      assert.equal(studentBoot.ok, true);
+      const bootData = studentBoot.data as {
+        classes: Array<{ id: string }>;
+        lessons: Array<{ id: string; questions: Array<{ correctAnswer?: string }> }>;
+        studentMemoryMeta: { revision: number; classesCount: number; lessonsCount: number } | null;
+      };
+      assert.deepEqual(
+        bootData.classes.map((c) => c.id),
+        ['LOP-9-5'],
+      );
+      assert.equal(bootData.lessons.length, 1);
+      assert.equal(bootData.lessons[0].id, 'lesson-95-student-mem');
+      assert.equal(bootData.lessons[0].questions[0].correctAnswer, undefined);
+      assert.equal(bootData.studentMemoryMeta?.classesCount, 1);
+      assert.equal(bootData.studentMemoryMeta?.lessonsCount, 1);
+
+      // 4) Public GET /api/student-memory?classId=LOP-9-5 also returns stripped lessons without Admin token
+      const memRes = await handleLocalApi('/api/student-memory?classId=LOP-9-5', { method: 'GET' }, storage);
+      assert.equal(memRes.ok, true);
+      const memData = (memRes.data as {
+        memory: { classes: Array<{ id: string }>; lessons: Array<{ id: string; questions: Array<{ correctAnswer?: string }> }> };
+      }).memory;
+      assert.equal(memData.classes[0].id, 'LOP-9-5');
+      assert.equal(memData.lessons[0].id, 'lesson-95-student-mem');
+      assert.equal(memData.lessons[0].questions[0].correctAnswer, undefined);
+    },
+  );
+});
+
+
 
 
 

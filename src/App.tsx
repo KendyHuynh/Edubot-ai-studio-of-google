@@ -44,6 +44,7 @@ import {
 import { apiRequestJson } from './utils/apiClient';
 import { clearAdminSession, getAdminToken } from './utils/authSession';
 import { AppPortal, parseEntryParams } from './utils/routing';
+import type { StudentMemoryMeta } from './utils/studentPublicMemory';
 
 interface BootstrapResponse {
   classes: ClassRoom[];
@@ -56,6 +57,7 @@ interface BootstrapResponse {
   groupProgress?: Record<string, GroupLessonProgress>;
   submissions?: AnswerSubmission[];
   syncMeta?: SyncLedgerMeta | null;
+  studentMemoryMeta?: StudentMemoryMeta | null;
   sharedAppUrl?: string;
 }
 
@@ -121,6 +123,7 @@ export default function App() {
   const [activityLogs, setActivityLogs] = useState<ActivityLog[]>([]);
   const [submissions, setSubmissions] = useState<AnswerSubmission[]>([]);
   const [syncMeta, setSyncMeta] = useState<SyncLedgerMeta | null>(null);
+  const [studentMemoryMeta, setStudentMemoryMeta] = useState<StudentMemoryMeta | null>(null);
   const [sharedAppUrl, setSharedAppUrl] = useState<string>('');
   const [workspaceCode, setWorkspaceCode] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null;
@@ -216,6 +219,9 @@ export default function App() {
         }
         if (data.syncMeta !== undefined) {
           setSyncMeta(data.syncMeta ?? null);
+        }
+        if (data.studentMemoryMeta !== undefined) {
+          setStudentMemoryMeta(data.studentMemoryMeta ?? null);
         }
         if (data.submissions) {
           setSubmissions(data.submissions);
@@ -644,6 +650,7 @@ export default function App() {
               submissions={submissions}
               notifications={notifications}
               syncMeta={syncMeta}
+              studentMemoryMeta={studentMemoryMeta}
               sharedAppUrl={sharedAppUrl}
               selectedClassId={activeClassId}
               onRefreshData={() => fetchBootstrap(true)}

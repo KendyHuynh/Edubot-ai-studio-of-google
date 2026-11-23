@@ -682,6 +682,24 @@ export function defaultShareCodeForUid(uid: string): string {
   return `WS-${toFirestoreDocId(uid, 12).toUpperCase()}`;
 }
 
+function compactLessonsForPublicDoc(
+  cleanLessons: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  return cleanLessons.slice(0, 60).map((l) => {
+    const qs = Array.isArray(l.questions) ? (l.questions as Array<Record<string, unknown>>) : [];
+    return {
+      ...l,
+      summary: String(l.summary ?? '').slice(0, 400),
+      questions: qs.slice(0, 25).map((q) => ({
+        ...q,
+        questionText: String(q.questionText ?? '').slice(0, 450),
+        aiSearchKeywordHint: String(q.aiSearchKeywordHint ?? '').slice(0, 120),
+        explanation: String(q.explanation ?? '').slice(0, 280),
+      })),
+    };
+  });
+}
+
 async function writeSinglePublicWorkspaceDoc(
   docId: string,
   ownerUid: string,
@@ -692,23 +710,48 @@ async function writeSinglePublicWorkspaceDoc(
   const ref = doc(db, 'publicWorkspaces', docId);
   const snap = await getDoc(ref);
   if (!isActiveOwner(ownerUid)) return;
-  if (!snap.exists()) {
-    await setDoc(ref, {
-      id: docId,
-      ownerUid,
-      classes: cleanClasses,
-      lessons: cleanLessons,
-      notifications: cleanNotifications,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } else {
-    await updateDoc(ref, {
-      classes: cleanClasses,
-      lessons: cleanLessons,
-      notifications: cleanNotifications,
-      updatedAt: serverTimestamp(),
-    });
+
+  const attemptWrite = async (
+    lessonsPayload: Array<Record<string, unknown>>,
+    includeNotifications: boolean,
+  ): Promise<void> => {
+    if (!snap.exists()) {
+      await setDoc(ref, {
+        id: docId,
+        ownerUid,
+        classes: cleanClasses,
+        lessons: lessonsPayload,
+        ...(includeNotifications ? { notifications: cleanNotifications } : {}),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(ref, {
+        classes: cleanClasses,
+        lessons: lessonsPayload,
+        ...(includeNotifications ? { notifications: cleanNotifications } : {}),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  };
+
+  try {
+    await attemptWrite(cleanLessons, true);
+    return;
+  } catch (firstErr) {
+    // Fallback 1: retry WITHOUT `notifications` in case deployed firestore.rules still uses legacy key allowlist
+    try {
+      await attemptWrite(cleanLessons, false);
+      return;
+    } catch {
+      // Fallback 2: retry with compacted lessons in case document exceeded Firestore 1 MiB limit
+      try {
+        await attemptWrite(compactLessonsForPublicDoc(cleanLessons), false);
+        return;
+      } catch {
+        throw firstErr;
+      }
+    }
   }
 }
 
