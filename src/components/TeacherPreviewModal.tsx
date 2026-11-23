@@ -16,7 +16,9 @@ import {
   AnswerMatchTier,
   calculatePoints,
   evaluateAnswerMatch,
+  formatTrueFalseMultiAnswer,
   getTimingRuleForQuestionType,
+  parseTrueFalseMultiAnswer,
 } from '../shared/scoring';
 import { Language, Lesson, Question } from '../shared/types';
 
@@ -52,6 +54,7 @@ export function TeacherPreviewModal({
 }: TeacherPreviewModalProps) {
   const [questionIndex, setQuestionIndex] = useState(0);
   const [selectedOption, setSelectedOption] = useState('');
+  const [tfMultiSelections, setTfMultiSelections] = useState<Array<boolean | null>>([]);
   const [textAnswer, setTextAnswer] = useState('');
   const [showKey, setShowKey] = useState(true);
   const [results, setResults] = useState<Record<string, SandboxResult>>({});
@@ -66,17 +69,30 @@ export function TeacherPreviewModal({
   useEffect(() => {
     startTimeRef.current = Date.now();
     setElapsedMs(0);
+    const stmtCount =
+      currentQuestion?.type === 'true_false_multi'
+        ? currentQuestion.options?.length ?? 0
+        : 0;
     if (currentQuestion && results[currentQuestion.id]) {
       const prev = results[currentQuestion.id];
-      if (currentQuestion.type === 'multiple_choice') {
+      if (currentQuestion.type === 'multiple_choice' || currentQuestion.type === 'true_false') {
         setSelectedOption(prev.userAnswer);
+        setTfMultiSelections([]);
+        setTextAnswer('');
+      } else if (currentQuestion.type === 'true_false_multi') {
+        setTfMultiSelections(parseTrueFalseMultiAnswer(prev.userAnswer, stmtCount));
+        setSelectedOption('');
         setTextAnswer('');
       } else {
         setTextAnswer(prev.userAnswer);
         setSelectedOption('');
+        setTfMultiSelections([]);
       }
     } else {
       setSelectedOption('');
+      setTfMultiSelections(
+        stmtCount > 0 ? new Array<boolean | null>(stmtCount).fill(null) : [],
+      );
       setTextAnswer('');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -90,8 +106,21 @@ export function TeacherPreviewModal({
     return () => window.clearInterval(timer);
   }, [currentQuestion, currentResult, finished]);
 
+  const tfStatements =
+    currentQuestion?.type === 'true_false_multi' ? currentQuestion.options ?? [] : [];
+  const allTfMultiSelected =
+    tfStatements.length > 0 &&
+    tfMultiSelections.length === tfStatements.length &&
+    tfMultiSelections.every((v) => v !== null);
+
   const answerValue =
-    currentQuestion?.type === 'multiple_choice' ? selectedOption : textAnswer;
+    currentQuestion?.type === 'multiple_choice' || currentQuestion?.type === 'true_false'
+      ? selectedOption
+      : currentQuestion?.type === 'true_false_multi'
+        ? allTfMultiSelected
+          ? formatTrueFalseMultiAnswer(tfMultiSelections)
+          : ''
+        : textAnswer;
 
   const handleCheckAnswer = (e: React.FormEvent) => {
     e.preventDefault();
@@ -133,6 +162,11 @@ export function TeacherPreviewModal({
       return next;
     });
     setSelectedOption('');
+    setTfMultiSelections(
+      currentQuestion.type === 'true_false_multi'
+        ? new Array<boolean | null>(currentQuestion.options?.length ?? 0).fill(null)
+        : [],
+    );
     setTextAnswer('');
     startTimeRef.current = Date.now();
     setElapsedMs(0);
@@ -143,6 +177,12 @@ export function TeacherPreviewModal({
     setQuestionIndex(0);
     setFinished(false);
     setSelectedOption('');
+    const firstQ = lesson.questions[0];
+    setTfMultiSelections(
+      firstQ?.type === 'true_false_multi'
+        ? new Array<boolean | null>(firstQ.options?.length ?? 0).fill(null)
+        : [],
+    );
     setTextAnswer('');
     startTimeRef.current = Date.now();
     setElapsedMs(0);
@@ -309,13 +349,21 @@ export function TeacherPreviewModal({
                       ? lang === 'vi'
                         ? 'Trắc nghiệm'
                         : 'Multiple Choice'
-                      : currentQuestion.type === 'fill_blank'
+                      : currentQuestion.type === 'true_false'
                         ? lang === 'vi'
-                          ? 'Điền khuyết'
-                          : 'Fill Blank'
-                        : lang === 'vi'
-                          ? 'Trả lời ngắn'
-                          : 'Short Answer'}
+                          ? 'Đúng / Sai'
+                          : 'True / False'
+                        : currentQuestion.type === 'true_false_multi'
+                          ? lang === 'vi'
+                            ? 'Đánh giá Đúng / Sai nâng cao'
+                            : 'Advanced True / False'
+                          : currentQuestion.type === 'fill_blank'
+                            ? lang === 'vi'
+                              ? 'Điền khuyết'
+                              : 'Fill Blank'
+                            : lang === 'vi'
+                              ? 'Trả lời ngắn'
+                              : 'Short Answer'}
                   </span>
                   <span aria-hidden="true">·</span>
                   {(() => {
@@ -353,11 +401,18 @@ export function TeacherPreviewModal({
                       {currentQuestion.correctAnswer || '(Chưa có đáp án)'}
                     </span>
                   </p>
-                  {currentQuestion.type !== 'multiple_choice' && (
+                  {(currentQuestion.type === 'fill_blank' || currentQuestion.type === 'short_answer') && (
                     <p className="text-sky-800">
                       {lang === 'vi'
                         ? 'Mẹo kiểm thử: Thầy/cô có thể nhập thử từ đồng nghĩa, không dấu hoặc hơi sai chính tả để kiểm tra hệ thống tự chấm linh hoạt.'
                         : 'Tip: Try typing synonyms, unaccented Vietnamese, or minor typos to verify flexible grading.'}
+                    </p>
+                  )}
+                  {currentQuestion.type === 'true_false_multi' && (
+                    <p className="text-sky-800">
+                      {lang === 'vi'
+                        ? 'Mẹo kiểm thử: Hệ thống tự động chia điểm tỷ lệ theo số nhận định đúng (VD: đúng 3/4 nhận 75% điểm, đúng 4/4 nhận 100% điểm).'
+                        : 'Tip: Proportional partial credit is awarded automatically based on the number of correct statements.'}
                     </p>
                   )}
                 </div>
@@ -392,6 +447,103 @@ export function TeacherPreviewModal({
                           </span>
                           <span className="text-sm font-medium leading-snug">{opt}</span>
                         </button>
+                      );
+                    })}
+                  </div>
+                ) : currentQuestion.type === 'true_false' ? (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {[
+                      { val: 'Đúng', labelVi: 'ĐÚNG · Chính xác', labelEn: 'TRUE · Accurate', isTrue: true },
+                      { val: 'Sai', labelVi: 'SAI · Không chính xác', labelEn: 'FALSE · Inaccurate', isTrue: false },
+                    ].map((btn) => {
+                      const chosen = selectedOption === btn.val;
+                      return (
+                        <button
+                          key={btn.val}
+                          type="button"
+                          disabled={Boolean(currentResult)}
+                          onClick={() => setSelectedOption(btn.val)}
+                          className={`p-4 rounded-xl border-2 font-bold text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:cursor-default ${
+                            chosen
+                              ? btn.isTrue
+                                ? 'bg-emerald-600 border-emerald-600 text-white'
+                                : 'bg-rose-600 border-rose-600 text-white'
+                              : btn.isTrue
+                                ? 'bg-white border-slate-200 hover:border-emerald-400 text-slate-800'
+                                : 'bg-white border-slate-200 hover:border-rose-400 text-slate-800'
+                          }`}
+                        >
+                          {btn.isTrue ? (
+                            <CheckCircle2 className="w-4 h-4" />
+                          ) : (
+                            <XCircle className="w-4 h-4" />
+                          )}
+                          <span>{lang === 'vi' ? btn.labelVi : btn.labelEn}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : currentQuestion.type === 'true_false_multi' && tfStatements.length > 0 ? (
+                  <div className="space-y-2.5">
+                    {tfStatements.map((stmt, idx) => {
+                      const chosenVal = tfMultiSelections[idx] ?? null;
+                      const letter = String.fromCharCode(97 + idx);
+                      return (
+                        <div
+                          key={`${currentQuestion.id}-sb-stmt-${idx}`}
+                          className="rounded-xl border border-slate-200 bg-slate-50/70 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
+                        >
+                          <div className="flex items-start gap-2 min-w-0">
+                            <span className="w-6 h-6 rounded-md bg-sky-100 text-sky-800 font-bold text-xs flex items-center justify-center shrink-0 uppercase">
+                              {letter}
+                            </span>
+                            <p className="text-sm text-slate-900 font-medium leading-snug">{stmt}</p>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                            <button
+                              type="button"
+                              disabled={Boolean(currentResult)}
+                              onClick={() =>
+                                setTfMultiSelections((prev) => {
+                                  const next =
+                                    prev.length === tfStatements.length
+                                      ? [...prev]
+                                      : new Array<boolean | null>(tfStatements.length).fill(null);
+                                  next[idx] = true;
+                                  return next;
+                                })
+                              }
+                              className={`px-3 py-1.5 rounded-lg border-2 text-xs font-bold cursor-pointer disabled:cursor-default ${
+                                chosenVal === true
+                                  ? 'bg-emerald-600 border-emerald-600 text-white'
+                                  : 'bg-white border-slate-200 hover:border-emerald-400 text-slate-700'
+                              }`}
+                            >
+                              {lang === 'vi' ? 'Đúng' : 'True'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={Boolean(currentResult)}
+                              onClick={() =>
+                                setTfMultiSelections((prev) => {
+                                  const next =
+                                    prev.length === tfStatements.length
+                                      ? [...prev]
+                                      : new Array<boolean | null>(tfStatements.length).fill(null);
+                                  next[idx] = false;
+                                  return next;
+                                })
+                              }
+                              className={`px-3 py-1.5 rounded-lg border-2 text-xs font-bold cursor-pointer disabled:cursor-default ${
+                                chosenVal === false
+                                  ? 'bg-rose-600 border-rose-600 text-white'
+                                  : 'bg-white border-slate-200 hover:border-rose-400 text-slate-700'
+                              }`}
+                            >
+                              {lang === 'vi' ? 'Sai' : 'False'}
+                            </button>
+                          </div>
+                        </div>
                       );
                     })}
                   </div>

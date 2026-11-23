@@ -71,6 +71,49 @@ test('sanitizeLessonFieldsForFirestore removes undefined options on fill_blank a
   assert.equal('options' in sanitized.questions[1], false);
 });
 
+test('sanitizeLessonFieldsForFirestore preserves true_false and true_false_multi types with options arrays', () => {
+  const tfLesson: Lesson = {
+    id: 'lesson-tf-test',
+    title: 'Đánh giá thông tin nâng cao',
+    topic: 'Kiểm chứng thông tin số',
+    sourceFileName: 'tf.txt',
+    summary: 'Bài tập Đúng/Sai',
+    assignedClassIds: ['LOP-8A'],
+    createdAt: '2026-11-22T00:00:00.000Z',
+    questions: [
+      {
+        id: 'q-tfm-1',
+        type: 'true_false_multi',
+        questionText: 'Đánh giá 4 nhận định sau về tin tức mạng:',
+        options: ['Ý a', 'Ý b', 'Ý c', 'Ý d'],
+        aiSearchKeywordHint: 'kiểm chứng thông tin số',
+        correctAnswer: 'a:Sai | b:Đúng | c:Đúng | d:Sai',
+        competencyId: '1.2',
+        competencyIds: ['1.2'],
+        explanation: 'Giải thích chuẩn.',
+      },
+      {
+        id: 'q-tf-2',
+        type: 'true_false',
+        questionText: 'Mọi bài viết nhiều lượt thích đều chính xác.',
+        options: ['Đúng', 'Sai'],
+        aiSearchKeywordHint: 'đánh giá độ tin cậy',
+        correctAnswer: 'Sai',
+        competencyId: '1.2',
+        competencyIds: ['1.2'],
+        explanation: 'Lượt thích không chứng minh độ chính xác.',
+      },
+    ],
+  };
+
+  const sanitized = sanitizeLessonFieldsForFirestore(tfLesson, 'lesson-tf-test');
+  assert.equal(sanitized.questions[0].type, 'true_false_multi');
+  assert.deepEqual(sanitized.questions[0].options, ['Ý a', 'Ý b', 'Ý c', 'Ý d']);
+  assert.equal(sanitized.questions[0].correctAnswer, 'a:Sai | b:Đúng | c:Đúng | d:Sai');
+  assert.equal(sanitized.questions[1].type, 'true_false');
+  assert.deepEqual(sanitized.questions[1].options, ['Đúng', 'Sai']);
+});
+
 test('toFirestoreRestValue and fromFirestoreRestValue round-trip nested data cleanly', () => {
   const original = {
     id: 'LOP-8A',

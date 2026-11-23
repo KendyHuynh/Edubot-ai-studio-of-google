@@ -1178,5 +1178,142 @@ test('localStoreApi requires verified Google login (rejects guest with 401) and 
   );
 });
 
+test('localStoreApi saves true_false and true_false_multi via PUT /api/lessons/:id and grades proportional partial credit accurately', async () => {
+  await withMockFetch(
+    () => new Response(JSON.stringify({}), { status: 404 }),
+    async () => {
+      const storage = createMemoryStorage();
+      const token = await seedAuthenticatedTeacherToken(storage);
+
+      // Update seed lesson-ai-search with a true_false_multi (4 statements) and a single true_false question
+      const putRes = await handleLocalApi(
+        '/api/lessons/lesson-ai-search',
+        {
+          method: 'PUT',
+          authToken: token,
+          body: JSON.stringify({
+            title: 'Bài 2: Đánh giá thông tin nâng cao',
+            topic: 'Đánh giá thông tin số',
+            summary: 'Luyện tập dạng Đúng/Sai nâng cao',
+            questions: [
+              {
+                id: 'q-tfm-test',
+                type: 'true_false_multi',
+                questionText: 'Một bài đăng trên mạng khẳng định nước chanh chữa khỏi mọi bệnh. Đánh giá các nhận định sau:',
+                options: [
+                  'Bài đăng có nhiều lượt chia sẻ nên chắc chắn đúng.',
+                  'Cần đối chiếu với trang web chính thức của Bộ Y tế hoặc WHO.',
+                  'Không nên chia sẻ lại khi chưa kiểm chứng nguồn tin.',
+                  'Chỉ cần đọc tiêu đề là đủ để tin tưởng.',
+                ],
+                aiSearchKeywordHint: 'kiểm chứng thông tin sức khỏe đáng tin cậy',
+                correctAnswer: 'a:Sai | b:Đúng | c:Đúng | d:Sai',
+                competencyId: '1.2',
+                competencyIds: ['1.2'],
+                explanation: 'Luôn kiểm tra nguồn y tế chính thống trước khi tin hoặc chia sẻ.',
+              },
+              {
+                id: 'q-tf-single-test',
+                type: 'true_false',
+                questionText: 'Khi tra cứu bằng AI, học sinh vẫn cần kiểm chứng lại các con số và trích dẫn.',
+                options: ['Đúng', 'Sai'],
+                aiSearchKeywordHint: 'kiểm chứng thông tin AI tạo ra',
+                correctAnswer: 'Đúng',
+                competencyId: '6.2',
+                competencyIds: ['6.2'],
+                explanation: 'AI có thể tạo thông tin chưa chính xác nên cần kiểm chứng.',
+              },
+            ],
+          }),
+        },
+        storage,
+      );
+      assert.equal(putRes.ok, true);
+      const updated = (putRes.data as { lesson: { questions: Array<{ type: string; options?: string[] }> } }).lesson;
+      assert.equal(updated.questions[0].type, 'true_false_multi');
+      assert.equal(updated.questions[0].options?.length, 4);
+      assert.equal(updated.questions[1].type, 'true_false');
+      assert.deepEqual(updated.questions[1].options, ['Đúng', 'Sai']);
+
+      // Group 1 gets 3/4 statements right on true_false_multi -> 75% partial credit (75 base + 38 speed = 113)
+      const subPartial = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-5A',
+            tabletNumber: 1,
+            groupName: 'Nhóm 3/4',
+            lessonId: 'lesson-ai-search',
+            questionId: 'q-tfm-test',
+            userAnswer: 'a:Sai | b:Đúng | c:Đúng | d:Đúng',
+            elapsedMs: 20000,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(subPartial.ok, true);
+      const pData = subPartial.data as {
+        submission: { isCorrect: boolean; basePoints: number; speedBonus: number; totalPoints: number; feedbackText: string };
+      };
+      assert.equal(pData.submission.isCorrect, true);
+      assert.equal(pData.submission.basePoints, 75);
+      assert.equal(pData.submission.speedBonus, 38);
+      assert.equal(pData.submission.totalPoints, 113);
+      assert.match(pData.submission.feedbackText, /3\/4 nhận định/);
+
+      // Group 2 gets 4/4 statements right -> 100% credit (100 base + 50 speed = 150)
+      const subFull = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-5A',
+            tabletNumber: 2,
+            groupName: 'Nhóm 4/4',
+            lessonId: 'lesson-ai-search',
+            questionId: 'q-tfm-test',
+            userAnswer: 'a:Sai | b:Đúng | c:Đúng | d:Sai',
+            elapsedMs: 18000,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(subFull.ok, true);
+      const fData = subFull.data as {
+        submission: { isCorrect: boolean; basePoints: number; totalPoints: number };
+      };
+      assert.equal(fData.submission.isCorrect, true);
+      assert.equal(fData.submission.basePoints, 100);
+      assert.equal(fData.submission.totalPoints, 150);
+
+      // Group 2 answers single true_false correctly -> 100% credit
+      const subSingle = await handleLocalApi(
+        '/api/quiz/submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            classId: 'LOP-5A',
+            tabletNumber: 2,
+            groupName: 'Nhóm 4/4',
+            lessonId: 'lesson-ai-search',
+            questionId: 'q-tf-single-test',
+            userAnswer: 'Đúng',
+            elapsedMs: 10000,
+            lang: 'vi',
+          }),
+        },
+        storage,
+      );
+      assert.equal(subSingle.ok, true);
+      const sData = subSingle.data as { submission: { isCorrect: boolean; totalPoints: number } };
+      assert.equal(sData.submission.isCorrect, true);
+      assert.equal(sData.submission.totalPoints, 150);
+    },
+  );
+});
+
 
 

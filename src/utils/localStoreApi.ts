@@ -1127,13 +1127,18 @@ export async function handleLocalApi(
           ? q.competencyIds
           : [q.competencyId || '1.1'];
       const qType: QuestionType =
-        q.type === 'fill_blank' || q.type === 'short_answer'
+        q.type === 'fill_blank' ||
+        q.type === 'short_answer' ||
+        q.type === 'true_false' ||
+        q.type === 'true_false_multi'
           ? q.type
           : 'multiple_choice';
       const cleanedOptions =
-        qType === 'multiple_choice'
+        qType === 'multiple_choice' || qType === 'true_false_multi'
           ? (q.options ?? []).map((opt) => opt.trim()).filter(Boolean)
-          : undefined;
+          : qType === 'true_false'
+            ? ['Đúng', 'Sai']
+            : undefined;
       return {
         id: q.id?.trim() || `${lessonId}-q${idx + 1}`,
         type: qType,

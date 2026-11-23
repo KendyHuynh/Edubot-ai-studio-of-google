@@ -136,8 +136,12 @@ export function TeacherStudio({
   const [mimeType, setMimeType] = useState<string | undefined>(undefined);
   const [questionCount, setQuestionCount] = useState(15);
   const [questionStyle, setQuestionStyle] = useState<
-    'multiple_choice_only' | 'mc_and_blank' | 'mixed'
-  >('multiple_choice_only');
+    | 'mc_and_true_false'
+    | 'true_false_focus'
+    | 'multiple_choice_only'
+    | 'mc_and_blank'
+    | 'mixed'
+  >('mc_and_true_false');
   const [targetClassIds, setTargetClassIds] = useState<string[]>(() => {
     const initial = selectedClassId || classes[0]?.id;
     return initial ? [initial] : [];
@@ -1250,11 +1254,26 @@ export function TeacherStudio({
                 value={questionStyle}
                 onChange={(e) =>
                   setQuestionStyle(
-                    e.target.value as 'multiple_choice_only' | 'mc_and_blank' | 'mixed',
+                    e.target.value as
+                      | 'mc_and_true_false'
+                      | 'true_false_focus'
+                      | 'multiple_choice_only'
+                      | 'mc_and_blank'
+                      | 'mixed',
                   )
                 }
                 className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-sky-500"
               >
+                <option value="mc_and_true_false">
+                  {lang === 'vi'
+                    ? 'Trắc nghiệm 4 đáp án + Đánh giá thông tin Đúng / Sai (1 ý & 4 ý a–d) — Khuyên dùng'
+                    : 'Multiple Choice + True/False Evaluation (Single & 4-Statement a–d) — Recommended'}
+                </option>
+                <option value="true_false_focus">
+                  {lang === 'vi'
+                    ? 'Chuyên sâu Đánh giá thông tin nâng cao · Đúng / Sai (Đơn & 4 nhận định a–d chuẩn GDPT 2018)'
+                    : 'Advanced Info Evaluation · True/False Focus (Single & 4-Statement a–d)'}
+                </option>
                 <option value="multiple_choice_only">
                   {lang === 'vi'
                     ? '100% Trắc nghiệm 4 đáp án (Chấm chuẩn tuyệt đối, không cần AI)'
@@ -1267,8 +1286,8 @@ export function TeacherStudio({
                 </option>
                 <option value="mixed">
                   {lang === 'vi'
-                    ? 'Đa dạng (Trắc nghiệm + Điền khuyết + Câu ngắn chấm từ khóa sẵn)'
-                    : 'Mixed (MC + Fill-Blank + Keyword-keyed Short Answer)'}
+                    ? 'Đa dạng tất cả (Trắc nghiệm + Đúng/Sai nâng cao + Điền khuyết + Câu ngắn)'
+                    : 'All Formats Mixed (MC + True/False + Fill-Blank + Short Answer)'}
                 </option>
               </select>
               <p className="text-[11px] text-slate-500 leading-relaxed">

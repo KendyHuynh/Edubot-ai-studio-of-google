@@ -693,9 +693,99 @@ function evaluateSingleKeyVariant(
   return miss;
 }
 
+const TF_STATEMENT_LETTERS = ['a', 'b', 'c', 'd', 'e', 'f'];
+
+/**
+ * Parses a single True/False token in Vietnamese or English ("Đúng"/"Sai", "True"/"False", "Đ"/"S").
+ */
+export function parseTrueFalseToken(raw: string): boolean | null {
+  const folded = stripVietnameseDiacritics(raw).replace(/^[a-f][.):\-\s]+/, '').trim();
+  if (!folded) return null;
+  if (
+    folded === 'dung' ||
+    folded === 'true' ||
+    folded === 't' ||
+    folded === 'd' ||
+    folded === 'yes' ||
+    folded === '1' ||
+    folded === 'chinh xac' ||
+    folded.startsWith('dung ')
+  ) {
+    return true;
+  }
+  if (
+    folded === 'sai' ||
+    folded === 'false' ||
+    folded === 'f' ||
+    folded === 's' ||
+    folded === 'no' ||
+    folded === '0' ||
+    folded === 'khong dung' ||
+    folded.startsWith('sai ')
+  ) {
+    return false;
+  }
+  return null;
+}
+
+/**
+ * Parses a multi-statement True/False answer string such as:
+ * "a:Đúng | b:Sai | c:Đúng | d:Sai" or "Đúng | Sai | Đúng | Sai" or "D, S, D, S".
+ */
+export function parseTrueFalseMultiAnswer(
+  raw: string,
+  expectedCount?: number,
+): Array<boolean | null> {
+  const trimmed = (raw ?? '').trim();
+  if (!trimmed) {
+    return expectedCount ? new Array<boolean | null>(expectedCount).fill(null) : [];
+  }
+
+  const rawParts = trimmed
+    .split(/[|;\n,]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  const count = expectedCount && expectedCount > 0 ? expectedCount : rawParts.length;
+  const result: Array<boolean | null> = new Array<boolean | null>(count).fill(null);
+
+  let sequentialIdx = 0;
+  for (const part of rawParts) {
+    const labeled = part.match(/^([a-fA-F])\s*[:.)\-]\s*(.+)$/);
+    if (labeled) {
+      const idx = TF_STATEMENT_LETTERS.indexOf(labeled[1].toLowerCase());
+      const val = parseTrueFalseToken(labeled[2]);
+      if (idx >= 0 && idx < result.length) {
+        result[idx] = val;
+        continue;
+      }
+    }
+    if (sequentialIdx < result.length) {
+      result[sequentialIdx] = parseTrueFalseToken(part);
+      sequentialIdx += 1;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Formats an array of statement booleans into canonical readable key/answer format:
+ * "a:Đúng | b:Sai | c:Đúng | d:Sai"
+ */
+export function formatTrueFalseMultiAnswer(values: Array<boolean | null>): string {
+  return values
+    .map((val, idx) => {
+      const letter = TF_STATEMENT_LETTERS[idx] ?? String(idx + 1);
+      const label = val === true ? 'Đúng' : val === false ? 'Sai' : '?';
+      return `${letter}:${label}`;
+    })
+    .join(' | ');
+}
+
 /**
  * Evaluates a student's answer against stored teacher/AI answer keys (supporting `|`-separated variants),
- * returning full credit (1.0), partial credit (0.7..0.85 for fuzzy fill-in-the-blank near-matches), or 0.
+ * returning full credit (1.0), partial credit (for fuzzy fill_blank OR multi-statement true_false_multi), or 0.
  */
 export function evaluateAnswerMatch(
   userAnswer: string,
@@ -705,6 +795,63 @@ export function evaluateAnswerMatch(
 ): AnswerEvaluation {
   if (!userAnswer?.trim() || !correctAnswer?.trim()) {
     return { isCorrect: false, creditFactor: 0, similarity: 0, matchTier: 'none' };
+  }
+  if (type === 'true_false') {
+    const userBool = parseTrueFalseToken(userAnswer);
+    const keyBool = parseTrueFalseToken(correctAnswer);
+    if (userBool !== null && keyBool !== null) {
+      const ok = userBool === keyBool;
+      return {
+        isCorrect: ok,
+        creditFactor: ok ? 1 : 0,
+        similarity: ok ? 1 : 0,
+        matchTier: ok ? 'exact' : 'none',
+        matchedVariant: ok ? (keyBool ? 'Đúng' : 'Sai') : undefined,
+      };
+    }
+    return evaluateSingleKeyVariant(userAnswer, correctAnswer, 'multiple_choice', ['Đúng', 'Sai']);
+  }
+  if (type === 'true_false_multi') {
+    const expectedCount = Array.isArray(options) && options.length > 0 ? options.length : undefined;
+    const keyVals = parseTrueFalseMultiAnswer(correctAnswer, expectedCount);
+    const total = keyVals.filter((v) => v !== null).length;
+    if (total === 0) {
+      return { isCorrect: false, creditFactor: 0, similarity: 0, matchTier: 'none' };
+    }
+    const userVals = parseTrueFalseMultiAnswer(userAnswer, keyVals.length);
+    let matched = 0;
+    for (let i = 0; i < keyVals.length; i++) {
+      if (keyVals[i] !== null && userVals[i] === keyVals[i]) {
+        matched += 1;
+      }
+    }
+    const ratio = Number((matched / total).toFixed(4));
+    const fractionLabel = `${matched}/${total}`;
+    if (matched === total) {
+      return {
+        isCorrect: true,
+        creditFactor: 1,
+        similarity: 1,
+        matchTier: 'exact',
+        matchedVariant: fractionLabel,
+      };
+    }
+    if (matched > 0) {
+      return {
+        isCorrect: true,
+        creditFactor: Number((matched / total).toFixed(2)),
+        similarity: ratio,
+        matchTier: 'fuzzy_partial',
+        matchedVariant: fractionLabel,
+      };
+    }
+    return {
+      isCorrect: false,
+      creditFactor: 0,
+      similarity: 0,
+      matchTier: 'none',
+      matchedVariant: fractionLabel,
+    };
   }
   if (type === 'multiple_choice') {
     return evaluateSingleKeyVariant(userAnswer, correctAnswer, type, options);
@@ -777,8 +924,14 @@ export function getTimingRuleForQuestionType(
   if (type === 'short_answer') {
     return { graceSec: 30, bonusEndSec: 90, maxTrackedSec: 180 };
   }
+  if (type === 'true_false_multi') {
+    return { graceSec: 25, bonusEndSec: 85, maxTrackedSec: 180 };
+  }
   if (type === 'fill_blank') {
     return { graceSec: 20, bonusEndSec: 75, maxTrackedSec: 180 };
+  }
+  if (type === 'true_false') {
+    return { graceSec: 12, bonusEndSec: 45, maxTrackedSec: 180 };
   }
   return { graceSec: 15, bonusEndSec: 60, maxTrackedSec: 180 };
 }
@@ -841,10 +994,31 @@ export function buildGradingFeedback(
   breakdown: PointsBreakdown,
   lang: Language = 'vi',
 ): string {
+  const isMultiTfFraction = Boolean(
+    evaluation.matchedVariant && /^\d+\/\d+$/.test(evaluation.matchedVariant),
+  );
+
   if (!evaluation.isCorrect || breakdown.totalPoints <= 0) {
+    if (isMultiTfFraction) {
+      return lang === 'en'
+        ? `0 correct statements (${evaluation.matchedVariant}), ${groupName}. Review the Digital Citizen explanation below!`
+        : `Chưa chính xác (${evaluation.matchedVariant} nhận định Đúng/Sai)! Nhóm ${groupName} xem giải thích bên dưới để rút kinh nghiệm nhé!`;
+    }
     return lang === 'en'
       ? `Nice try, ${groupName}! Check the Digital Citizen tip below and keep going!`
       : `Suýt đúng rồi ${groupName} ơi! Xem bí kíp Công dân số bên dưới để ghi điểm câu sau nhé!`;
+  }
+
+  if (isMultiTfFraction) {
+    const pct = Math.round(evaluation.creditFactor * 100);
+    if (evaluation.creditFactor >= 1) {
+      return lang === 'en'
+        ? `Outstanding, ${groupName}! Evaluated all ${evaluation.matchedVariant} True/False statements accurately (+${breakdown.totalPoints} pts)!`
+        : `Xuất sắc ${groupName}! Đánh giá chuẩn xác toàn bộ ${evaluation.matchedVariant} nhận định Đúng/Sai (+${breakdown.totalPoints} điểm)!`;
+    }
+    return lang === 'en'
+      ? `Good job, ${groupName}! Evaluated ${evaluation.matchedVariant} True/False statements correctly — awarded ${pct}% credit (+${breakdown.totalPoints} pts).`
+      : `Tốt lắm ${groupName}! Đánh giá đúng ${evaluation.matchedVariant} nhận định Đúng/Sai — nhận ${pct}% điểm (+${breakdown.totalPoints} điểm).`;
   }
 
   if (evaluation.matchTier === 'fuzzy_partial') {

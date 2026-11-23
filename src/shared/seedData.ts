@@ -587,6 +587,37 @@ export function createSeedData(): StoreData {
           explanation:
             'Đánh giá công cụ AI (6.3) kết hợp Đánh giá thông tin (1.2) giúp đảm bảo nội dung chính xác và không phụ thuộc mù quáng vào AI.',
         },
+        {
+          id: 'q2-16-tf-advanced',
+          type: 'true_false_multi',
+          questionText:
+            'Đánh giá thông tin nâng cao (Đúng / Sai): Khi em đọc một bài đăng lan truyền trên mạng xã hội kèm lời khuyên sức khỏe và ảnh chụp màn hình số liệu, hãy chọn ĐÚNG hoặc SAI cho từng nhận định dưới đây:',
+          options: [
+            'Bài viết có hàng chục nghìn lượt thích (like) và chia sẻ chắc chắn là thông tin chính xác 100%.',
+            'Cần kiểm tra tác giả, ngày đăng và đối chiếu với trang chính thống (.gov.vn, .edu.vn) trước khi tin hoặc chia sẻ.',
+            'Tiêu đề viết toàn chữ IN HOA kèm lời giục "Chia sẻ ngay kẻo bị xóa!" là dấu hiệu phổ biến của tin giả câu view.',
+            'Ảnh chụp màn hình hoặc số liệu do AI trích dẫn không thể bị chỉnh sửa hay sai lệch nên không cần kiểm chứng lại.',
+          ],
+          aiSearchKeywordHint: 'Tiêu chí đánh giá thông tin nâng cao và nhận diện tin giả TT 02/2025',
+          correctAnswer: 'a:Sai | b:Đúng | c:Đúng | d:Sai',
+          competencyId: '1.2',
+          competencyIds: ['1.2', '6.3'],
+          explanation:
+            'a) SAI: Lượt thích cao không đảm bảo sự thật. b) ĐÚNG: Luôn đối chiếu nguồn chính thống. c) ĐÚNG: Tiêu đề giật gân khẩn cấp là dấu hiệu tin giả. d) SAI: Ảnh chụp có thể chỉnh sửa và AI có thể mắc lỗi ảo giác.',
+        },
+        {
+          id: 'q2-17-tf-single',
+          type: 'true_false',
+          questionText:
+            'Đánh giá nhận định Đúng / Sai: Khi sử dụng công cụ AI để hỗ trợ viết báo cáo, học sinh nên kiểm chứng lại toàn bộ số liệu và trích dẫn mà AI đưa ra trước khi nộp bài.',
+          options: ['Đúng', 'Sai'],
+          aiSearchKeywordHint: 'Kiểm chứng thông tin AI tạo sinh ảo giác AI học sinh',
+          correctAnswer: 'Đúng',
+          competencyId: '6.3',
+          competencyIds: ['6.3', '1.2'],
+          explanation:
+            'ĐÚNG! Công cụ AI có thể tạo ra thông tin hoặc nguồn trích dẫn không có thật ("ảo giác AI"), vì vậy học sinh luôn cần đối chiếu với nguồn tin cậy.',
+        },
       ],
     },
   ];

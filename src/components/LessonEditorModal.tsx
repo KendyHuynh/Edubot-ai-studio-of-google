@@ -1,6 +1,11 @@
 import { useState } from 'react';
-import { Check, Plus, Save, Trash2, X } from 'lucide-react';
+import { Check, CheckCircle2, Plus, Save, Trash2, X, XCircle } from 'lucide-react';
 import { COMPETENCIES_24 } from '../shared/competencies';
+import {
+  formatTrueFalseMultiAnswer,
+  parseTrueFalseMultiAnswer,
+  parseTrueFalseToken,
+} from '../shared/scoring';
 import {
   ClassRoom,
   Language,
@@ -17,7 +22,43 @@ interface LessonEditorModalProps {
   onSave: (updatedLesson: Lesson) => Promise<void>;
 }
 
-function createEmptyQuestion(index: number, lessonId: string): Question {
+function createEmptyQuestion(
+  index: number,
+  lessonId: string,
+  type: QuestionType = 'multiple_choice',
+): Question {
+  if (type === 'true_false_multi') {
+    return {
+      id: `${lessonId}-q${Date.now()}-${index}`,
+      type: 'true_false_multi',
+      questionText:
+        'Đánh giá thông tin nâng cao (Đúng / Sai): Đọc tình huống sau và xác định từng nhận định là ĐÚNG hay SAI:',
+      options: [
+        'Nhận định a (ví dụ thông tin cần kiểm chứng)',
+        'Nhận định b (ví dụ nguồn tin chính thống)',
+        'Nhận định c (ví dụ dấu hiệu rủi ro)',
+        'Nhận định d (ví dụ kết luận sai lệch)',
+      ],
+      aiSearchKeywordHint: 'đánh giá thông tin nâng cao kiểm chứng nguồn tin TT 02/2025',
+      correctAnswer: 'a:Sai | b:Đúng | c:Đúng | d:Sai',
+      competencyId: '1.2',
+      competencyIds: ['1.2'],
+      explanation: '',
+    };
+  }
+  if (type === 'true_false') {
+    return {
+      id: `${lessonId}-q${Date.now()}-${index}`,
+      type: 'true_false',
+      questionText: '',
+      options: ['Đúng', 'Sai'],
+      aiSearchKeywordHint: 'đánh giá thông tin công dân số TT 02/2025',
+      correctAnswer: 'Đúng',
+      competencyId: '1.2',
+      competencyIds: ['1.2'],
+      explanation: '',
+    };
+  }
   return {
     id: `${lessonId}-q${Date.now()}-${index}`,
     type: 'multiple_choice',
@@ -73,8 +114,37 @@ export function LessonEditorModal({
     setQuestions((prev) =>
       prev.map((q, i) => {
         if (i !== idx) return q;
+        if (nextType === 'true_false') {
+          const parsed = parseTrueFalseToken(q.correctAnswer ?? '');
+          return {
+            ...q,
+            type: 'true_false',
+            options: ['Đúng', 'Sai'],
+            correctAnswer: parsed === false ? 'Sai' : 'Đúng',
+          };
+        }
+        if (nextType === 'true_false_multi') {
+          const existingStmts =
+            q.type === 'true_false_multi' && q.options && q.options.length >= 2
+              ? q.options
+              : [
+                  'Nhận định a (ví dụ thông tin cần kiểm chứng)',
+                  'Nhận định b (ví dụ nguồn tin chính thống)',
+                  'Nhận định c (ví dụ dấu hiệu rủi ro)',
+                  'Nhận định d (ví dụ kết luận sai lệch)',
+                ];
+          const bools = parseTrueFalseMultiAnswer(q.correctAnswer ?? '', existingStmts.length).map(
+            (v, k) => (v === null ? k % 2 === 1 : v),
+          );
+          return {
+            ...q,
+            type: 'true_false_multi',
+            options: existingStmts,
+            correctAnswer: formatTrueFalseMultiAnswer(bools),
+          };
+        }
         const opts =
-          q.options && q.options.length >= 2
+          q.options && q.options.length >= 2 && q.type === 'multiple_choice'
             ? q.options
             : ['Lựa chọn A', 'Lựa chọn B', 'Lựa chọn C', 'Lựa chọn D'];
         return {
@@ -87,6 +157,70 @@ export function LessonEditorModal({
                 ? q.correctAnswer
                 : opts[0]
               : q.correctAnswer ?? '',
+        };
+      }),
+    );
+  };
+
+  const updateTfMultiStatement = (qIdx: number, stmtIdx: number, text: string) => {
+    setQuestions((prev) =>
+      prev.map((q, i) => {
+        if (i !== qIdx) return q;
+        const nextOpts = [...(q.options ?? ['', '', '', ''])];
+        nextOpts[stmtIdx] = text;
+        return { ...q, options: nextOpts };
+      }),
+    );
+  };
+
+  const toggleTfMultiCorrect = (qIdx: number, stmtIdx: number, val: boolean) => {
+    setQuestions((prev) =>
+      prev.map((q, i) => {
+        if (i !== qIdx) return q;
+        const count = q.options?.length ?? 4;
+        const bools = parseTrueFalseMultiAnswer(q.correctAnswer ?? '', count).map((v) =>
+          v === null ? true : v,
+        );
+        bools[stmtIdx] = val;
+        return { ...q, correctAnswer: formatTrueFalseMultiAnswer(bools) };
+      }),
+    );
+  };
+
+  const addTfMultiStatement = (qIdx: number) => {
+    setQuestions((prev) =>
+      prev.map((q, i) => {
+        if (i !== qIdx) return q;
+        const currentOpts = q.options ?? [];
+        if (currentOpts.length >= 6) return q;
+        const nextOpts = [...currentOpts, `Nhận định ${String.fromCharCode(97 + currentOpts.length)}`];
+        const bools = parseTrueFalseMultiAnswer(q.correctAnswer ?? '', currentOpts.length).map((v) =>
+          v === null ? true : v,
+        );
+        bools.push(true);
+        return {
+          ...q,
+          options: nextOpts,
+          correctAnswer: formatTrueFalseMultiAnswer(bools),
+        };
+      }),
+    );
+  };
+
+  const removeTfMultiStatement = (qIdx: number, stmtIdx: number) => {
+    setQuestions((prev) =>
+      prev.map((q, i) => {
+        if (i !== qIdx) return q;
+        const currentOpts = q.options ?? [];
+        if (currentOpts.length <= 2) return q;
+        const nextOpts = currentOpts.filter((_, idx) => idx !== stmtIdx);
+        const bools = parseTrueFalseMultiAnswer(q.correctAnswer ?? '', currentOpts.length)
+          .map((v) => (v === null ? true : v))
+          .filter((_, idx) => idx !== stmtIdx);
+        return {
+          ...q,
+          options: nextOpts,
+          correctAnswer: formatTrueFalseMultiAnswer(bools),
         };
       }),
     );
@@ -125,10 +259,10 @@ export function LessonEditorModal({
     );
   };
 
-  const handleAddQuestion = () => {
+  const handleAddQuestion = (type: QuestionType = 'multiple_choice') => {
     setQuestions((prev) => [
       ...prev,
-      createEmptyQuestion(prev.length + 1, lesson.id),
+      createEmptyQuestion(prev.length + 1, lesson.id, type),
     ]);
   };
 
@@ -313,20 +447,34 @@ export function LessonEditorModal({
 
           {/* Questions list */}
           <div className="space-y-4">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-sm font-bold text-slate-900">
                 {lang === 'vi'
                   ? `Danh sách câu hỏi (${questions.length} câu)`
                   : `Questions (${questions.length})`}
               </h3>
-              <button
-                type="button"
-                onClick={handleAddQuestion}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg cursor-pointer"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>{lang === 'vi' ? 'Thêm câu hỏi mới' : 'Add Question'}</span>
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleAddQuestion('true_false_multi')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>
+                    {lang === 'vi'
+                      ? 'Thêm câu Đúng/Sai nâng cao (4 ý)'
+                      : 'Add Advanced True/False (4 items)'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleAddQuestion('multiple_choice')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>{lang === 'vi' ? 'Thêm câu hỏi mới' : 'Add Question'}</span>
+                </button>
+              </div>
             </div>
 
             {questions.map((q, qIdx) => {
@@ -350,7 +498,15 @@ export function LessonEditorModal({
                         className="px-2.5 py-1 text-xs font-semibold border border-slate-300 rounded-lg bg-white"
                       >
                         <option value="multiple_choice">
-                          {lang === 'vi' ? 'Trắc nghiệm' : 'Multiple Choice'}
+                          {lang === 'vi' ? 'Trắc nghiệm 4 đáp án' : 'Multiple Choice'}
+                        </option>
+                        <option value="true_false">
+                          {lang === 'vi' ? 'Đúng / Sai (1 nhận định)' : 'True / False (Single)'}
+                        </option>
+                        <option value="true_false_multi">
+                          {lang === 'vi'
+                            ? 'Đánh giá Đúng / Sai nâng cao (Nhiều ý a–d)'
+                            : 'Advanced True / False (Multi a–d)'}
                         </option>
                         <option value="fill_blank">
                           {lang === 'vi' ? 'Điền khuyết' : 'Fill in the Blank'}
@@ -374,7 +530,13 @@ export function LessonEditorModal({
 
                   <div className="space-y-1">
                     <label className="block text-xs font-semibold text-slate-700">
-                      {lang === 'vi' ? 'Nội dung câu hỏi' : 'Question Text'}
+                      {q.type === 'true_false_multi'
+                        ? lang === 'vi'
+                          ? 'Bối cảnh / Tình huống đánh giá thông tin'
+                          : 'Evaluation Context / Scenario Prompt'
+                        : lang === 'vi'
+                          ? 'Nội dung câu hỏi'
+                          : 'Question Text'}
                     </label>
                     <textarea
                       rows={2}
@@ -428,6 +590,144 @@ export function LessonEditorModal({
                           );
                         })}
                       </div>
+                    </div>
+                  ) : q.type === 'true_false' ? (
+                    <div className="space-y-2">
+                      <span className="block text-xs font-semibold text-slate-700">
+                        {lang === 'vi'
+                          ? 'Chọn đáp án chuẩn (Đúng hoặc Sai):'
+                          : 'Select Correct Answer (True or False):'}
+                      </span>
+                      <div className="grid grid-cols-2 gap-2.5 max-w-md">
+                        {[
+                          { val: 'Đúng', labelVi: 'ĐÚNG · Chính xác', labelEn: 'TRUE', isTrue: true },
+                          { val: 'Sai', labelVi: 'SAI · Không chính xác', labelEn: 'FALSE', isTrue: false },
+                        ].map((btn) => {
+                          const active =
+                            (parseTrueFalseToken(q.correctAnswer ?? '') ?? true) === btn.isTrue;
+                          return (
+                            <button
+                              key={btn.val}
+                              type="button"
+                              onClick={() =>
+                                updateQuestion(qIdx, {
+                                  options: ['Đúng', 'Sai'],
+                                  correctAnswer: btn.val,
+                                })
+                              }
+                              className={`inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-bold rounded-xl border-2 cursor-pointer ${
+                                active
+                                  ? btn.isTrue
+                                    ? 'bg-emerald-600 border-emerald-600 text-white'
+                                    : 'bg-rose-600 border-rose-600 text-white'
+                                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                              }`}
+                            >
+                              {btn.isTrue ? (
+                                <CheckCircle2 className="w-4 h-4" />
+                              ) : (
+                                <XCircle className="w-4 h-4" />
+                              )}
+                              <span>{lang === 'vi' ? btn.labelVi : btn.labelEn}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : q.type === 'true_false_multi' ? (
+                    <div className="space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-slate-700">
+                          {lang === 'vi'
+                            ? 'Các nhận định cần đánh giá & Đáp án Đúng/Sai tương ứng:'
+                            : 'Statements & Corresponding True/False Keys:'}
+                        </span>
+                        {(q.options?.length ?? 0) < 6 && (
+                          <button
+                            type="button"
+                            onClick={() => addTfMultiStatement(qIdx)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg cursor-pointer"
+                          >
+                            <Plus className="w-3 h-3" />
+                            <span>{lang === 'vi' ? 'Thêm nhận định' : 'Add Statement'}</span>
+                          </button>
+                        )}
+                      </div>
+                      {(() => {
+                        const stmts = q.options ?? ['', '', '', ''];
+                        const keyBools = parseTrueFalseMultiAnswer(
+                          q.correctAnswer ?? '',
+                          stmts.length,
+                        );
+                        return (
+                          <div className="space-y-2">
+                            {stmts.map((stmt, sIdx) => {
+                              const isTrueKey = keyBools[sIdx] !== false;
+                              const letter = String.fromCharCode(97 + sIdx);
+                              return (
+                                <div
+                                  key={sIdx}
+                                  className="flex flex-col sm:flex-row sm:items-center gap-2 p-2 rounded-xl border border-slate-200 bg-slate-50/70"
+                                >
+                                  <div className="flex items-center gap-2 flex-1 min-w-0">
+                                    <span className="w-6 h-6 rounded-md bg-sky-100 text-sky-800 font-bold text-xs flex items-center justify-center shrink-0 uppercase">
+                                      {letter}
+                                    </span>
+                                    <input
+                                      type="text"
+                                      value={stmt}
+                                      onChange={(e) =>
+                                        updateTfMultiStatement(qIdx, sIdx, e.target.value)
+                                      }
+                                      placeholder={`Nội dung nhận định ${letter})...`}
+                                      className="flex-1 px-2.5 py-1.5 text-sm bg-white border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-500"
+                                    />
+                                  </div>
+                                  <div className="flex items-center gap-1.5 shrink-0 self-end sm:self-center">
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleTfMultiCorrect(qIdx, sIdx, true)}
+                                      className={`px-2.5 py-1 text-xs font-bold rounded-lg border cursor-pointer ${
+                                        isTrueKey
+                                          ? 'bg-emerald-600 border-emerald-600 text-white'
+                                          : 'bg-white border-slate-200 text-slate-600'
+                                      }`}
+                                    >
+                                      {lang === 'vi' ? 'Đúng' : 'True'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleTfMultiCorrect(qIdx, sIdx, false)}
+                                      className={`px-2.5 py-1 text-xs font-bold rounded-lg border cursor-pointer ${
+                                        !isTrueKey
+                                          ? 'bg-rose-600 border-rose-600 text-white'
+                                          : 'bg-white border-slate-200 text-slate-600'
+                                      }`}
+                                    >
+                                      {lang === 'vi' ? 'Sai' : 'False'}
+                                    </button>
+                                    {stmts.length > 2 && (
+                                      <button
+                                        type="button"
+                                        onClick={() => removeTfMultiStatement(qIdx, sIdx)}
+                                        aria-label={`Xóa nhận định ${letter}`}
+                                        className="p-1 text-rose-500 hover:bg-rose-50 rounded-md cursor-pointer"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        );
+                      })()}
+                      <p className="text-[11px] text-slate-500">
+                        {lang === 'vi'
+                          ? `Đáp án lưu chuẩn: ${q.correctAnswer} · Học sinh đánh giá từng ý và nhận điểm tỷ lệ theo số ý đúng (chấm tức thì, không cần AI).`
+                          : `Stored key: ${q.correctAnswer} · Students rate each item and receive proportional partial credit automatically.`}
+                      </p>
                     </div>
                   ) : (
                     <div className="space-y-1">

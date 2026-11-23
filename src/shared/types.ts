@@ -1,6 +1,11 @@
 export type Language = 'vi' | 'en';
 export type UiMode = 'kid' | 'standard';
-export type QuestionType = 'multiple_choice' | 'fill_blank' | 'short_answer';
+export type QuestionType =
+  | 'multiple_choice'
+  | 'true_false'
+  | 'true_false_multi'
+  | 'fill_blank'
+  | 'short_answer';
 
 export interface DomainInfo {
   id: string;

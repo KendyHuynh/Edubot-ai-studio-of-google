@@ -88,9 +88,16 @@ export function sanitizeQuestionForFirestore(q: Question, idx: number, lessonId:
     Array.isArray(q.competencyIds) && q.competencyIds.length > 0
       ? q.competencyIds
       : [q.competencyId || '1.1'];
+  const safeType: Question['type'] =
+    q.type === 'fill_blank' ||
+    q.type === 'short_answer' ||
+    q.type === 'true_false' ||
+    q.type === 'true_false_multi'
+      ? q.type
+      : 'multiple_choice';
   const base: Question = {
     id: toFirestoreDocId(q.id || `${lessonId}-q${idx + 1}`, 80),
-    type: q.type === 'fill_blank' || q.type === 'short_answer' ? q.type : 'multiple_choice',
+    type: safeType,
     questionText: (q.questionText ?? '').slice(0, 1000),
     aiSearchKeywordHint: (q.aiSearchKeywordHint ?? '').slice(0, 300),
     correctAnswer: (q.correctAnswer ?? '').slice(0, 600),
@@ -98,7 +105,13 @@ export function sanitizeQuestionForFirestore(q: Question, idx: number, lessonId:
     competencyIds: compIds.slice(0, 10),
     explanation: (q.explanation ?? '').slice(0, 1000),
   };
-  if (base.type === 'multiple_choice' && Array.isArray(q.options) && q.options.length > 0) {
+  if (
+    (base.type === 'multiple_choice' ||
+      base.type === 'true_false' ||
+      base.type === 'true_false_multi') &&
+    Array.isArray(q.options) &&
+    q.options.length > 0
+  ) {
     base.options = q.options.map((opt) => String(opt).slice(0, 300));
   }
   return base;

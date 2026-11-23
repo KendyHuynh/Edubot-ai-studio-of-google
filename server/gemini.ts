@@ -1,6 +1,11 @@
 import { GoogleGenAI, Type } from '@google/genai';
 import { COMPETENCIES_24 } from '../src/shared/competencies';
-import { Language, Question } from '../src/shared/types';
+import {
+  formatTrueFalseMultiAnswer,
+  parseTrueFalseMultiAnswer,
+  parseTrueFalseToken,
+} from '../src/shared/scoring';
+import { Language, Question, QuestionType } from '../src/shared/types';
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -24,7 +29,12 @@ export interface GeneratedLessonPayload {
   questions: Question[];
 }
 
-export type QuestionStylePreset = 'multiple_choice_only' | 'mc_and_blank' | 'mixed';
+export type QuestionStylePreset =
+  | 'multiple_choice_only'
+  | 'mc_and_true_false'
+  | 'true_false_focus'
+  | 'mc_and_blank'
+  | 'mixed';
 
 export async function generateLessonQuestions(params: {
   title?: string;
@@ -43,24 +53,33 @@ export async function generateLessonQuestions(params: {
 
   const count = Math.max(3, Math.min(params.questionCount || 15, 25));
   const langLabel = params.language === 'vi' ? 'Tiếng Việt' : 'English';
-  const style: QuestionStylePreset = params.questionStyle ?? 'multiple_choice_only';
+  const style: QuestionStylePreset = params.questionStyle ?? 'mc_and_true_false';
 
   const styleInstruction =
     style === 'multiple_choice_only'
       ? `2. TẤT CẢ ${count} câu hỏi đều thuộc dạng "multiple_choice" (có đúng 4 đáp án ngắn gọn rõ ràng trong options, và correctAnswer PHẢI trùng khớp chính xác từng ký tự với đúng 1 phần tử trong options) để hệ thống chấm tự động chính xác 100% mà KHÔNG cần AI chấm lại.`
-      : style === 'mc_and_blank'
-        ? `2. Kết hợp khoảng 80% "multiple_choice" (4 đáp án rõ ràng, correctAnswer trùng khớp từng ký tự với 1 phần tử trong options) và 20% "fill_blank" (1 chỗ trống ______ với correctAnswer là cụm 1-3 từ ngắn gọn, có thể kèm 1-2 cách viết đồng nghĩa ngăn cách bằng dấu " | " để chấm tự động không cần AI). Không dùng "short_answer".`
-        : `2. Kết hợp đa dạng dạng câu hỏi: "multiple_choice" (4 đáp án rõ ràng, correctAnswer trùng khớp 1 phần tử trong options), "fill_blank" (1 chỗ trống ______ với correctAnswer ngắn 1-3 từ, có thể kèm biến thể cách nhau bằng " | "), và "short_answer" (ghi correctAnswer ngắn gọn gồm các từ khóa cốt lõi và 1-2 biến thể ngăn cách bằng " | " để hệ thống chấm trực tiếp theo đáp án có sẵn mà KHÔNG cần AI chấm).`;
+      : style === 'mc_and_true_false'
+        ? `2. TẤT CẢ ${count} câu hỏi là dạng LỰA CHỌN chấm tự động tức thì gồm 3 loại:
+   - Khoảng 50% "multiple_choice" (4 phương án rõ ràng trong options, correctAnswer trùng khớp từng ký tự với đúng 1 phương án).
+   - Khoảng 25% "true_false" (Đánh giá nhận định Đúng/Sai đơn: questionText nêu 1 nhận định cụ thể, options là ["Đúng", "Sai"], correctAnswer là "Đúng" hoặc "Sai").
+   - Khoảng 25% "true_false_multi" (Đánh giá thông tin nâng cao · Đúng/Sai 4 ý a, b, c, d chuẩn GDPT 2018: questionText nêu bối cảnh/tình huống thực tế, options là mảng ĐÚNG 4 nhận định a, b, c, d có cả ý Đúng lẫn ý Sai, và correctAnswer PHẢI ghi đúng định dạng "a:Đúng | b:Sai | c:Đúng | d:Sai").`
+        : style === 'true_false_focus'
+          ? `2. Tập trung chuyên sâu vào dạng Đánh giá thông tin nâng cao Đúng / Sai gồm 2 loại:
+   - Khoảng 50% "true_false_multi" (Đánh giá thông tin nâng cao 4 nhận định a, b, c, d: questionText đưa tình huống/dữ liệu thực tế, options gồm ĐÚNG 4 mệnh đề cần phân tích có cả Đúng và Sai, correctAnswer PHẢI ghi đúng định dạng "a:Đúng | b:Sai | c:Đúng | d:Sai").
+   - Khoảng 50% "true_false" (Nhận định Đúng/Sai nhanh kiểm tra tư duy phản biện: options là ["Đúng", "Sai"], correctAnswer là "Đúng" hoặc "Sai").`
+          : style === 'mc_and_blank'
+            ? `2. Kết hợp khoảng 80% "multiple_choice" (4 đáp án rõ ràng, correctAnswer trùng khớp từng ký tự với 1 phần tử trong options) và 20% "fill_blank" (1 chỗ trống ______ với correctAnswer là cụm 1-3 từ ngắn gọn, có thể kèm 1-2 cách viết đồng nghĩa ngăn cách bằng dấu " | " để chấm tự động không cần AI). Không dùng "short_answer".`
+            : `2. Kết hợp đa dạng tất cả các dạng câu hỏi: "multiple_choice" (4 đáp án rõ ràng), "true_false" (Đúng/Sai đơn, options ["Đúng","Sai"], correctAnswer "Đúng" hoặc "Sai"), "true_false_multi" (Đánh giá thông tin nâng cao 4 nhận định trong options, correctAnswer theo định dạng "a:Đúng | b:Sai | c:Đúng | d:Sai"), "fill_blank" (1 chỗ trống ______ với correctAnswer ngắn 1-3 từ kèm biến thể cách nhau bằng " | "), và "short_answer" (từ khóa cốt lõi cách nhau bằng " | ").`;
 
   const systemInstruction = `Bạn là "EduBot Digital Citizen" - Trợ lý AI giáo dục chuyên về khung 24 Năng lực Công dân số (TT 02/2025).
-Nhiệm vụ của bạn: Đọc kỹ nội dung bài học giáo viên cung cấp và tạo ra ĐÚNG ${count} câu hỏi trò chơi tương tác (không ít hơn ${count} câu, tương tự Quizizz/Kahoot) bằng ${langLabel}, phù hợp với học sinh phổ thông.
+Nhiệm vụ của bạn: Đọc kỹ nội dung bài học giáo viên cung cấp và tạo ra ĐÚNG ${count} câu hỏi trò chơi tương tác (không ít hơn ${count} câu, tương tự Quizizz/Kahoot và chuẩn đề Đúng/Sai GDPT 2018) bằng ${langLabel}, phù hợp với học sinh phổ thông.
 
 QUY TẮC BẮT BUỘC:
 1. Mỗi câu hỏi phải ánh xạ vào 1 hoặc nhiều mã năng lực thành phần (1 đến 2 mã phù hợp nhất) trong số 24 mã dưới đây (chỉ ghi mã số như "1.1", "4.2", "6.2"):
 ${competencyCatalog}
 ${styleInstruction}
 3. Mỗi câu hỏi PHẢI có "aiSearchKeywordHint": gợi ý từ khóa cụ thể để học sinh tự đi tra cứu trên Google hoặc AI khác trước khi chọn đáp án cuối cùng.
-4. Mỗi câu hỏi PHẢI có "explanation": giải thích ngắn gọn, dễ hiểu, gắn với tiêu chuẩn Công dân số.
+4. Mỗi câu hỏi PHẢI có "explanation": giải thích ngắn gọn, dễ hiểu, gắn với tiêu chuẩn Công dân số (với dạng true_false_multi nên giải thích ngắn từng ý a, b, c, d).
 5. Đáp án đúng ("correctAnswer") BẮT BUỘC phải đầy đủ, rõ ràng, không bao giờ để trống vì hệ thống lưu cố định đáp án này để chấm điểm trực tiếp không dùng AI.`;
 
   const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
@@ -82,12 +101,16 @@ Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${co
 
   parts.push({ text: promptText });
 
-  const allowedTypes =
+  const allowedTypes: QuestionType[] =
     style === 'multiple_choice_only'
       ? ['multiple_choice']
-      : style === 'mc_and_blank'
-        ? ['multiple_choice', 'fill_blank']
-        : ['multiple_choice', 'fill_blank', 'short_answer'];
+      : style === 'mc_and_true_false'
+        ? ['multiple_choice', 'true_false', 'true_false_multi']
+        : style === 'true_false_focus'
+          ? ['true_false', 'true_false_multi']
+          : style === 'mc_and_blank'
+            ? ['multiple_choice', 'fill_blank']
+            : ['multiple_choice', 'true_false', 'true_false_multi', 'fill_blank', 'short_answer'];
 
   const response = await ai.models.generateContent({
     model: 'gemini-4-hydrogen',
@@ -149,6 +172,7 @@ Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${co
 
   const validIds = new Set(COMPETENCIES_24.map((c) => c.id));
   const letters = ['a', 'b', 'c', 'd', 'e', 'f'];
+  const allowedSet = new Set<string>(allowedTypes);
 
   const questions: Question[] = (parsed.questions ?? []).map((q, index) => {
     const rawList = q.competencyIds?.length
@@ -158,12 +182,10 @@ Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${co
         : ['1.1'];
     const filteredIds = Array.from(new Set(rawList.filter((id) => validIds.has(id))));
     const safeCompIds = filteredIds.length > 0 ? filteredIds : ['1.1'];
-    const safeType =
-      style === 'multiple_choice_only'
-        ? 'multiple_choice'
-        : q.type === 'fill_blank' || (q.type === 'short_answer' && style === 'mixed')
-          ? q.type
-          : 'multiple_choice';
+
+    const safeType: QuestionType = allowedSet.has(q.type)
+      ? (q.type as QuestionType)
+      : allowedTypes[0];
 
     let options: string[] | undefined;
     let resolvedAnswer = String(q.correctAnswer ?? '').trim();
@@ -187,6 +209,26 @@ Hãy trích xuất chủ đề chính, viết tóm tắt 1-2 câu và tạo ${co
           resolvedAnswer = matchedOpt ?? options[0];
         }
       }
+    } else if (safeType === 'true_false') {
+      options = ['Đúng', 'Sai'];
+      const parsedBool = parseTrueFalseToken(resolvedAnswer);
+      resolvedAnswer = parsedBool === false ? 'Sai' : 'Đúng';
+    } else if (safeType === 'true_false_multi') {
+      const cleanedStatements = (q.options ?? [])
+        .map((o) => String(o).trim().replace(/^[a-fA-F][.):\-\s]+/, ''))
+        .filter(Boolean)
+        .slice(0, 6);
+      options =
+        cleanedStatements.length >= 2
+          ? cleanedStatements
+          : [
+              'Thông tin có nguồn chính thống và tác giả rõ ràng đáng tin cậy hơn tin ẩn danh.',
+              'Mọi bài đăng nhiều lượt thích trên mạng xã hội đều chắc chắn là sự thật.',
+            ];
+      const parsedBools = parseTrueFalseMultiAnswer(resolvedAnswer, options.length).map(
+        (v, i) => (v === null ? i % 2 === 0 : v),
+      );
+      resolvedAnswer = formatTrueFalseMultiAnswer(parsedBools);
     }
 
     return {

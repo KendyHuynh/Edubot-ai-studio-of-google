@@ -10,8 +10,11 @@ import {
   damerauLevenshteinDistance,
   evaluateAnswerMatch,
   formatGroupId,
+  formatTrueFalseMultiAnswer,
   isAnswerMatch,
   normalizedFuzzySimilarity,
+  parseTrueFalseMultiAnswer,
+  parseTrueFalseToken,
 } from './scoring';
 import { AnswerSubmission, Lesson } from './types';
 
@@ -298,3 +301,80 @@ test('buildCompetencyMatrix aggregates multi-competency questions across 24 comp
   assert.equal(comp23?.questionCount, 1);
   assert.equal(comp62?.accuracyPercent, null);
 });
+
+test('true_false and true_false_multi parsing, proportional partial-credit grading, timing windows, and feedback', () => {
+  // 1. Token parser supports Vietnamese, English, and shorthand tokens
+  assert.equal(parseTrueFalseToken('Đúng'), true);
+  assert.equal(parseTrueFalseToken('dung'), true);
+  assert.equal(parseTrueFalseToken('TRUE'), true);
+  assert.equal(parseTrueFalseToken('Đ'), true);
+  assert.equal(parseTrueFalseToken('Sai'), false);
+  assert.equal(parseTrueFalseToken('false'), false);
+  assert.equal(parseTrueFalseToken('S'), false);
+  assert.equal(parseTrueFalseToken('maybe'), null);
+
+  // 2. Single true_false deterministic grading & 12s grace window
+  const tfRight = evaluateAnswerMatch('Đúng', 'Đúng', 'true_false');
+  assert.equal(tfRight.isCorrect, true);
+  assert.equal(tfRight.creditFactor, 1);
+  assert.equal(tfRight.matchTier, 'exact');
+
+  const tfRightAlias = evaluateAnswerMatch('false', 'Sai', 'true_false');
+  assert.equal(tfRightAlias.isCorrect, true);
+  assert.equal(tfRightAlias.creditFactor, 1);
+
+  const tfWrong = evaluateAnswerMatch('Sai', 'Đúng', 'true_false');
+  assert.equal(tfWrong.isCorrect, false);
+  assert.equal(tfWrong.creditFactor, 0);
+
+  const tfFastPts = calculatePoints(true, 11000, 'true_false', 1);
+  assert.equal(tfFastPts.basePoints, 100);
+  assert.equal(tfFastPts.speedBonus, 50);
+
+  // 3. Multi-statement canonical format & parser round-trip
+  const key = formatTrueFalseMultiAnswer([false, true, true, false]);
+  assert.equal(key, 'a:Sai | b:Đúng | c:Đúng | d:Sai');
+  assert.deepEqual(parseTrueFalseMultiAnswer(key, 4), [false, true, true, false]);
+  // Also parses unlabeled pipe-separated shorthand
+  assert.deepEqual(parseTrueFalseMultiAnswer('S | Đ | Đ | S', 4), [false, true, true, false]);
+
+  // 4. Proportional partial credit across 4/4, 3/4, 2/4, 1/4, 0/4
+  const tfm4 = evaluateAnswerMatch('a:Sai | b:Đúng | c:Đúng | d:Sai', key, 'true_false_multi');
+  assert.equal(tfm4.isCorrect, true);
+  assert.equal(tfm4.creditFactor, 1);
+  assert.equal(tfm4.matchTier, 'exact');
+  assert.equal(tfm4.matchedVariant, '4/4');
+
+  const tfm3 = evaluateAnswerMatch('a:Sai | b:Đúng | c:Đúng | d:Đúng', key, 'true_false_multi');
+  assert.equal(tfm3.isCorrect, true);
+  assert.equal(tfm3.creditFactor, 0.75);
+  assert.equal(tfm3.matchTier, 'fuzzy_partial');
+  assert.equal(tfm3.matchedVariant, '3/4');
+
+  const tfm2 = evaluateAnswerMatch('a:Đúng | b:Đúng | c:Đúng | d:Đúng', key, 'true_false_multi');
+  assert.equal(tfm2.isCorrect, true);
+  assert.equal(tfm2.creditFactor, 0.5);
+  assert.equal(tfm2.matchedVariant, '2/4');
+
+  const tfm1 = evaluateAnswerMatch('a:Đúng | b:Đúng | c:Sai | d:Đúng', key, 'true_false_multi');
+  assert.equal(tfm1.isCorrect, true);
+  assert.equal(tfm1.creditFactor, 0.25);
+  assert.equal(tfm1.matchedVariant, '1/4');
+
+  const tfm0 = evaluateAnswerMatch('a:Đúng | b:Sai | c:Sai | d:Đúng', key, 'true_false_multi');
+  assert.equal(tfm0.isCorrect, false);
+  assert.equal(tfm0.creditFactor, 0);
+  assert.equal(tfm0.matchedVariant, '0/4');
+
+  // 5. Timing grace for true_false_multi (<= 25s gets full scaled speed bonus) & feedback text
+  const pts3 = calculatePoints(true, 24000, 'true_false_multi', tfm3.creditFactor);
+  assert.equal(pts3.basePoints, 75);
+  assert.equal(pts3.speedBonus, 38); // Math.round(50 * 0.75) = 38
+  assert.equal(pts3.totalPoints, 113);
+
+  const msg3Vi = buildGradingFeedback('Sao Xanh', tfm3, pts3, 'vi');
+  assert.match(msg3Vi, /3\/4 nhận định.*75%/);
+  const msg4En = buildGradingFeedback('Blue Star', tfm4, calculatePoints(true, 20000, 'true_false_multi', 1), 'en');
+  assert.match(msg4En, /4\/4 True\/False statements/);
+});
+

@@ -15,7 +15,11 @@ import {
 } from 'lucide-react';
 import { getCompetencyById, getDomainByCompetencyId } from '../shared/competencies';
 import { CopyDict } from '../shared/i18n';
-import { calculatePoints, getTimingRuleForQuestionType } from '../shared/scoring';
+import {
+  calculatePoints,
+  formatTrueFalseMultiAnswer,
+  getTimingRuleForQuestionType,
+} from '../shared/scoring';
 import {
   AnswerSubmission,
   Language,
@@ -83,6 +87,7 @@ export function StudentArena({
 }: StudentArenaProps) {
   const [questionIndex, setQuestionIndex] = useState(0);
   const [selectedOption, setSelectedOption] = useState('');
+  const [tfMultiSelections, setTfMultiSelections] = useState<Array<boolean | null>>([]);
   const [textAnswer, setTextAnswer] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [copiedHint, setCopiedHint] = useState(false);
@@ -108,10 +113,17 @@ export function StudentArena({
     startTimeRef.current = Date.now();
     setElapsedMs(0);
     setSelectedOption('');
+    const stmtCount =
+      currentQuestion?.type === 'true_false_multi'
+        ? currentQuestion.options?.length ?? 0
+        : 0;
+    setTfMultiSelections(
+      stmtCount > 0 ? new Array<boolean | null>(stmtCount).fill(null) : [],
+    );
     setTextAnswer('');
     setFeedback(null);
     setCopiedHint(false);
-  }, [selectedLessonId, questionIndex]);
+  }, [selectedLessonId, questionIndex, currentQuestion?.id, currentQuestion?.type, currentQuestion?.options?.length]);
 
   useEffect(() => {
     if (!currentQuestion || feedback) return;
@@ -334,8 +346,20 @@ export function StudentArena({
   const totalQ = activeLesson.questions.length;
   const comp = getCompetencyById(currentQuestion.competencyId);
   const domain = getDomainByCompetencyId(currentQuestion.competencyId);
+  const tfStatements =
+    currentQuestion.type === 'true_false_multi' ? currentQuestion.options ?? [] : [];
+  const allTfMultiSelected =
+    tfStatements.length > 0 &&
+    tfMultiSelections.length === tfStatements.length &&
+    tfMultiSelections.every((v) => v !== null);
   const answerValue =
-    currentQuestion.type === 'multiple_choice' ? selectedOption : textAnswer;
+    currentQuestion.type === 'multiple_choice' || currentQuestion.type === 'true_false'
+      ? selectedOption
+      : currentQuestion.type === 'true_false_multi'
+        ? allTfMultiSelected
+          ? formatTrueFalseMultiAnswer(tfMultiSelections)
+          : ''
+        : textAnswer;
   const isLastQuestion = questionIndex >= totalQ - 1;
 
   const handleCopyKeyword = async () => {
@@ -558,11 +582,35 @@ export function StudentArena({
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
-          <span className="font-semibold text-slate-800 tabular-nums">
-            {lang === 'vi'
-              ? `Câu ${questionIndex + 1} / ${totalQ}`
-              : `Question ${questionIndex + 1} / ${totalQ}`}
-          </span>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-slate-800 tabular-nums">
+              {lang === 'vi'
+                ? `Câu ${questionIndex + 1} / ${totalQ}`
+                : `Question ${questionIndex + 1} / ${totalQ}`}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="font-semibold text-sky-700">
+              {currentQuestion.type === 'multiple_choice'
+                ? lang === 'vi'
+                  ? 'Trắc nghiệm'
+                  : 'Multiple Choice'
+                : currentQuestion.type === 'true_false'
+                  ? lang === 'vi'
+                    ? 'Đánh giá Đúng / Sai'
+                    : 'True / False'
+                  : currentQuestion.type === 'true_false_multi'
+                    ? lang === 'vi'
+                      ? `Đánh giá Đúng / Sai nâng cao (${tfStatements.length} nhận định)`
+                      : `Advanced True / False (${tfStatements.length} statements)`
+                    : currentQuestion.type === 'fill_blank'
+                      ? lang === 'vi'
+                        ? 'Điền khuyết'
+                        : 'Fill Blank'
+                      : lang === 'vi'
+                        ? 'Trả lời ngắn'
+                        : 'Short Answer'}
+            </span>
+          </div>
           <span className={`font-semibold ${domain.textClass}`}>
             {(() => {
               const ids =
@@ -663,6 +711,141 @@ export function StudentArena({
                   </button>
                 );
               })}
+            </div>
+          ) : currentQuestion.type === 'true_false' ? (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {[
+                {
+                  val: 'Đúng',
+                  labelVi: 'ĐÚNG · Chính xác',
+                  labelEn: 'TRUE · Accurate',
+                  isTrue: true,
+                },
+                {
+                  val: 'Sai',
+                  labelVi: 'SAI · Không chính xác',
+                  labelEn: 'FALSE · Inaccurate',
+                  isTrue: false,
+                },
+              ].map((btn) => {
+                const chosen = selectedOption === btn.val;
+                return (
+                  <button
+                    key={btn.val}
+                    type="button"
+                    disabled={Boolean(feedback)}
+                    onClick={() => setSelectedOption(btn.val)}
+                    className={`rounded-xl border-2 font-bold flex items-center justify-center gap-2.5 transition-colors cursor-pointer disabled:cursor-default ${
+                      uiMode === 'kid' ? 'p-5 text-base min-h-[68px]' : 'p-4 text-sm min-h-[56px]'
+                    } ${
+                      chosen
+                        ? btn.isTrue
+                          ? 'bg-emerald-600 border-emerald-600 text-white'
+                          : 'bg-rose-600 border-rose-600 text-white'
+                        : btn.isTrue
+                          ? 'bg-white border-slate-200 hover:border-emerald-400 hover:bg-emerald-50/50 text-slate-800'
+                          : 'bg-white border-slate-200 hover:border-rose-400 hover:bg-rose-50/50 text-slate-800'
+                    }`}
+                  >
+                    {btn.isTrue ? (
+                      <CheckCircle2 className="w-5 h-5 shrink-0" />
+                    ) : (
+                      <XCircle className="w-5 h-5 shrink-0" />
+                    )}
+                    <span>{lang === 'vi' ? btn.labelVi : btn.labelEn}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : currentQuestion.type === 'true_false_multi' && tfStatements.length > 0 ? (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600">
+                <span className="font-semibold text-slate-800">
+                  {lang === 'vi'
+                    ? 'Chọn ĐÚNG hoặc SAI cho từng nhận định dưới đây (chấm điểm theo số ý đúng):'
+                    : 'Evaluate each statement as TRUE or FALSE (proportional partial credit):'}
+                </span>
+                <span className="font-mono-num font-bold text-sky-700">
+                  {lang === 'vi'
+                    ? `Đã đánh giá ${tfMultiSelections.filter((v) => v !== null).length}/${tfStatements.length} ý`
+                    : `Rated ${tfMultiSelections.filter((v) => v !== null).length}/${tfStatements.length}`}
+                </span>
+              </div>
+
+              <div className="space-y-2.5">
+                {tfStatements.map((stmt, idx) => {
+                  const chosenVal = tfMultiSelections[idx] ?? null;
+                  const letter = String.fromCharCode(97 + idx);
+                  return (
+                    <div
+                      key={`${currentQuestion.id}-stmt-${idx}`}
+                      className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                    >
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <span className="w-6 h-6 rounded-md bg-sky-100 text-sky-800 font-bold text-xs flex items-center justify-center shrink-0 mt-0.5 uppercase">
+                          {letter}
+                        </span>
+                        <p
+                          className={`text-slate-900 font-medium leading-relaxed ${
+                            uiMode === 'kid' ? 'text-base' : 'text-sm'
+                          }`}
+                        >
+                          {stmt}
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                        <button
+                          type="button"
+                          disabled={Boolean(feedback)}
+                          aria-label={`${letter.toUpperCase()} - ${lang === 'vi' ? 'Đúng' : 'True'}`}
+                          onClick={() =>
+                            setTfMultiSelections((prev) => {
+                              const next =
+                                prev.length === tfStatements.length
+                                  ? [...prev]
+                                  : new Array<boolean | null>(tfStatements.length).fill(null);
+                              next[idx] = true;
+                              return next;
+                            })
+                          }
+                          className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border-2 text-xs sm:text-sm font-bold transition-colors cursor-pointer disabled:cursor-default ${
+                            chosenVal === true
+                              ? 'bg-emerald-600 border-emerald-600 text-white'
+                              : 'bg-white border-slate-200 hover:border-emerald-400 text-slate-700'
+                          }`}
+                        >
+                          <CheckCircle2 className="w-4 h-4" />
+                          <span>{lang === 'vi' ? 'Đúng' : 'True'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={Boolean(feedback)}
+                          aria-label={`${letter.toUpperCase()} - ${lang === 'vi' ? 'Sai' : 'False'}`}
+                          onClick={() =>
+                            setTfMultiSelections((prev) => {
+                              const next =
+                                prev.length === tfStatements.length
+                                  ? [...prev]
+                                  : new Array<boolean | null>(tfStatements.length).fill(null);
+                              next[idx] = false;
+                              return next;
+                            })
+                          }
+                          className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border-2 text-xs sm:text-sm font-bold transition-colors cursor-pointer disabled:cursor-default ${
+                            chosenVal === false
+                              ? 'bg-rose-600 border-rose-600 text-white'
+                              : 'bg-white border-slate-200 hover:border-rose-400 text-slate-700'
+                          }`}
+                        >
+                          <XCircle className="w-4 h-4" />
+                          <span>{lang === 'vi' ? 'Sai' : 'False'}</span>
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           ) : (
             <div className="space-y-2">
