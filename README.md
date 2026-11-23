@@ -1,15 +1,18 @@
 # EduBot Công Dân Số (TT 02/2025)
 
-Ứng dụng trò chơi học tập & đánh giá **24 năng lực Công dân số** dành cho lớp học dùng chung 10 máy tính bảng, tách riêng **Cổng Học sinh** và **Cổng Giáo viên / Admin** với cơ chế phân quyền bảo mật.
+Ứng dụng trò chơi học tập & tự đánh giá **24 năng lực Công dân số** với 3 phân quyền tách biệt rõ ràng:
+1. **Chế độ Tập trung Trên lớp (10 máy tính bảng dùng chung):** Học sinh vào đúng **Lớp học** và **Số máy (01–10)** để nhận thông báo trực tiếp và làm bài tập Thầy/Cô giao, tự động ẩn mục tự học ngoài lớp để tập trung tuyệt đối.
+2. **Chế độ Cá nhân Ở nhà (Tự đánh giá 24 Năng lực theo 4 Cấp độ):** Học sinh đăng nhập **tài khoản Google cá nhân** (tài khoản mới bắt buộc khai báo **Họ tên · Lớp học · Trường học**), luyện tập **96 bài tập tương tác đa dạng 5 hình thức** (Tình huống, Đúng/Sai, Sắp xếp quy trình 4 bước, Ghép cặp, Phân loại) trải đều 24 năng lực (1.1 → 6.3) và nhận **Huy hiệu khen thưởng** từ Thầy/Cô.
+3. **Cổng Giáo viên / Admin:** Quản lý lớp học, soạn câu hỏi AI, theo dõi tiến độ 24 năng lực của từng học sinh tự học theo Lớp/Trường, xuất Excel (CSV) và gửi **Khen thưởng + Điểm cộng XP**.
 
-## 1. Bảo mật & Phân quyền Giáo viên / Admin
+## 1. Bảo mật & Phân quyền
 
 - **Không còn mã PIN mặc định `2025`:**
   - Khi mở **Cổng Giáo Viên** lần đầu trên máy chủ, thầy/cô tự tạo mã PIN bảo mật riêng (tối thiểu 6 ký tự, mã hóa băm `scrypt`) hoặc đăng nhập trực tiếp bằng **tài khoản Google Admin** (`huynh.nhu.y1601@gmail.com`).
   - Trong mục **Bảo mật & Admin**, thầy/cô có thể **đổi mã PIN bất cứ lúc nào**, **bật chế độ Chỉ Admin Google (khóa hẳn đăng nhập bằng PIN)**, và thêm/gỡ email giáo viên đồng quản trị.
-- **Khóa giao diện trên 10 máy tính bảng học sinh:**
-  - Mọi link chia sẻ cho lớp học (`?class=LOP-5A`, `?tablet=1`, `?ws=...`) đều **tự động ẩn nút Cổng Giáo Viên** và không gửi đáp án về máy học sinh.
-  - Tài khoản Google của học sinh sẽ bị từ chối tự động nếu cố truy cập đường dẫn `/teacher` hoặc `/?role=teacher`.
+- **Tách biệt quyền Học sinh & Giáo viên:**
+  - Mọi link chia sẻ cho lớp học (`?class=LOP-5A`, `?tablet=1`, `?ws=...`) đều **tự động bật Chế độ Tập trung Trên lớp**, ẩn nút Cổng Giáo Viên & mục tự đánh giá ở nhà, không gửi đáp án về máy học sinh.
+  - Tài khoản Google của học sinh ở chế độ Tự đánh giá (`?mode=home`) được gán quyền `student` riêng biệt (chỉ đọc/ghi hồ sơ của chính mình) và bị từ chối tự động nếu cố truy cập đường dẫn `/teacher` hoặc `/?role=teacher`.
 
 ## 2. Đẩy lên GitHub từ AI Studio & bật GitHub Pages (Không cần quyền Workflows)
 
@@ -24,12 +27,14 @@ Dự án đã build sẵn bản chạy tĩnh tối ưu cho GitHub Pages ngay tro
 2. Ở phần **Build and deployment → Source**, giữ nguyên **Deploy from a branch**.
 3. Chọn Branch: **`main`**, Folder: **`/docs`** → bấm **Save**.
 4. Đường dẫn web công khai của bạn sẽ có dạng:
-   - **Cổng Học sinh (10 máy tính bảng, KHÔNG cần đăng nhập, tự ẩn nút Giáo viên):**
+   - **Chế độ Trên lớp — Tập trung (10 máy tính bảng, KHÔNG cần đăng nhập, tự ẩn nút Giáo viên):**
      `https://<TEN_GITHUB>.github.io/<TEN_REPO>/?class=LOP-5A`
+   - **Chế độ Ở nhà — Tự đánh giá 24 Năng lực (Học sinh đăng nhập Google, nhập Tên · Lớp · Trường):**
+     `https://<TEN_GITHUB>.github.io/<TEN_REPO>/?mode=home`
    - **Cổng Giáo viên / Admin (chỉ tài khoản Google Admin được phép vào mặc định trên GitHub Pages):**
      `https://<TEN_GITHUB>.github.io/<TEN_REPO>/?role=teacher`
 
-> **Lưu ý khi dùng Google Admin trên GitHub Pages:** Hãy vào [Firebase Console](https://console.firebase.google.com/) → **Authentication → Settings → Authorized domains** → thêm tên miền `<TEN_GITHUB>.github.io`.
+> **Lưu ý khi dùng Google Admin & Đăng nhập Google Học sinh trên GitHub Pages:** Hãy vào [Firebase Console](https://console.firebase.google.com/) → **Authentication → Settings → Authorized domains** → thêm tên miền `<TEN_GITHUB>.github.io`.
 
 ## 3. Chạy thử trên máy cá nhân (Full-stack Express + Gemini AI)
 

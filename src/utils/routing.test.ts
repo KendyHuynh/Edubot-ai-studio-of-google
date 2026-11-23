@@ -64,3 +64,17 @@ test('buildStudentJoinUrl and buildTeacherPortalUrl generate clean URLs for both
     'https://huynhnhuy.github.io/edubot/?role=teacher',
   );
 });
+
+test('parseEntryParams distinguishes classroom focus mode vs home self-assessment mode', () => {
+  const homeByQuery = parseEntryParams('/', '?mode=home');
+  assert.equal(homeByQuery.portal, 'student');
+  assert.equal(homeByQuery.experienceMode, 'home');
+
+  const homeByPath = parseEntryParams('/tu-danh-gia', '');
+  assert.equal(homeByPath.experienceMode, 'home');
+
+  // Teacher classroom join link ALWAYS locks into classroom focus mode even if ?mode=home was tampered
+  const classLocked = parseEntryParams('/', '?class=LOP-5A&tablet=2&mode=home');
+  assert.equal(classLocked.experienceMode, 'classroom');
+  assert.equal(classLocked.classId, 'LOP-5A');
+});

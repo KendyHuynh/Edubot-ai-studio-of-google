@@ -19,14 +19,26 @@ import {
 import {
   ActivityLog,
   AnswerSubmission,
+  AssessmentExerciseOutcome,
+  AssessmentLevel,
+  AssessmentSessionMode,
   ClassRoom,
   Language,
+  LearnerGradeBand,
   Lesson,
   OfflineQueueItem,
   PushNotification,
   Question,
   QuestionType,
 } from '../shared/types';
+import {
+  createTeacherAwardInStore,
+  deleteTeacherAwardInStore,
+  ensureLearnerCollections,
+  getPublicHonorFromStore,
+  recordAssessmentAttemptInStore,
+  upsertLearnerProfileInStore,
+} from '../shared/learnerStoreOps';
 import {
   DEFAULT_PUBLIC_WORKSPACE_ID,
   isDefaultSeedClassesOnly,
@@ -113,7 +125,7 @@ function verifyLocalToken(
 
 async function verifyGoogleIdTokenStatic(
   idToken: string,
-): Promise<{ email: string; emailVerified: boolean } | null> {
+): Promise<{ uid: string; email: string; emailVerified: boolean } | null> {
   if (!idToken || !firebaseConfig?.apiKey) return null;
   try {
     const res = await fetch(
@@ -128,11 +140,15 @@ async function verifyGoogleIdTokenStatic(
     );
     if (!res.ok) return null;
     const data = (await res.json()) as {
-      users?: Array<{ email?: string; emailVerified?: boolean }>;
+      users?: Array<{ localId?: string; email?: string; emailVerified?: boolean }>;
     };
     const u = data.users?.[0];
-    if (!u?.email) return null;
-    return { email: u.email.toLowerCase(), emailVerified: Boolean(u.emailVerified) };
+    if (!u?.email || !u?.localId) return null;
+    return {
+      uid: u.localId,
+      email: u.email.toLowerCase(),
+      emailVerified: Boolean(u.emailVerified),
+    };
   } catch {
     return null;
   }
@@ -434,7 +450,12 @@ export interface LocalApiResult {
 
 export async function handleLocalApi(
   url: string,
-  options: { method?: string; body?: unknown; authToken?: string } = {},
+  options: {
+    method?: string;
+    body?: unknown;
+    authToken?: string;
+    learnerToken?: string;
+  } = {},
   storage: StorageLike = defaultStorage,
 ): Promise<LocalApiResult> {
   const method = (options.method || 'GET').toUpperCase();
@@ -1308,6 +1329,264 @@ export async function handleLocalApi(
         })),
       },
     };
+  }
+
+  // POST /api/learners/profile
+  if (pathname === '/api/learners/profile' && method === 'POST') {
+    const pBody = body as {
+      idToken?: string;
+      uid?: string;
+      authType?: 'google' | 'guest';
+      photoUrl?: string;
+      fullName?: string;
+      className?: string;
+      schoolName?: string;
+      gradeBand?: LearnerGradeBand;
+    };
+    const fullName = String(pBody.fullName ?? '').trim();
+    const className = String(pBody.className ?? '').trim();
+    const schoolName = String(pBody.schoolName ?? '').trim();
+    if (!fullName || !className || !schoolName) {
+      return {
+        ok: false,
+        status: 400,
+        data: { error: 'Vui lòng nhập đầy đủ Họ tên, Lớp học và Trường học để lưu hồ sơ.' },
+      };
+    }
+
+    let resolvedUid = String(pBody.uid ?? '').trim();
+    let resolvedAuthType: 'google' | 'guest' = 'guest';
+    let resolvedEmail: string | undefined;
+
+    if (pBody.idToken) {
+      const verified = await verifyGoogleIdTokenStatic(String(pBody.idToken));
+      if (!verified || !verified.emailVerified) {
+        return {
+          ok: false,
+          status: 401,
+          data: { error: 'Không thể xác thực tài khoản Google của học sinh.' },
+        };
+      }
+      resolvedUid = verified.uid;
+      resolvedEmail = verified.email;
+      resolvedAuthType = 'google';
+    } else if (!resolvedUid || !resolvedUid.startsWith('guest_')) {
+      resolvedUid = `guest_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    const store = loadLocalStore(storage);
+    const profile = upsertLearnerProfileInStore(store, {
+      uid: resolvedUid,
+      authType: resolvedAuthType,
+      email: resolvedEmail,
+      photoUrl: pBody.photoUrl,
+      fullName,
+      className,
+      schoolName,
+      gradeBand: pBody.gradeBand,
+    });
+    saveLocalStore(store, storage);
+    const { assessmentAttempts, teacherAwards } = ensureLearnerCollections(store);
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        profile,
+        attempts: assessmentAttempts.filter((a) => a.learnerUid === profile.uid).slice(0, 30),
+        awards: teacherAwards.filter((a) => a.learnerUid === profile.uid),
+      },
+    };
+  }
+
+  // GET /api/learners/me
+  if (pathname === '/api/learners/me' && method === 'GET') {
+    let resolvedUid = (parsedUrl.searchParams.get('uid') || '').trim();
+    if (options.learnerToken) {
+      const verified = await verifyGoogleIdTokenStatic(options.learnerToken);
+      if (verified?.uid) resolvedUid = verified.uid;
+    }
+    if (!resolvedUid) {
+      return { ok: false, status: 400, data: { error: 'Thiếu mã định danh học sinh.' } };
+    }
+    const store = loadLocalStore(storage);
+    const { learnerProfiles, assessmentAttempts, teacherAwards } =
+      ensureLearnerCollections(store);
+    const profile = learnerProfiles.find((p) => p.uid === resolvedUid) ?? null;
+    if (profile && profile.authType === 'google' && !options.learnerToken) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Cần xác thực tài khoản Google để xem hồ sơ cá nhân.' },
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        profile,
+        attempts: profile
+          ? assessmentAttempts.filter((a) => a.learnerUid === profile.uid).slice(0, 30)
+          : [],
+        awards: profile ? teacherAwards.filter((a) => a.learnerUid === profile.uid) : [],
+      },
+    };
+  }
+
+  // POST /api/learners/assessment-submit
+  if (pathname === '/api/learners/assessment-submit' && method === 'POST') {
+    const aBody = body as {
+      idToken?: string;
+      learnerUid?: string;
+      learnerName?: string;
+      className?: string;
+      schoolName?: string;
+      gradeBand?: LearnerGradeBand;
+      mode?: AssessmentSessionMode;
+      targetLevel?: AssessmentLevel;
+      targetCompetencyId?: string;
+      outcomes?: AssessmentExerciseOutcome[];
+      maxCombo?: number;
+    };
+    let resolvedUid = String(aBody.learnerUid ?? '').trim();
+    let resolvedAuthType: 'google' | 'guest' = 'guest';
+    let resolvedEmail: string | undefined;
+
+    if (aBody.idToken) {
+      const verified = await verifyGoogleIdTokenStatic(String(aBody.idToken));
+      if (verified?.uid) {
+        resolvedUid = verified.uid;
+        resolvedEmail = verified.email;
+        resolvedAuthType = 'google';
+      }
+    }
+    if (!resolvedUid) {
+      resolvedUid = `guest_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    const store = loadLocalStore(storage);
+    const { profile, attempt } = recordAssessmentAttemptInStore(store, {
+      learnerUid: resolvedUid,
+      learnerName: aBody.learnerName,
+      className: aBody.className,
+      schoolName: aBody.schoolName,
+      authType: resolvedAuthType,
+      email: resolvedEmail,
+      gradeBand: aBody.gradeBand,
+      mode: aBody.mode || 'variety_sprint',
+      targetLevel: aBody.targetLevel,
+      targetCompetencyId: aBody.targetCompetencyId,
+      outcomes: Array.isArray(aBody.outcomes) ? aBody.outcomes : [],
+      maxCombo: Number(aBody.maxCombo || 0),
+    });
+    saveLocalStore(store, storage);
+    const { teacherAwards } = ensureLearnerCollections(store);
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        profile,
+        attempt,
+        awards: teacherAwards.filter((a) => a.learnerUid === profile.uid),
+      },
+    };
+  }
+
+  // GET /api/learners/honor
+  if (pathname === '/api/learners/honor' && method === 'GET') {
+    const store = loadLocalStore(storage);
+    const schoolName = parsedUrl.searchParams.get('schoolName') || undefined;
+    const className = parsedUrl.searchParams.get('className') || undefined;
+    return {
+      ok: true,
+      status: 200,
+      data: { entries: getPublicHonorFromStore(store, { schoolName, className }) },
+    };
+  }
+
+  // GET /api/teacher/learners
+  if (pathname === '/api/teacher/learners' && method === 'GET') {
+    const store = loadLocalStore(storage);
+    if (!getLocalAuth(store)) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Phiên Giáo viên / Admin đã hết hạn hoặc chưa xác thực.' },
+      };
+    }
+    const { learnerProfiles, assessmentAttempts, teacherAwards } =
+      ensureLearnerCollections(store);
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        learners: learnerProfiles,
+        attempts: assessmentAttempts.slice(0, 200),
+        awards: teacherAwards,
+      },
+    };
+  }
+
+  // POST /api/teacher/awards
+  if (pathname === '/api/teacher/awards' && method === 'POST') {
+    const store = loadLocalStore(storage);
+    const authSess = getLocalAuth(store);
+    if (!authSess) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Phiên Giáo viên / Admin đã hết hạn hoặc chưa xác thực.' },
+      };
+    }
+    const awBody = body as {
+      learnerUid?: string;
+      badgeId?: string;
+      badgeTitle?: string;
+      message?: string;
+      bonusXp?: number;
+      awardedByName?: string;
+    };
+    if (!awBody.learnerUid || !awBody.badgeTitle?.trim()) {
+      return {
+        ok: false,
+        status: 400,
+        data: { error: 'Vui lòng chọn học sinh và danh hiệu khen thưởng.' },
+      };
+    }
+    const result = createTeacherAwardInStore(store, {
+      learnerUid: awBody.learnerUid,
+      badgeId: awBody.badgeId || 'custom',
+      badgeTitle: awBody.badgeTitle.trim(),
+      message: awBody.message || '',
+      bonusXp: Number(awBody.bonusXp ?? 100),
+      awardedByName:
+        awBody.awardedByName?.trim() ||
+        (authSess.email ? `GV (${authSess.email})` : 'Giáo viên'),
+      awardedByEmail: authSess.email,
+    });
+    if (!result) {
+      return { ok: false, status: 404, data: { error: 'Không tìm thấy hồ sơ học sinh.' } };
+    }
+    saveLocalStore(store, storage);
+    return { ok: true, status: 201, data: result };
+  }
+
+  // DELETE /api/teacher/awards/:id
+  if (pathname.startsWith('/api/teacher/awards/') && method === 'DELETE') {
+    const store = loadLocalStore(storage);
+    if (!getLocalAuth(store)) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Phiên Giáo viên / Admin đã hết hạn hoặc chưa xác thực.' },
+      };
+    }
+    const awardId = decodeURIComponent(pathname.slice('/api/teacher/awards/'.length));
+    const ok = deleteTeacherAwardInStore(store, awardId);
+    if (!ok) {
+      return { ok: false, status: 404, data: { error: 'Không tìm thấy khen thưởng.' } };
+    }
+    saveLocalStore(store, storage);
+    return { ok: true, status: 200, data: { ok: true } };
   }
 
   return { ok: false, status: 404, data: { error: 'Not found' } };

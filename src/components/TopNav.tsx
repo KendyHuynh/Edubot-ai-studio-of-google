@@ -2,13 +2,15 @@ import { CopyDict } from '../shared/i18n';
 import { Language, SessionIdentity } from '../shared/types';
 import { AppPortal } from '../utils/routing';
 
-export type ActiveTab = 'identity' | 'play' | 'honor' | 'teacher';
+export type ActiveTab = 'identity' | 'play' | 'self_assess' | 'honor' | 'teacher';
 
 interface TopNavProps {
   portal: AppPortal;
   activeTab: ActiveTab;
   onSelectTab: (tab: ActiveTab) => void;
   session: SessionIdentity | null;
+  classroomFocusMode?: boolean;
+  isLockedStudentLink?: boolean;
   copy: CopyDict;
   lang: Language;
   onQuickSwitchShift: () => void;
@@ -20,14 +22,27 @@ export function TopNav({
   activeTab,
   onSelectTab,
   session,
+  classroomFocusMode = false,
+  isLockedStudentLink = false,
   copy,
   lang,
   onQuickSwitchShift,
   onSwitchToStudentPortal,
 }: TopNavProps) {
+  // In Classroom Focus Mode (or teacher-locked join link), hide home self-assessment tab so students stay focused
+  const showSelfAssessTab = !isLockedStudentLink && !classroomFocusMode;
+
   const studentNavItems: Array<{ id: ActiveTab; label: string }> = [
     { id: 'identity', label: copy.navIdentity },
     { id: 'play', label: copy.navPlay },
+    ...(showSelfAssessTab
+      ? [
+          {
+            id: 'self_assess' as const,
+            label: lang === 'vi' ? 'Tự đánh giá 24 NL' : '24-Skill Check',
+          },
+        ]
+      : []),
     { id: 'honor', label: copy.navHonor },
   ];
 
@@ -53,9 +68,13 @@ export function TopNav({
       ? lang === 'vi'
         ? 'Về cổng Học sinh'
         : 'Student Portal'
-      : session
-        ? `${session.classId} · Máy ${String(session.tabletNumber).padStart(2, '0')}`
-        : copy.navIdentity;
+      : activeTab === 'self_assess'
+        ? lang === 'vi'
+          ? 'Vào chế độ Lớp học'
+          : 'Classroom Mode'
+        : session
+          ? `${session.classId} · Máy ${String(session.tabletNumber).padStart(2, '0')}`
+          : copy.navIdentity;
 
   const handlePrimaryAction =
     portal === 'teacher' ? onSwitchToStudentPortal : onQuickSwitchShift;

@@ -17,6 +17,7 @@ import {
   FileUp,
   FlaskConical,
   FolderOpen,
+  Gift,
   History,
   LayoutGrid,
   Link2,
@@ -85,6 +86,7 @@ import { AdminSecurityPanel } from './AdminSecurityPanel';
 import { AuthErrorBanner } from './AuthErrorBanner';
 import { GoogleDrivePanel } from './GoogleDrivePanel';
 import { LessonEditorModal } from './LessonEditorModal';
+import { TeacherLearnersPanel } from './TeacherLearnersPanel';
 import { TeacherPreviewModal } from './TeacherPreviewModal';
 
 interface TeacherStudioProps {
@@ -123,7 +125,7 @@ export function TeacherStudio({
   lang,
 }: TeacherStudioProps) {
   const [subTab, setSubTab] = useState<
-    'generate' | 'drive' | 'classes' | 'reviews' | 'matrix' | 'history' | 'security'
+    'generate' | 'drive' | 'classes' | 'reviews' | 'learners' | 'matrix' | 'history' | 'security'
   >('generate');
 
   // Lesson upload / AI generator form (default 15 questions)
@@ -931,6 +933,20 @@ export function TeacherStudio({
                 {lang === 'vi'
                   ? `Bài làm & Phúc khảo (${submissions.length})`
                   : `Submissions (${submissions.length})`}
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('learners')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs sm:text-sm font-medium rounded-lg cursor-pointer whitespace-nowrap ${
+                subTab === 'learners'
+                  ? 'bg-white text-amber-800 shadow-xs font-semibold'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Gift className="w-4 h-4 text-amber-600" />
+              <span>
+                {lang === 'vi' ? 'Tự đánh giá & Khen thưởng' : 'Self-Study & Awards'}
               </span>
             </button>
             <button
@@ -2525,6 +2541,17 @@ export function TeacherStudio({
           </div>
         );
       })()}
+
+      {/* TAB: Home Self-Assessment Learners & Teacher Awards */}
+      {subTab === 'learners' && (
+        <TeacherLearnersPanel
+          sharedAppUrl={sharedAppUrl}
+          workspaceCode={shareCode}
+          cloudSignedIn={Boolean(cloudUser)}
+          teacherEmail={cloudUser?.email}
+          lang={lang}
+        />
+      )}
 
       {/* TAB 5: Security, Change PIN & Admin RBAC */}
       {subTab === 'security' && <AdminSecurityPanel lang={lang} />}

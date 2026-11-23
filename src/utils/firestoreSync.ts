@@ -19,9 +19,11 @@ import {
   ActivityLog,
   AnswerSubmission,
   ClassRoom,
+  LearnerProfile,
   Lesson,
   PushNotification,
   Question,
+  TeacherAward,
 } from '../shared/types';
 import {
   hasStrippedAnswers,
@@ -732,5 +734,229 @@ export async function publishPublicWorkspace(
   } catch (error) {
     if (!isActiveOwner(ownerUid)) return docId;
     handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+// =========================================================================
+// PERSONAL HOME LEARNER PROFILES & TEACHER AWARDS (CLOUD FIRESTORE SYNC)
+// =========================================================================
+
+export async function saveLearnerProfileToFirestore(
+  profile: LearnerProfile,
+): Promise<boolean> {
+  const current = auth.currentUser;
+  if (!current || !current.emailVerified || current.uid !== profile.uid) {
+    return false;
+  }
+  try {
+    const docId = toFirestoreDocId(profile.uid, 128);
+    const ref = doc(db, 'learnerProfiles', docId);
+    const snap = await getDoc(ref);
+    const payload = {
+      uid: docId,
+      authType: 'google' as const,
+      ...(profile.email ? { email: profile.email.slice(0, 200) } : {}),
+      ...(profile.photoUrl ? { photoUrl: profile.photoUrl.slice(0, 500) } : {}),
+      fullName: (profile.fullName || 'Học sinh').slice(0, 120),
+      className: (profile.className || 'Tự học').slice(0, 60),
+      schoolName: (profile.schoolName || 'Trường học').slice(0, 160),
+      gradeBand: profile.gradeBand || 'primary',
+      role: 'student' as const,
+      profileCompleted: Boolean(profile.profileCompleted),
+      currentLevel: Math.max(1, Math.min(4, Math.round(profile.currentLevel || 1))),
+      totalXp: Math.max(0, Math.min(1000000, Math.round(profile.totalXp || 0))),
+      bestCombo: Math.max(0, Math.min(1000, Math.round(profile.bestCombo || 0))),
+      totalExercisesDone: Math.max(0, Math.min(100000, Math.round(profile.totalExercisesDone || 0))),
+      totalCorrect: Math.max(0, Math.min(100000, Math.round(profile.totalCorrect || 0))),
+      masteryByCompetency: profile.masteryByCompetency ?? {},
+      lastActiveAt: (profile.lastActiveAt || new Date().toISOString()).slice(0, 64),
+      updatedAt: serverTimestamp(),
+    };
+    if (!snap.exists()) {
+      await setDoc(ref, { ...payload, createdAt: serverTimestamp() });
+    } else {
+      await updateDoc(ref, payload);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchLearnerCloudBundle(uid: string): Promise<{
+  profile: LearnerProfile | null;
+  awards: TeacherAward[];
+}> {
+  const current = auth.currentUser;
+  if (!current || !current.emailVerified || current.uid !== uid) {
+    return { profile: null, awards: [] };
+  }
+  try {
+    const docId = toFirestoreDocId(uid, 128);
+    const [profileSnap, awardsSnap] = await Promise.all([
+      getDoc(doc(db, 'learnerProfiles', docId)),
+      getDocs(query(collection(db, 'teacherAwards'), where('learnerUid', '==', docId))),
+    ]);
+
+    let profile: LearnerProfile | null = null;
+    if (profileSnap.exists()) {
+      const d = profileSnap.data();
+      profile = {
+        uid: String(d.uid),
+        authType: d.authType === 'guest' ? 'guest' : 'google',
+        email: d.email ? String(d.email) : undefined,
+        photoUrl: d.photoUrl ? String(d.photoUrl) : undefined,
+        fullName: String(d.fullName ?? ''),
+        className: String(d.className ?? ''),
+        schoolName: String(d.schoolName ?? ''),
+        gradeBand:
+          d.gradeBand === 'middle' || d.gradeBand === 'high' ? d.gradeBand : 'primary',
+        role: 'student',
+        profileCompleted: Boolean(d.profileCompleted),
+        currentLevel: Math.max(1, Math.min(4, Number(d.currentLevel ?? 1))) as 1 | 2 | 3 | 4,
+        totalXp: Number(d.totalXp ?? 0),
+        bestCombo: Number(d.bestCombo ?? 0),
+        totalExercisesDone: Number(d.totalExercisesDone ?? 0),
+        totalCorrect: Number(d.totalCorrect ?? 0),
+        masteryByCompetency:
+          d.masteryByCompetency && typeof d.masteryByCompetency === 'object'
+            ? d.masteryByCompetency
+            : {},
+        createdAt: normalizeTimestampToIso(d.createdAt),
+        updatedAt: normalizeTimestampToIso(d.updatedAt),
+        lastActiveAt: String(d.lastActiveAt ?? normalizeTimestampToIso(d.updatedAt)),
+      };
+    }
+
+    const awards: TeacherAward[] = awardsSnap.docs
+      .map((row) => {
+        const d = row.data();
+        return {
+          id: String(d.id ?? row.id),
+          learnerUid: String(d.learnerUid ?? ''),
+          learnerName: String(d.learnerName ?? ''),
+          className: String(d.className ?? ''),
+          schoolName: String(d.schoolName ?? ''),
+          badgeId: String(d.badgeId ?? 'custom'),
+          badgeTitle: String(d.badgeTitle ?? ''),
+          message: String(d.message ?? ''),
+          bonusXp: Number(d.bonusXp ?? 0),
+          awardedByName: String(d.awardedByName ?? 'Giáo viên'),
+          awardedByEmail: d.awardedByEmail ? String(d.awardedByEmail) : undefined,
+          createdAt: normalizeTimestampToIso(d.createdAt),
+        };
+      })
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+    return { profile, awards };
+  } catch {
+    return { profile: null, awards: [] };
+  }
+}
+
+export async function fetchAllLearnersFromFirestore(): Promise<{
+  learners: LearnerProfile[];
+  awards: TeacherAward[];
+}> {
+  if (!isSignedInVerified()) return { learners: [], awards: [] };
+  try {
+    const [profilesSnap, awardsSnap] = await Promise.all([
+      getDocs(collection(db, 'learnerProfiles')),
+      getDocs(collection(db, 'teacherAwards')),
+    ]);
+
+    const learners: LearnerProfile[] = profilesSnap.docs.map((row) => {
+      const d = row.data();
+      return {
+        uid: String(d.uid ?? row.id),
+        authType: d.authType === 'guest' ? 'guest' : 'google',
+        email: d.email ? String(d.email) : undefined,
+        photoUrl: d.photoUrl ? String(d.photoUrl) : undefined,
+        fullName: String(d.fullName ?? ''),
+        className: String(d.className ?? ''),
+        schoolName: String(d.schoolName ?? ''),
+        gradeBand:
+          d.gradeBand === 'middle' || d.gradeBand === 'high' ? d.gradeBand : 'primary',
+        role: 'student',
+        profileCompleted: Boolean(d.profileCompleted),
+        currentLevel: Math.max(1, Math.min(4, Number(d.currentLevel ?? 1))) as 1 | 2 | 3 | 4,
+        totalXp: Number(d.totalXp ?? 0),
+        bestCombo: Number(d.bestCombo ?? 0),
+        totalExercisesDone: Number(d.totalExercisesDone ?? 0),
+        totalCorrect: Number(d.totalCorrect ?? 0),
+        masteryByCompetency:
+          d.masteryByCompetency && typeof d.masteryByCompetency === 'object'
+            ? d.masteryByCompetency
+            : {},
+        createdAt: normalizeTimestampToIso(d.createdAt),
+        updatedAt: normalizeTimestampToIso(d.updatedAt),
+        lastActiveAt: String(d.lastActiveAt ?? normalizeTimestampToIso(d.updatedAt)),
+      };
+    });
+
+    const awards: TeacherAward[] = awardsSnap.docs
+      .map((row) => {
+        const d = row.data();
+        return {
+          id: String(d.id ?? row.id),
+          learnerUid: String(d.learnerUid ?? ''),
+          learnerName: String(d.learnerName ?? ''),
+          className: String(d.className ?? ''),
+          schoolName: String(d.schoolName ?? ''),
+          badgeId: String(d.badgeId ?? 'custom'),
+          badgeTitle: String(d.badgeTitle ?? ''),
+          message: String(d.message ?? ''),
+          bonusXp: Number(d.bonusXp ?? 0),
+          awardedByName: String(d.awardedByName ?? 'Giáo viên'),
+          awardedByEmail: d.awardedByEmail ? String(d.awardedByEmail) : undefined,
+          createdAt: normalizeTimestampToIso(d.createdAt),
+        };
+      })
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+    return { learners, awards };
+  } catch {
+    return { learners: [], awards: [] };
+  }
+}
+
+export async function saveTeacherAwardToFirestore(
+  award: TeacherAward,
+): Promise<boolean> {
+  if (!isSignedInVerified()) return false;
+  try {
+    const docId = toFirestoreDocId(award.id, 80);
+    await setDoc(doc(db, 'teacherAwards', docId), {
+      id: docId,
+      learnerUid: toFirestoreDocId(award.learnerUid, 128),
+      learnerName: (award.learnerName || '').slice(0, 120),
+      className: (award.className || '').slice(0, 60),
+      schoolName: (award.schoolName || '').slice(0, 160),
+      badgeId: (award.badgeId || 'custom').slice(0, 64),
+      badgeTitle: (award.badgeTitle || 'Khen thưởng').slice(0, 140),
+      message: (award.message || '').slice(0, 500),
+      bonusXp: Math.max(0, Math.min(500, Math.round(award.bonusXp || 0))),
+      awardedByName: (award.awardedByName || 'Giáo viên').slice(0, 120),
+      ...(award.awardedByEmail
+        ? { awardedByEmail: award.awardedByEmail.slice(0, 200) }
+        : {}),
+      createdAt: serverTimestamp(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteTeacherAwardFromFirestore(
+  awardId: string,
+): Promise<boolean> {
+  if (!isSignedInVerified()) return false;
+  try {
+    const docId = toFirestoreDocId(awardId, 80);
+    await deleteDoc(doc(db, 'teacherAwards', docId));
+    return true;
+  } catch {
+    return false;
   }
 }

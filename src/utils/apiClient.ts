@@ -39,6 +39,7 @@ export async function apiRequestJson<T = unknown>(
   if (token && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${token}`);
   }
+  const learnerToken = headers.get('x-learner-token') ?? undefined;
   const authedInit: RequestInit = { ...init, headers };
 
   if (isStaticHostingEnvironment()) {
@@ -46,6 +47,7 @@ export async function apiRequestJson<T = unknown>(
       method: authedInit.method,
       body: authedInit.body,
       authToken: token ?? undefined,
+      learnerToken,
     });
     return {
       ok: local.ok,
@@ -70,6 +72,7 @@ export async function apiRequestJson<T = unknown>(
         method: authedInit.method,
         body: authedInit.body,
         authToken: token ?? undefined,
+        learnerToken,
       });
       return {
         ok: local.ok,
@@ -93,6 +96,7 @@ export async function apiRequestJson<T = unknown>(
         method: authedInit.method,
         body: authedInit.body,
         authToken: token ?? undefined,
+        learnerToken,
       });
       return {
         ok: local.ok,

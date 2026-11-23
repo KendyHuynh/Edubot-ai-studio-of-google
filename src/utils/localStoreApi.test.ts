@@ -761,5 +761,163 @@ test('localStoreApi enforces class isolation (403 cross-class), 1st-attempt lock
   );
 });
 
+test('localStoreApi supports personal 24-competency self-assessment, Google profile onboarding, PII isolation, and teacher awards', async () => {
+  const storage = createMemoryStorage();
+  await withMockFetch(
+    async (input, init) => {
+      const url = String(input);
+      if (url.includes('identitytoolkit.googleapis.com/v1/accounts:lookup')) {
+        const parsed = JSON.parse(String(init?.body ?? '{}')) as { idToken?: string };
+        if (parsed.idToken === 'student-google-token') {
+          return new Response(
+            JSON.stringify({
+              users: [
+                {
+                  localId: 'uid-student-an',
+                  email: 'minhan.student@gmail.com',
+                  emailVerified: true,
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (parsed.idToken === 'admin-google-token') {
+          return new Response(
+            JSON.stringify({
+              users: [
+                {
+                  localId: 'uid-admin-teacher',
+                  email: 'huynh.nhu.y1601@gmail.com',
+                  emailVerified: true,
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    },
+    async () => {
+      // 1) Profile requires fullName, className, and schoolName
+      const badProfile = await handleLocalApi(
+        '/api/learners/profile',
+        {
+          method: 'POST',
+          body: JSON.stringify({ idToken: 'student-google-token', fullName: 'Minh An' }),
+        },
+        storage,
+      );
+      assert.equal(badProfile.status, 400);
+
+      // 2) Student Google onboarding succeeds with Name + Class + School
+      const goodProfile = await handleLocalApi(
+        '/api/learners/profile',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idToken: 'student-google-token',
+            fullName: 'Trần Minh An',
+            className: '5A',
+            schoolName: 'TH Nguyễn Du',
+            gradeBand: 'primary',
+          }),
+        },
+        storage,
+      );
+      assert.equal(goodProfile.ok, true);
+      const profData = goodProfile.data as {
+        profile: { uid: string; role: string; email: string; profileCompleted: boolean };
+      };
+      assert.equal(profData.profile.uid, 'uid-student-an');
+      assert.equal(profData.profile.role, 'student');
+      assert.equal(profData.profile.profileCompleted, true);
+
+      // 3) Student Google account is STILL strictly rejected from Teacher Admin Portal!
+      const studentTryAdmin = await handleLocalApi(
+        '/api/teacher/verify-google',
+        { method: 'POST', body: JSON.stringify({ idToken: 'student-google-token' }) },
+        storage,
+      );
+      assert.equal(studentTryAdmin.ok, false);
+
+      // 4) Unauthenticated caller CANNOT read Google student's profile or teacher learner list
+      const unauthMe = await handleLocalApi(
+        '/api/learners/me?uid=uid-student-an',
+        { method: 'GET' },
+        storage,
+      );
+      assert.equal(unauthMe.status, 401);
+
+      const unauthTeacherList = await handleLocalApi(
+        '/api/teacher/learners',
+        { method: 'GET' },
+        storage,
+      );
+      assert.equal(unauthTeacherList.status, 401);
+
+      // 5) Student submits self-assessment session
+      const submitRes = await handleLocalApi(
+        '/api/learners/assessment-submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idToken: 'student-google-token',
+            mode: 'variety_sprint',
+            maxCombo: 4,
+            outcomes: [
+              { exerciseId: 'ex-1.1-l1', competencyId: '1.1', level: 1, type: 'scenario_choice', isCorrect: true, xpEarned: 25 },
+              { exerciseId: 'ex-4.2-l2', competencyId: '4.2', level: 2, type: 'scenario_choice', isCorrect: true, xpEarned: 40 },
+              { exerciseId: 'ex-6.2-l3', competencyId: '6.2', level: 3, type: 'true_false', isCorrect: true, xpEarned: 60 },
+            ],
+          }),
+        },
+        storage,
+      );
+      assert.equal(submitRes.ok, true);
+      const subData = submitRes.data as { profile: { totalXp: number } };
+      assert.equal(subData.profile.totalXp, 125);
+
+      // 6) Teacher authenticates and sends a reward badge (+100 XP)
+      const adminAuth = await handleLocalApi(
+        '/api/teacher/verify-google',
+        { method: 'POST', body: JSON.stringify({ idToken: 'admin-google-token' }) },
+        storage,
+      );
+      assert.equal(adminAuth.ok, true);
+      const adminToken = (adminAuth.data as { token: string }).token;
+
+      const awardRes = await handleLocalApi(
+        '/api/teacher/awards',
+        {
+          method: 'POST',
+          authToken: adminToken,
+          body: JSON.stringify({
+            learnerUid: 'uid-student-an',
+            badgeId: 'star-self-learner',
+            badgeTitle: 'Ngôi sao Tự học Xuất sắc',
+            message: 'Cô rất khen ngợi tinh thần tự học của An!',
+            bonusXp: 100,
+          }),
+        },
+        storage,
+      );
+      assert.equal(awardRes.status, 201);
+
+      // 7) Public Honor Board includes student + award count + updated XP (225) WITHOUT exposing email
+      const honorRes = await handleLocalApi('/api/learners/honor', { method: 'GET' }, storage);
+      assert.equal(honorRes.ok, true);
+      const entries = (honorRes.data as { entries: Array<Record<string, unknown>> }).entries;
+      assert.equal(entries.length, 1);
+      assert.equal(entries[0].fullName, 'Trần Minh An');
+      assert.equal(entries[0].schoolName, 'TH Nguyễn Du');
+      assert.equal(entries[0].totalXp, 225);
+      assert.equal(entries[0].awardsCount, 1);
+      assert.equal('email' in entries[0], false);
+    },
+  );
+});
+
 
 

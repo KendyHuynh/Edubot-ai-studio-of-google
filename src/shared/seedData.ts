@@ -1,9 +1,12 @@
 import {
   ActivityLog,
   AnswerSubmission,
+  AssessmentSessionAttempt,
   ClassRoom,
+  LearnerProfile,
   Lesson,
   PushNotification,
+  TeacherAward,
 } from './types';
 import { formatGroupId } from './scoring';
 
@@ -32,6 +35,9 @@ export interface StoreData {
   notifications: PushNotification[];
   activityLogs: ActivityLog[];
   adminSecurity?: AdminSecurityConfig;
+  learnerProfiles?: LearnerProfile[];
+  assessmentAttempts?: AssessmentSessionAttempt[];
+  teacherAwards?: TeacherAward[];
 }
 
 export function createSeedData(): StoreData {

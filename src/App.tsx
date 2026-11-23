@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Bell,
+  Focus,
   Globe,
   Lock,
   RefreshCw,
@@ -11,6 +12,7 @@ import {
 import { HonorBoard } from './components/HonorBoard';
 import { IdentityGate } from './components/IdentityGate';
 import { NotificationDrawer } from './components/NotificationDrawer';
+import { SelfAssessmentHub } from './components/SelfAssessmentHub';
 import { GroupLessonProgress, StudentArena } from './components/StudentArena';
 import { TeacherPinGate } from './components/TeacherPinGate';
 import { TeacherStudio } from './components/TeacherStudio';
@@ -69,9 +71,9 @@ export default function App() {
   const [teacherUnlocked, setTeacherUnlocked] = useState<boolean>(() =>
     Boolean(getAdminToken()),
   );
-  // Hide the Teacher Portal link completely when students open a shared class/tablet join link
+  // Hide the Teacher Portal link and home self-assessment tab when students open a shared class/tablet join link
   const isLockedStudentLink = Boolean(
-    entryParams.classId || entryParams.tabletNumber || entryParams.workspaceCode,
+    entryParams.classId || entryParams.tabletNumber || (entryParams.workspaceCode && entryParams.experienceMode !== 'home'),
   );
 
   const [session, setSession] = useState<SessionIdentity | null>(() => {
@@ -91,8 +93,17 @@ export default function App() {
     return loadSavedSession();
   });
 
+  // Classroom Focus Mode: keeps students strictly focused on their class & tablet assignments
+  const [classroomFocusMode, setClassroomFocusMode] = useState<boolean>(() =>
+    Boolean(entryParams.classId || entryParams.tabletNumber || entryParams.autostart),
+  );
+  const [honorInitialMode, setHonorInitialMode] = useState<'classroom' | 'self_learners'>(
+    'classroom',
+  );
+
   const [activeTab, setActiveTab] = useState<ActiveTab>(() => {
     if (entryParams.portal === 'teacher') return 'teacher';
+    if (entryParams.experienceMode === 'home') return 'self_assess';
     if (entryParams.autostart) return 'play';
     return 'identity';
   });
@@ -264,8 +275,17 @@ export default function App() {
         setWorkspaceCode(parsed.workspaceCode);
       }
       setPortal(parsed.portal);
+      if (parsed.classId || parsed.tabletNumber) {
+        setClassroomFocusMode(true);
+      }
       setActiveTab(
-        parsed.portal === 'teacher' ? 'teacher' : parsed.autostart ? 'play' : 'identity',
+        parsed.portal === 'teacher'
+          ? 'teacher'
+          : parsed.experienceMode === 'home'
+            ? 'self_assess'
+            : parsed.autostart
+              ? 'play'
+              : 'identity',
       );
     };
     window.addEventListener('popstate', onPopState);
@@ -324,7 +344,9 @@ export default function App() {
     setSession(next);
     saveSession(next);
     setHonorClassId(next.classId);
+    setHonorInitialMode('classroom');
     setSelectedLessonId(null);
+    setClassroomFocusMode(true);
     setActiveTab('play');
   };
 
@@ -332,6 +354,9 @@ export default function App() {
     setSession(null);
     saveSession(null);
     setSelectedLessonId(null);
+    if (!isLockedStudentLink) {
+      setClassroomFocusMode(false);
+    }
     setActiveTab('identity');
   };
 
@@ -381,7 +406,7 @@ export default function App() {
   const isSubpathOrStaticHost = () => {
     if (typeof window === 'undefined') return false;
     const pathClean = window.location.pathname
-      .replace(/\/(teacher|giao-vien)\/?$/i, '')
+      .replace(/\/(teacher|giao-vien|tu-danh-gia|self-assessment)\/?$/i, '')
       .replace(/\/index\.html$/i, '')
       .replace(/\/+$/, '');
     return window.location.hostname.endsWith('.github.io') || pathClean.length > 0;
@@ -390,7 +415,7 @@ export default function App() {
   const getCleanBasePath = () => {
     if (typeof window === 'undefined') return '/';
     const cleaned = window.location.pathname
-      .replace(/\/(teacher|giao-vien)\/?$/i, '')
+      .replace(/\/(teacher|giao-vien|tu-danh-gia|self-assessment)\/?$/i, '')
       .replace(/\/index\.html$/i, '')
       .replace(/\/+$/, '');
     return cleaned ? `${cleaned}/` : '/';
@@ -426,11 +451,20 @@ export default function App() {
       <TopNav
         portal={portal}
         activeTab={activeTab}
-        onSelectTab={setActiveTab}
+        onSelectTab={(tab) => {
+          if (tab === 'self_assess' && !isLockedStudentLink) {
+            setClassroomFocusMode(false);
+          }
+          setActiveTab(tab);
+        }}
         session={session}
+        classroomFocusMode={classroomFocusMode}
+        isLockedStudentLink={isLockedStudentLink}
         copy={copy}
         lang={lang}
-        onQuickSwitchShift={() => setActiveTab('identity')}
+        onQuickSwitchShift={() => {
+          setActiveTab('identity');
+        }}
         onSwitchToStudentPortal={switchToStudentPortal}
       />
 
@@ -487,6 +521,27 @@ export default function App() {
                 {copy.standardModeLabel}
               </button>
             </div>
+
+            {/* Classroom Focus Mode Indicator / Toggle */}
+            {portal === 'student' && (classroomFocusMode || isLockedStudentLink) && (
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-sky-50 border border-sky-200 text-sky-800 font-semibold">
+                <Focus className="w-3.5 h-3.5 text-sky-600" />
+                <span>
+                  {lang === 'vi'
+                    ? `Tập trung Trên lớp${session ? ` · ${session.classId}` : ''}`
+                    : `Classroom Focus${session ? ` · ${session.classId}` : ''}`}
+                </span>
+                {!isLockedStudentLink && (
+                  <button
+                    type="button"
+                    onClick={() => setClassroomFocusMode(false)}
+                    className="ml-1 text-[11px] underline text-sky-700 hover:text-sky-900 cursor-pointer"
+                  >
+                    {lang === 'vi' ? 'Mở Tự đánh giá' : 'Show Self-Check'}
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
@@ -598,8 +653,13 @@ export default function App() {
                 activeSession={session}
                 initialClassId={entryParams.classId}
                 initialTabletNumber={entryParams.tabletNumber}
+                isLockedStudentLink={isLockedStudentLink}
                 onConfirmSession={handleConfirmSession}
                 onClearSession={handleClearSession}
+                onSwitchToHomeAssessment={() => {
+                  setClassroomFocusMode(false);
+                  setActiveTab('self_assess');
+                }}
                 copy={copy}
                 lang={lang}
                 uiMode={uiMode}
@@ -618,6 +678,7 @@ export default function App() {
                 onGoToHonorBoard={() => {
                   if (session) setHonorClassId(session.classId);
                   setHonorLessonId('');
+                  setHonorInitialMode('classroom');
                   setActiveTab('honor');
                 }}
                 isOfflineEffective={isOfflineEffective}
@@ -631,13 +692,31 @@ export default function App() {
               />
             )}
 
+            {activeTab === 'self_assess' && !isLockedStudentLink && (
+              <SelfAssessmentHub
+                classes={classes}
+                onSwitchToClassroom={() => {
+                  setActiveTab('identity');
+                }}
+                onGoToHonorBoard={() => {
+                  setHonorInitialMode('self_learners');
+                  setActiveTab('honor');
+                }}
+                lang={lang}
+                uiMode={uiMode}
+              />
+            )}
+
             {activeTab === 'honor' && (
               <HonorBoard
                 classes={classes}
                 selectedClassId={studentLockedClassId || honorClassId}
-                lockedClassId={studentLockedClassId}
+                lockedClassId={
+                  classroomFocusMode || isLockedStudentLink ? studentLockedClassId : null
+                }
+                initialBoardMode={honorInitialMode}
                 onChangeClass={(cid) => {
-                  if (!studentLockedClassId) {
+                  if (!studentLockedClassId || !classroomFocusMode) {
                     setHonorClassId(cid);
                     setHonorLessonId('');
                   }

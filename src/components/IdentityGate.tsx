@@ -1,5 +1,15 @@
 import { useEffect, useState } from 'react';
-import { ArrowRight, Check, Link2, RotateCcw, Tablet, Users } from 'lucide-react';
+import {
+  ArrowRight,
+  Check,
+  Compass,
+  Focus,
+  Link2,
+  RotateCcw,
+  Sparkles,
+  Tablet,
+  Users,
+} from 'lucide-react';
 import { CopyDict } from '../shared/i18n';
 import { formatGroupId } from '../shared/scoring';
 import { ClassRoom, Language, SessionIdentity, UiMode } from '../shared/types';
@@ -9,8 +19,10 @@ interface IdentityGateProps {
   activeSession: SessionIdentity | null;
   initialClassId?: string | null;
   initialTabletNumber?: number | null;
+  isLockedStudentLink?: boolean;
   onConfirmSession: (session: SessionIdentity) => void;
   onClearSession: () => void;
+  onSwitchToHomeAssessment?: () => void;
   copy: CopyDict;
   lang: Language;
   uiMode: UiMode;
@@ -34,8 +46,10 @@ export function IdentityGate({
   activeSession,
   initialClassId,
   initialTabletNumber,
+  isLockedStudentLink = false,
   onConfirmSession,
   onClearSession,
+  onSwitchToHomeAssessment,
   copy,
   lang,
   uiMode,
@@ -119,20 +133,84 @@ export function IdentityGate({
   };
 
   return (
-    <section className="max-w-4xl mx-auto">
+    <section className="max-w-4xl mx-auto space-y-5">
+      {/* Mode Choice Banner (Only shown when NOT opened from a teacher-locked classroom link) */}
+      {!isLockedStudentLink && onSwitchToHomeAssessment && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+          <div className="p-4 rounded-2xl border-2 border-sky-600 bg-sky-50/60 flex items-start gap-3">
+            <div className="w-10 h-10 rounded-xl bg-sky-600 text-white flex items-center justify-center shrink-0">
+              <Focus className="w-5 h-5" />
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-bold text-slate-900">
+                  {lang === 'vi'
+                    ? 'Trên Lớp Học · Chế độ Tập trung'
+                    : 'Classroom Focus Mode'}
+                </p>
+                <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-sky-600 text-white">
+                  {lang === 'vi' ? 'Đang chọn' : 'Active'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                {lang === 'vi'
+                  ? 'Vào đúng Lớp học và đúng Máy (01–10) để nhận thông báo trực tiếp và làm bài tập Thầy/Cô giao.'
+                  : 'Check into your exact Class & Tablet (01–10) for live teacher alerts and assigned class lessons.'}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={onSwitchToHomeAssessment}
+            className="text-left p-4 rounded-2xl border border-emerald-200 bg-white hover:border-emerald-500 hover:bg-emerald-50/40 transition-all flex items-start justify-between gap-3 cursor-pointer"
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                <Compass className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-bold text-slate-900 flex items-center gap-1.5">
+                  <span>
+                    {lang === 'vi'
+                      ? 'Ở Nhà · Tự Đánh Giá 24 Năng Lực'
+                      : 'At Home · 24-Competency Self-Assessment'}
+                  </span>
+                  <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
+                </p>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  {lang === 'vi'
+                    ? 'Đăng nhập Google cá nhân, nhập Tên · Lớp · Trường, luyện 96 bài tập đa dạng theo 4 cấp độ & nhận khen thưởng.'
+                    : 'Sign in with Google, enter Name · Class · School, try 96 interactive exercises across 4 levels & earn awards.'}
+                </p>
+              </div>
+            </div>
+            <ArrowRight className="w-4 h-4 text-emerald-700 shrink-0 mt-1" />
+          </button>
+        </div>
+      )}
+
       <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-5">
-        <div className="space-y-1.5">
-          <p className="text-xs font-semibold text-sky-700">
-            {lang === 'vi'
-              ? 'Bước 1 · Định danh máy tính bảng dùng chung'
-              : 'Step 1 · Shared Tablet Session Check-In'}
-          </p>
-          <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 text-balance">
-            {copy.step1Title}
-          </h1>
-          <p className="text-sm text-slate-600 max-w-2xl leading-relaxed">
-            {copy.step1Subtitle}
-          </p>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1.5">
+            <p className="text-xs font-semibold text-sky-700">
+              {lang === 'vi'
+                ? 'Bước 1 · Chế độ Tập trung Trên lớp (10 Máy tính bảng dùng chung)'
+                : 'Step 1 · Classroom Focus Mode (Shared Tablets)'}
+            </p>
+            <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 text-balance">
+              {copy.step1Title}
+            </h1>
+            <p className="text-sm text-slate-600 max-w-2xl leading-relaxed">
+              {copy.step1Subtitle}
+            </p>
+          </div>
+          {isLockedStudentLink && (
+            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-50 border border-sky-200 text-xs font-bold text-sky-800">
+              <Focus className="w-3.5 h-3.5" />
+              <span>{lang === 'vi' ? 'Chế độ Tập trung Trên lớp' : 'Classroom Focus Locked'}</span>
+            </span>
+          )}
         </div>
 
         {(initialClassId || initialTabletNumber) && !activeSession && (

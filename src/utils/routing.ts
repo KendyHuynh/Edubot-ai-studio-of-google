@@ -1,7 +1,10 @@
+import { StudentExperienceMode } from '../shared/types';
+
 export type AppPortal = 'student' | 'teacher';
 
 export interface ParsedEntryParams {
   portal: AppPortal;
+  experienceMode: StudentExperienceMode | null;
   classId: string | null;
   tabletNumber: number | null;
   autostart: boolean;
@@ -42,7 +45,32 @@ export function parseEntryParams(
   const workspaceCode =
     rawWs && /^[A-Za-z0-9_-]{2,64}$/.test(rawWs.trim()) ? rawWs.trim() : null;
 
-  return { portal, classId, tabletNumber, autostart, workspaceCode };
+  const isHomePath =
+    cleanPath === '/tu-danh-gia' ||
+    cleanPath.endsWith('/tu-danh-gia') ||
+    cleanPath === '/self-assessment' ||
+    cleanPath.endsWith('/self-assessment') ||
+    hash.startsWith('#/tu-danh-gia') ||
+    hash.startsWith('#/home');
+
+  // If teacher sent a class/tablet join link, enforce classroom focus mode
+  let experienceMode: StudentExperienceMode | null = null;
+  if (portal === 'student') {
+    if (classId || tabletNumber) {
+      experienceMode = 'classroom';
+    } else if (
+      isHomePath ||
+      roleParam === 'home' ||
+      roleParam === 'self' ||
+      roleParam === 'assessment'
+    ) {
+      experienceMode = 'home';
+    } else if (roleParam === 'classroom' || roleParam === 'class') {
+      experienceMode = 'classroom';
+    }
+  }
+
+  return { portal, experienceMode, classId, tabletNumber, autostart, workspaceCode };
 }
 
 /**
@@ -71,7 +99,7 @@ export function resolveShareableOrigin(
 
 /**
  * Preserves project subpath on GitHub Pages (e.g. https://user.github.io/my-repo)
- * while stripping trailing /teacher, /giao-vien, or /index.html segments.
+ * while stripping trailing /teacher, /giao-vien, /tu-danh-gia, or /index.html segments.
  */
 export function resolveShareableBaseUrl(
   currentOrigin: string,
@@ -80,7 +108,7 @@ export function resolveShareableBaseUrl(
 ): string {
   const resolvedOrigin = resolveShareableOrigin(currentOrigin, serverSharedAppUrl);
   let basePath = (currentPathname || '/').replace(/\/index\.html$/i, '');
-  basePath = basePath.replace(/\/(teacher|giao-vien)\/?$/i, '');
+  basePath = basePath.replace(/\/(teacher|giao-vien|tu-danh-gia|self-assessment)\/?$/i, '');
   basePath = basePath.replace(/\/+$/, '');
   if (!basePath || basePath === '/') {
     return resolvedOrigin;
@@ -100,6 +128,19 @@ export function buildStudentJoinUrl(
   if (tabletNumber && tabletNumber >= 1 && tabletNumber <= 10) {
     params.set('tablet', String(tabletNumber));
   }
+  if (workspaceCode && /^[A-Za-z0-9_-]{2,64}$/.test(workspaceCode.trim())) {
+    params.set('ws', workspaceCode.trim());
+  }
+  return `${cleanBase}/?${params.toString()}`;
+}
+
+export function buildHomeAssessmentUrl(
+  baseUrl: string,
+  workspaceCode?: string | null,
+): string {
+  const cleanBase = baseUrl.replace(/\/+$/, '');
+  const params = new URLSearchParams();
+  params.set('mode', 'home');
   if (workspaceCode && /^[A-Za-z0-9_-]{2,64}$/.test(workspaceCode.trim())) {
     params.set('ws', workspaceCode.trim());
   }

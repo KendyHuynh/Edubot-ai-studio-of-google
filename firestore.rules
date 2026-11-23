@@ -370,5 +370,78 @@ service cloud.firestore {
         allow delete: if isValidId(workspaceId) && isValidId(submissionId) && isAdmin();
       }
     }
+
+    // Personal Home Self-Assessment Learner Profiles (PII-isolated: owner + admin only)
+    function isValidLearnerProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'authType', 'fullName', 'className', 'schoolName', 'gradeBand', 'role', 'profileCompleted', 'currentLevel', 'totalXp', 'bestCombo', 'totalExercisesDone', 'totalCorrect', 'masteryByCompetency', 'lastActiveAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'authType', 'email', 'photoUrl', 'fullName', 'className', 'schoolName', 'gradeBand', 'role', 'profileCompleted', 'currentLevel', 'totalXp', 'bestCombo', 'totalExercisesDone', 'totalCorrect', 'masteryByCompetency', 'lastActiveAt', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && data.uid.size() <= 128
+        && data.authType in ['google', 'guest']
+        && (!('email' in data) || (data.email is string && data.email.size() <= 200))
+        && (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 500))
+        && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120
+        && data.className is string && data.className.size() >= 1 && data.className.size() <= 60
+        && data.schoolName is string && data.schoolName.size() >= 1 && data.schoolName.size() <= 160
+        && data.gradeBand in ['primary', 'middle', 'high']
+        && data.role == 'student'
+        && data.profileCompleted is bool
+        && data.currentLevel is int && data.currentLevel >= 1 && data.currentLevel <= 4
+        && data.totalXp is int && data.totalXp >= 0 && data.totalXp <= 1000000
+        && data.bestCombo is int && data.bestCombo >= 0 && data.bestCombo <= 1000
+        && data.totalExercisesDone is int && data.totalExercisesDone >= 0 && data.totalExercisesDone <= 100000
+        && data.totalCorrect is int && data.totalCorrect >= 0 && data.totalCorrect <= 100000
+        && data.masteryByCompetency is map
+        && data.lastActiveAt is string && data.lastActiveAt.size() <= 64
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTeacherAward(data, awardId) {
+      return data.keys().hasAll(['id', 'learnerUid', 'learnerName', 'className', 'schoolName', 'badgeId', 'badgeTitle', 'message', 'bonusXp', 'awardedByName', 'createdAt'])
+        && data.keys().hasOnly(['id', 'learnerUid', 'learnerName', 'className', 'schoolName', 'badgeId', 'badgeTitle', 'message', 'bonusXp', 'awardedByName', 'awardedByEmail', 'createdAt'])
+        && data.id is string && data.id == awardId && data.id.size() <= 80
+        && data.learnerUid is string && data.learnerUid.size() >= 1 && data.learnerUid.size() <= 128
+        && data.learnerName is string && data.learnerName.size() <= 120
+        && data.className is string && data.className.size() <= 60
+        && data.schoolName is string && data.schoolName.size() <= 160
+        && data.badgeId is string && data.badgeId.size() <= 64
+        && data.badgeTitle is string && data.badgeTitle.size() >= 1 && data.badgeTitle.size() <= 140
+        && data.message is string && data.message.size() <= 500
+        && data.bonusXp is int && data.bonusXp >= 0 && data.bonusXp <= 500
+        && data.awardedByName is string && data.awardedByName.size() <= 120
+        && (!('awardedByEmail' in data) || (data.awardedByEmail is string && data.awardedByEmail.size() <= 200))
+        && data.createdAt is timestamp;
+    }
+
+    match /learnerProfiles/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId)
+        && isVerifiedUser()
+        && isOwner(userId)
+        && isValidLearnerProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isVerifiedUser()
+        && (isOwner(userId) || isAdmin())
+        && isValidLearnerProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().role == 'student'
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isValidId(userId) && isAdmin();
+    }
+
+    match /teacherAwards/{awardId} {
+      allow get: if isValidId(awardId) && (isAdmin() || (isVerifiedUser() && existing().learnerUid == request.auth.uid));
+      allow list: if isAdmin() || (isVerifiedUser() && resource.data.learnerUid == request.auth.uid);
+      allow create: if isValidId(awardId)
+        && isAdmin()
+        && isValidTeacherAward(incoming(), awardId)
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(awardId) && isAdmin();
+    }
   }
 }
