@@ -6,9 +6,11 @@ import {
 } from '../shared/types';
 import {
   buildPublicSubmissionRestFields,
+  dedupeById,
   FirestoreRestValue,
   fromFirestoreRestValue,
   mergeLatestSubmissions,
+  normalizeClassCode,
   resolveCandidateWorkspaceIds,
   toFirestoreDocId,
 } from './firestoreHelpers';
@@ -24,15 +26,116 @@ export interface PublicWorkspaceSnapshot {
   classes: ClassRoom[];
   lessons: Lesson[];
   notifications?: PushNotification[];
+  updatedAt?: string;
 }
 
 function isValidConfig(cfg: PublicFirestoreConfig): cfg is Required<PublicFirestoreConfig> {
   return Boolean(cfg.projectId && cfg.firestoreDatabaseId && cfg.apiKey);
 }
 
+function parseTimestampMs(raw?: string | null): number {
+  if (!raw) return 0;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+async function fetchSinglePublicWorkspaceDoc(
+  cfg: Required<PublicFirestoreConfig>,
+  wsId: string,
+): Promise<PublicWorkspaceSnapshot | null> {
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+      cfg.projectId,
+    )}/databases/${encodeURIComponent(
+      cfg.firestoreDatabaseId,
+    )}/documents/publicWorkspaces/${encodeURIComponent(
+      wsId,
+    )}?key=${encodeURIComponent(cfg.apiKey)}`;
+
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const doc = (await res.json()) as {
+      updateTime?: string;
+      fields?: Record<string, FirestoreRestValue>;
+    };
+    if (!doc.fields) return null;
+
+    const decoded = fromFirestoreRestValue({
+      mapValue: { fields: doc.fields },
+    }) as {
+      classes?: ClassRoom[];
+      lessons?: Lesson[];
+      notifications?: PushNotification[];
+      updatedAt?: string;
+    };
+
+    const classes = Array.isArray(decoded.classes)
+      ? dedupeById(
+          decoded.classes
+            .filter((c) => Boolean(c?.id && c?.name))
+            .map((c) => ({
+              ...c,
+              id: normalizeClassCode(String(c.id)),
+            })),
+        )
+      : [];
+    const lessons = Array.isArray(decoded.lessons)
+      ? dedupeById(
+          decoded.lessons
+            .filter(
+              (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
+            )
+            .map((l) => ({
+              ...l,
+              assignedClassIds: Array.isArray(l.assignedClassIds)
+                ? Array.from(
+                    new Set(
+                      l.assignedClassIds
+                        .map((cid) => String(cid ?? '').trim())
+                        .filter(Boolean)
+                        .map((cid) => normalizeClassCode(cid))
+                        .filter(Boolean),
+                    ),
+                  )
+                : [],
+            })),
+        )
+      : [];
+    const notifications = Array.isArray(decoded.notifications)
+      ? decoded.notifications
+          .filter((n) => Boolean(n?.id && n?.classId))
+          .map((n) => ({
+            ...n,
+            classId: normalizeClassCode(String(n.classId)),
+          }))
+      : undefined;
+
+    if (classes.length === 0 && lessons.length === 0) {
+      return null;
+    }
+
+    const updatedAt =
+      (typeof decoded.updatedAt === 'string' && decoded.updatedAt) ||
+      (typeof doc.updateTime === 'string' && doc.updateTime) ||
+      undefined;
+
+    return {
+      workspaceId: wsId,
+      classes,
+      lessons,
+      notifications,
+      updatedAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Fetches the teacher's published public workspace snapshot via Firestore REST API (zero-login).
- * Tries requested `?ws=` first (if any), then `default`, then legacy fallback workspace.
+ * Evaluates candidate workspaces (`?ws=`, `default`, legacy fallback) and selects the freshest
+ * snapshot with real lessons so a stale `default` document with 0 lessons never hides teacher lessons
+ * from incognito/student browsers.
  */
 export async function fetchPublicWorkspaceSnapshot(
   cfg: PublicFirestoreConfig,
@@ -40,58 +143,69 @@ export async function fetchPublicWorkspaceSnapshot(
 ): Promise<PublicWorkspaceSnapshot | null> {
   if (!isValidConfig(cfg)) return null;
   const candidates = resolveCandidateWorkspaceIds(requestedWs);
+  const explicitWs = (requestedWs ?? '').trim();
 
-  for (const wsId of candidates) {
-    try {
-      const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
-        cfg.projectId,
-      )}/databases/${encodeURIComponent(
-        cfg.firestoreDatabaseId,
-      )}/documents/publicWorkspaces/${encodeURIComponent(
-        wsId,
-      )}?key=${encodeURIComponent(cfg.apiKey)}`;
-
-      const res = await fetch(url);
-      if (!res.ok) continue;
-      const doc = (await res.json()) as {
-        fields?: Record<string, FirestoreRestValue>;
+  // If teacher shared an explicit ?ws= code and it already has lessons, honor it immediately
+  if (explicitWs && candidates[0] === explicitWs) {
+    const explicitSnap = await fetchSinglePublicWorkspaceDoc(cfg, explicitWs);
+    if (explicitSnap && explicitSnap.lessons.length > 0) {
+      return explicitSnap;
+    }
+    const restSnaps = (
+      await Promise.all(
+        candidates.slice(1).map((wsId) => fetchSinglePublicWorkspaceDoc(cfg, wsId)),
+      )
+    ).filter((s): s is PublicWorkspaceSnapshot => Boolean(s));
+    const all = explicitSnap ? [explicitSnap, ...restSnaps] : restSnaps;
+    if (all.length === 0) return null;
+    const withLessons = all.filter((s) => s.lessons.length > 0);
+    if (withLessons.length > 0) {
+      withLessons.sort((a, b) => parseTimestampMs(b.updatedAt) - parseTimestampMs(a.updatedAt));
+      const best = withLessons[0];
+      return {
+        ...best,
+        classes: dedupeById([...(explicitSnap?.classes ?? []), ...best.classes]),
       };
-      if (!doc.fields) continue;
+    }
+    return explicitSnap ?? all[0];
+  }
 
-      const decoded = fromFirestoreRestValue({
-        mapValue: { fields: doc.fields },
-      }) as {
-        classes?: ClassRoom[];
-        lessons?: Lesson[];
-        notifications?: PushNotification[];
-      };
+  // Zero-login root URL: fetch default & fallback in parallel and pick freshest snapshot with lessons
+  const snapshots = (
+    await Promise.all(candidates.map((wsId) => fetchSinglePublicWorkspaceDoc(cfg, wsId)))
+  ).filter((s): s is PublicWorkspaceSnapshot => Boolean(s));
 
-      const classes = Array.isArray(decoded.classes)
-        ? decoded.classes.filter((c) => Boolean(c?.id && c?.name))
-        : [];
-      const lessons = Array.isArray(decoded.lessons)
-        ? decoded.lessons.filter(
-            (l) => Boolean(l?.id && l?.title && Array.isArray(l.questions) && l.questions.length > 0),
-          )
-        : [];
-      const notifications = Array.isArray(decoded.notifications)
-        ? decoded.notifications.filter((n) => Boolean(n?.id && n?.classId))
-        : undefined;
+  if (snapshots.length === 0) return null;
+  if (snapshots.length === 1) return snapshots[0];
 
-      if (classes.length > 0 || lessons.length > 0) {
-        return {
-          workspaceId: wsId,
-          classes,
-          lessons,
-          notifications,
-        };
-      }
-    } catch {
-      // Try next candidate or fall back cleanly on offline network
+  const withLessons = snapshots.filter((s) => s.lessons.length > 0);
+  if (withLessons.length === 0) {
+    return snapshots[0];
+  }
+
+  // Pick the snapshot with the strictly newest updatedAt timestamp among those that have lessons
+  let best = withLessons[0];
+  let bestTs = parseTimestampMs(best.updatedAt);
+  for (let i = 1; i < withLessons.length; i++) {
+    const curr = withLessons[i];
+    const currTs = parseTimestampMs(curr.updatedAt);
+    if (currTs > bestTs) {
+      best = curr;
+      bestTs = currTs;
     }
   }
 
-  return null;
+  // If the primary candidate had classes (e.g. LOP-9-5) with 0 lessons while fallback had lessons,
+  // preserve classes from both so no real class disappears.
+  const emptyPrimary = snapshots.find((s) => s.workspaceId !== best.workspaceId && s.lessons.length === 0);
+  if (emptyPrimary && emptyPrimary.classes.length > 0) {
+    return {
+      ...best,
+      classes: dedupeById([...emptyPrimary.classes, ...best.classes]),
+    };
+  }
+
+  return best;
 }
 
 /**

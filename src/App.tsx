@@ -263,7 +263,7 @@ export default function App() {
   }, [fetchBootstrap]);
 
   useEffect(() => {
-    if (activeTab === 'honor' || activeTab === 'teacher') {
+    if (activeTab === 'play' || activeTab === 'honor' || activeTab === 'teacher') {
       fetchBootstrap(true);
     }
   }, [activeTab, fetchBootstrap]);
@@ -688,6 +688,7 @@ export default function App() {
                   setHonorInitialMode('classroom');
                   setActiveTab('honor');
                 }}
+                onRefreshLessons={() => fetchBootstrap(true)}
                 isOfflineEffective={isOfflineEffective}
                 onOnlineSubmission={() => {
                   fetchBootstrap(true);

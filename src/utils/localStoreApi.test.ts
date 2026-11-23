@@ -1483,5 +1483,106 @@ test('localStoreApi purges legacy virtual LOP-5A seed artifacts, deduplicates re
   );
 });
 
+test('incognito student selecting LOP-9-5 sees lessons with zero login even when publicWorkspaces/default is stale vs fallback workspace', async () => {
+  await withMockFetch(
+    (url, init) => {
+      // Simulate stale `default` doc that has class LOP-9-5 but 0 lessons (older updatedAt)
+      if (url.includes('/publicWorkspaces/default?') && (!init?.method || init.method === 'GET')) {
+        const docFields = toFirestoreRestValue({
+          id: 'default',
+          classes: [
+            {
+              id: 'LOP-9-5',
+              name: 'Lớp 9/5',
+              grade: 'Khối 9',
+              teacherName: 'Cô Huỳnh Như Ý',
+              createdAt: '2026-11-22T00:00:00.000Z',
+            },
+          ],
+          lessons: [],
+          updatedAt: '2026-11-22T01:00:00.000Z',
+        }).mapValue?.fields;
+        return new Response(
+          JSON.stringify({ updateTime: '2026-11-22T01:00:00.000Z', fields: docFields }),
+          { status: 200 },
+        );
+      }
+      // Simulate fresher teacher workspace `WS-LHH4MPLJSIV8` with the real lesson assigned to Lớp 9-5
+      if (url.includes('/publicWorkspaces/WS-LHH4MPLJSIV8?') && (!init?.method || init.method === 'GET')) {
+        const docFields = toFirestoreRestValue({
+          id: 'WS-LHH4MPLJSIV8',
+          classes: [
+            {
+              id: 'LOP-9-5',
+              name: 'Lớp 9/5',
+              grade: 'Khối 9',
+              teacherName: 'Cô Huỳnh Như Ý',
+              createdAt: '2026-11-22T00:00:00.000Z',
+            },
+          ],
+          lessons: [
+            {
+              id: 'lesson-9-5-live',
+              title: 'An toàn thông tin số lớp 9',
+              topic: 'Công dân số 9',
+              sourceFileName: 'bai9.txt',
+              summary: 'Bài tập cho lớp 9-5',
+              assignedClassIds: ['Lớp 9-5'],
+              createdAt: '2026-11-22T02:00:00.000Z',
+              questions: [
+                {
+                  id: 'q95-1',
+                  type: 'multiple_choice',
+                  questionText: 'Cách đặt mật khẩu mạnh?',
+                  options: ['Kết hợp chữ hoa, số, ký tự đặc biệt', 'Ngày sinh'],
+                  aiSearchKeywordHint: 'mật khẩu mạnh',
+                  correctAnswer: 'Kết hợp chữ hoa, số, ký tự đặc biệt',
+                  competencyId: '4.1',
+                  competencyIds: ['4.1'],
+                  explanation: 'Mật khẩu mạnh cần đa dạng ký tự.',
+                },
+              ],
+            },
+          ],
+          updatedAt: '2026-11-22T02:00:00.000Z',
+        }).mapValue?.fields;
+        return new Response(
+          JSON.stringify({ updateTime: '2026-11-22T02:00:00.000Z', fields: docFields }),
+          { status: 200 },
+        );
+      }
+      if (url.includes(':runQuery')) {
+        return new Response(JSON.stringify([{ readTime: '2026-11-22T02:00:00Z' }]), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    },
+    async () => {
+      resetLocalHydrationCache();
+      const storage = createMemoryStorage();
+      // Fresh incognito student enters LOP-9-5 with NO login and NO ?ws= param
+      const res = await handleLocalApi(
+        '/api/bootstrap?classId=LOP-9-5&lang=vi&role=student&refresh=1',
+        { method: 'GET' },
+        storage,
+      );
+      assert.equal(res.ok, true);
+      const data = res.data as {
+        classes: Array<{ id: string }>;
+        lessons: Array<{ id: string; assignedClassIds: string[]; questions: Array<{ correctAnswer?: string }> }>;
+      };
+      assert.deepEqual(
+        data.classes.map((c) => c.id),
+        ['LOP-9-5'],
+      );
+      assert.equal(data.lessons.length, 1);
+      assert.equal(data.lessons[0].id, 'lesson-9-5-live');
+      assert.deepEqual(data.lessons[0].assignedClassIds, ['LOP-9-5']);
+      // Answer key remains strictly stripped for unauthenticated student
+      assert.equal(data.lessons[0].questions[0].correctAnswer, undefined);
+    },
+  );
+});
+
+
 
 

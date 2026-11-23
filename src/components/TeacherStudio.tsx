@@ -49,6 +49,7 @@ import {
   deleteLessonFromFirestore,
   fetchTeacherCloudData,
   publishPublicWorkspace,
+  PublishPublicWorkspaceResult,
   pushWorkspaceToFirestore,
   saveClassToFirestore,
   saveLessonToFirestore,
@@ -81,7 +82,13 @@ import {
   loadRememberedAiLessons,
   rememberAiLessons,
 } from '../utils/aiLessonVault';
-import { isDefaultSeedClassesOnly, isDemoSeedClass } from '../utils/firestoreHelpers';
+import {
+  dedupeById,
+  isDefaultSeedClassesOnly,
+  isDemoSeedClass,
+  isLessonAssignedToClass,
+  normalizeClassCode,
+} from '../utils/firestoreHelpers';
 import type { SyncLedgerMeta } from '../shared/seedData';
 import { AdminSecurityPanel } from './AdminSecurityPanel';
 import { AuthErrorBanner } from './AuthErrorBanner';
@@ -196,6 +203,8 @@ export function TeacherStudio({
     suggestNewTab?: boolean;
     unauthorizedHost?: string | null;
   } | null>(null);
+  const [publicPublishInfo, setPublicPublishInfo] =
+    useState<PublishPublicWorkspaceResult | null>(null);
   const cloudSyncingRef = useRef(false);
   const hydratedUidRef = useRef<string | null>(null);
 
@@ -210,43 +219,115 @@ export function TeacherStudio({
   } | null>(null);
 
   const publishLatestPublicSnapshot = useCallback(
-    async (uid: string) => {
+    async (
+      uid: string,
+      overrides?: {
+        updatedLesson?: Lesson;
+        deletedLessonId?: string;
+        updatedClass?: ClassRoom;
+        deletedClassId?: string;
+      },
+    ): Promise<PublishPublicWorkspaceResult | null> => {
       try {
         let nextClasses = classes;
         let nextLessons = lessons;
         let nextNotifications = notifications;
-        let gotTeacherBootstrap = false;
+        let gotAuthoritativeTeacherStore = false;
+
+        // Read directly from teacher-only /api/workspace/export first — NEVER hydrates stale publicWorkspaces
+        // and NEVER strips correctAnswer keys!
+        try {
+          const exportRes = await apiRequestJson<{
+            classes?: ClassRoom[];
+            lessons?: Lesson[];
+          }>('/api/workspace/export', {}, lang);
+          if (
+            exportRes.ok &&
+            Array.isArray(exportRes.data?.classes) &&
+            Array.isArray(exportRes.data?.lessons)
+          ) {
+            nextClasses = exportRes.data.classes;
+            nextLessons = exportRes.data.lessons;
+            gotAuthoritativeTeacherStore = true;
+          }
+        } catch {
+          // Fall back below
+        }
+
         try {
           const res = await apiRequestJson<{
             classes?: ClassRoom[];
             lessons?: Lesson[];
             notifications?: PushNotification[];
           }>('/api/bootstrap?role=teacher', {}, lang);
-          if (res.ok && res.data?.classes && res.data?.lessons) {
-            nextClasses = res.data.classes;
-            nextLessons = res.data.lessons;
-            gotTeacherBootstrap = true;
+          if (res.ok && res.data) {
+            if (!gotAuthoritativeTeacherStore && Array.isArray(res.data.classes)) {
+              nextClasses = res.data.classes;
+            }
+            if (!gotAuthoritativeTeacherStore && Array.isArray(res.data.lessons)) {
+              nextLessons = res.data.lessons;
+              gotAuthoritativeTeacherStore = true;
+            }
             if (Array.isArray(res.data.notifications)) {
               nextNotifications = res.data.notifications;
             }
           }
         } catch {
-          // Fall back to current in-memory classes & lessons
+          // Keep current in-memory values
         }
-        const safeLessons = recoverMissingCorrectAnswers(nextLessons);
+
+        // Apply exact just-saved override directly so student-facing public snapshot is never behind
+        if (overrides?.updatedClass) {
+          nextClasses = dedupeById([...nextClasses, overrides.updatedClass]);
+        }
+        if (overrides?.deletedClassId) {
+          nextClasses = nextClasses.filter((c) => c.id !== overrides.deletedClassId);
+        }
+        if (overrides?.updatedLesson) {
+          nextLessons = dedupeById([...nextLessons, overrides.updatedLesson]);
+        }
+        if (overrides?.deletedLessonId) {
+          nextLessons = nextLessons.filter((l) => l.id !== overrides.deletedLessonId);
+        }
+
+        const safeLessons = recoverMissingCorrectAnswers(
+          nextLessons,
+          loadRememberedAiLessons(),
+        );
         // Never publish student-sanitized lessons (stripped correctAnswer) to publicWorkspaces
-        if (hasStrippedAnswers(safeLessons) || (!gotTeacherBootstrap && hasStrippedAnswers(nextLessons))) {
-          return;
+        if (
+          hasStrippedAnswers(safeLessons) ||
+          (!gotAuthoritativeTeacherStore && hasStrippedAnswers(nextLessons))
+        ) {
+          return null;
         }
-        await publishPublicWorkspace(
+        const pubRes = await publishPublicWorkspace(
           defaultShareCodeForUid(uid),
           uid,
           nextClasses,
           safeLessons,
           nextNotifications,
         );
-      } catch {
-        // Non-fatal: private Firestore data still saved
+        setPublicPublishInfo(pubRes);
+        if (!pubRes.publishedDefault && pubRes.defaultError) {
+          setCloudNotice({
+            type: 'err',
+            text:
+              lang === 'vi'
+                ? `Đã lưu riêng tư nhưng chưa cập nhật được kho công khai (publicWorkspaces/default) cho học sinh không đăng nhập: ${pubRes.defaultError}`
+                : `Saved privately, but failed to publish publicWorkspaces/default for zero-login students: ${pubRes.defaultError}`,
+          });
+        }
+        return pubRes;
+      } catch (err) {
+        setCloudNotice({
+          type: 'err',
+          text:
+            err instanceof Error
+              ? err.message
+              : 'Lỗi xuất bản bài học công khai cho học sinh.',
+        });
+        return null;
       }
     },
     [classes, lang, lessons, notifications],
@@ -277,6 +358,21 @@ export function TeacherStudio({
         const cloudData = await fetchTeacherCloudData(user.uid);
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
 
+        // Also rescue any locally remembered AI/custom lessons not yet in Firestore so students see them too
+        const deletedIds = loadDeletedLessonIds();
+        const cloudLessonIds = new Set(cloudData.lessons.map((l) => l.id));
+        const localVaultMissing = loadRememberedAiLessons().filter(
+          (l) =>
+            !cloudLessonIds.has(l.id) &&
+            !deletedIds.has(l.id) &&
+            isAiGeneratedOrCustomLesson(l) &&
+            !hasStrippedAnswers([l]),
+        );
+        const mergedCloudLessons = dedupeById([
+          ...cloudData.lessons,
+          ...localVaultMissing,
+        ]);
+
         // ALWAYS authoritatively overwrite & deduplicate local store from Firebase (including empty real state)
         // so virtual demo classes (LOP-5A/5B/6A) or duplicate records NEVER linger or get re-created!
         const wsCode = defaultShareCodeForUid(user.uid);
@@ -287,6 +383,7 @@ export function TeacherStudio({
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               ...cloudData,
+              lessons: mergedCloudLessons,
               authoritativeCloud: true,
               workspaceId: wsCode,
               ownerUid: user.uid,
@@ -299,41 +396,57 @@ export function TeacherStudio({
         await onRefreshData();
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
 
-        // Always read freshly hydrated teacher store so stale local props are NEVER pushed back over Firebase
-        let freshClasses: ClassRoom[] = [];
-        let freshLessons: Lesson[] = [];
-        let freshSubmissions: AnswerSubmission[] = [];
-        let freshNotifications: PushNotification[] = [];
-        let freshLogs: ActivityLog[] = [];
+        // Always read freshly hydrated teacher store directly via /api/workspace/export (never stripped)
+        let freshClasses: ClassRoom[] = cloudData.classes;
+        let freshLessons: Lesson[] = mergedCloudLessons;
+        let freshSubmissions: AnswerSubmission[] = cloudData.submissions;
+        let freshNotifications: PushNotification[] = cloudData.notifications;
+        let freshLogs: ActivityLog[] = cloudData.activityLogs;
         try {
-          const freshRes = await apiRequestJson<{
-            classes?: ClassRoom[];
-            lessons?: Lesson[];
-            submissions?: AnswerSubmission[];
-            notifications?: PushNotification[];
-            activityLogs?: ActivityLog[];
-          }>('/api/bootstrap?role=teacher&refresh=1', {}, lang);
-          if (freshRes.ok && freshRes.data) {
+          const [exportRes, freshRes] = await Promise.all([
+            apiRequestJson<{ classes?: ClassRoom[]; lessons?: Lesson[] }>(
+              '/api/workspace/export',
+              {},
+              lang,
+            ),
+            apiRequestJson<{
+              classes?: ClassRoom[];
+              lessons?: Lesson[];
+              submissions?: AnswerSubmission[];
+              notifications?: PushNotification[];
+              activityLogs?: ActivityLog[];
+            }>('/api/bootstrap?role=teacher&refresh=1', {}, lang),
+          ]);
+          if (exportRes.ok && exportRes.data) {
+            if (Array.isArray(exportRes.data.classes)) freshClasses = exportRes.data.classes;
+            if (Array.isArray(exportRes.data.lessons)) freshLessons = exportRes.data.lessons;
+          } else if (freshRes.ok && freshRes.data) {
             if (Array.isArray(freshRes.data.classes)) freshClasses = freshRes.data.classes;
             if (Array.isArray(freshRes.data.lessons)) freshLessons = freshRes.data.lessons;
+          }
+          if (freshRes.ok && freshRes.data) {
             if (Array.isArray(freshRes.data.submissions)) freshSubmissions = freshRes.data.submissions;
             if (Array.isArray(freshRes.data.notifications)) freshNotifications = freshRes.data.notifications;
             if (Array.isArray(freshRes.data.activityLogs)) freshLogs = freshRes.data.activityLogs;
           }
         } catch {
-          freshClasses = cloudData.classes;
-          freshLessons = cloudData.lessons;
-          freshSubmissions = cloudData.submissions;
-          freshNotifications = cloudData.notifications;
-          freshLogs = cloudData.activityLogs;
+          // Keep cloudData fallback
         }
 
-        const realFreshClasses = freshClasses.filter((c) => !isDemoSeedClass(c));
-        const safeLessons = recoverMissingCorrectAnswers(freshLessons, cloudData.lessons);
+        const realFreshClasses = dedupeById(
+          freshClasses.filter((c) => !isDemoSeedClass(c)),
+        );
+        const safeLessons = dedupeById(
+          recoverMissingCorrectAnswers(freshLessons, [
+            ...cloudData.lessons,
+            ...loadRememberedAiLessons(),
+          ]),
+        );
         const canSafelyPushLessons = safeLessons.length > 0 && !hasStrippedAnswers(safeLessons);
         const canSafelyPushClasses =
           realFreshClasses.length > 0 && !isDefaultSeedClassesOnly(realFreshClasses);
         const effectiveClasses = canSafelyPushClasses ? realFreshClasses : cloudData.classes;
+        const effectiveLessons = canSafelyPushLessons ? safeLessons : cloudData.lessons;
         if (canSafelyPushLessons) {
           rememberAiLessons(safeLessons);
         }
@@ -351,23 +464,37 @@ export function TeacherStudio({
           existingLogIds,
         );
         if (!auth.currentUser || auth.currentUser.uid !== user.uid) return;
-        if (effectiveClasses.length > 0 || canSafelyPushLessons) {
-          await publishPublicWorkspace(
+
+        // ALWAYS publish public workspace (`WS-<uid>` AND `default`) so zero-login / incognito students
+        // immediately see all real classes and assigned lessons without needing an Admin login!
+        let pubRes: PublishPublicWorkspaceResult | null = null;
+        if (effectiveClasses.length > 0 || effectiveLessons.length > 0) {
+          pubRes = await publishPublicWorkspace(
             wsCode,
             user.uid,
             effectiveClasses,
-            canSafelyPushLessons ? safeLessons : cloudData.lessons,
+            effectiveLessons,
             freshNotifications,
           );
+          setPublicPublishInfo(pubRes);
         }
         hydratedUidRef.current = user.uid;
-        if (manual) {
+
+        if (pubRes && !pubRes.publishedDefault && pubRes.defaultError) {
+          setCloudNotice({
+            type: 'err',
+            text:
+              lang === 'vi'
+                ? `Đã đồng bộ kho riêng tư (${effectiveClasses.length} lớp, ${effectiveLessons.length} bài) nhưng CHƯA xuất bản được kho công khai (default) cho học sinh ẩn danh: ${pubRes.defaultError}. Hãy dùng tài khoản Admin chính hoặc gửi link kèm ?ws=${wsCode}.`
+                : `Synced private store (${effectiveClasses.length} classes, ${effectiveLessons.length} lessons) but failed to publish default public workspace: ${pubRes.defaultError}.`,
+          });
+        } else if (manual) {
           setCloudNotice({
             type: 'ok',
             text:
               lang === 'vi'
-                ? `Đã đồng bộ chuẩn xác & ghi chép từ Firebase: ${effectiveClasses.length} lớp thật, ${safeLessons.length} bài học, ${freshSubmissions.length} bài làm học sinh (mã ${wsCode})!`
-                : `Authoritative Firebase sync complete: ${effectiveClasses.length} classes, ${safeLessons.length} lessons, ${freshSubmissions.length} student answers (${wsCode})!`,
+                ? `Đã đồng bộ & xuất bản công khai cho học sinh (không cần đăng nhập): ${effectiveClasses.length} lớp thật, ${effectiveLessons.length} bài học, ${freshSubmissions.length} bài làm (default + ${wsCode})!`
+                : `Synced & published for zero-login students: ${effectiveClasses.length} classes, ${effectiveLessons.length} lessons, ${freshSubmissions.length} submissions (default + ${wsCode})!`,
           });
           window.setTimeout(() => setCloudNotice(null), 6000);
         }
@@ -384,15 +511,7 @@ export function TeacherStudio({
         setCloudSyncing(false);
       }
     },
-    [
-      activityLogs,
-      classes,
-      lang,
-      lessons,
-      notifications,
-      onRefreshData,
-      submissions,
-    ],
+    [lang, onRefreshData],
   );
 
   const syncWithCloudRef = useRef(syncWithCloud);
@@ -454,13 +573,19 @@ export function TeacherStudio({
           lang,
         );
         if (res.ok) {
+          if (auth.currentUser?.emailVerified) {
+            for (const lesson of missing) {
+              await saveLessonToFirestore(lesson, auth.currentUser.uid).catch(() => undefined);
+            }
+            await publishLatestPublicSnapshot(auth.currentUser.uid);
+          }
           await onRefreshData();
         }
       } catch {
         // Non-fatal fallback
       }
     })();
-  }, [lang, lessons, onRefreshData]);
+  }, [lang, lessons, onRefreshData, publishLatestPublicSnapshot]);
 
   const origin =
     typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
@@ -659,7 +784,7 @@ export function TeacherStudio({
 
       if (cloudUser) {
         await saveLessonToFirestore(data.lesson, cloudUser.uid);
-        await publishLatestPublicSnapshot(cloudUser.uid);
+        await publishLatestPublicSnapshot(cloudUser.uid, { updatedLesson: data.lesson });
       }
       await onRefreshData();
       setGenStatus({
@@ -683,10 +808,11 @@ export function TeacherStudio({
   };
 
   const handleToggleLessonClass = async (lesson: Lesson, cid: string) => {
-    const exists = lesson.assignedClassIds.includes(cid);
+    const normCid = normalizeClassCode(cid);
+    const exists = isLessonAssignedToClass(lesson, normCid);
     const nextIds = exists
-      ? lesson.assignedClassIds.filter((x) => x !== cid)
-      : [...lesson.assignedClassIds, cid];
+      ? lesson.assignedClassIds.filter((x) => normalizeClassCode(x) !== normCid)
+      : Array.from(new Set([...lesson.assignedClassIds.map((x) => normalizeClassCode(x)), normCid]));
     const res = await apiRequestJson<{ lesson?: Lesson }>(
       `/api/lessons/${lesson.id}/assign`,
       {
@@ -696,12 +822,41 @@ export function TeacherStudio({
       },
       lang,
     );
-    if (res.ok && cloudUser && res.data?.lesson) {
-      try {
-        await saveLessonToFirestore(res.data.lesson, cloudUser.uid);
-        await publishLatestPublicSnapshot(cloudUser.uid);
-      } catch {
-        // Non-fatal
+    if (res.ok && res.data?.lesson) {
+      rememberAiLessons([res.data.lesson]);
+      if (cloudUser) {
+        try {
+          await saveLessonToFirestore(res.data.lesson, cloudUser.uid);
+          const pubRes = await publishLatestPublicSnapshot(cloudUser.uid, {
+            updatedLesson: res.data.lesson,
+          });
+          if (pubRes?.publishedDefault) {
+            setCloudNotice({
+              type: 'ok',
+              text:
+                lang === 'vi'
+                  ? `Đã cập nhật giao bài "${res.data.lesson.title}" cho lớp ${normCid} và xuất bản công khai cho học sinh không cần đăng nhập!`
+                  : `Updated assignment for "${res.data.lesson.title}" (${normCid}) and published for zero-login students!`,
+            });
+            window.setTimeout(() => setCloudNotice(null), 4000);
+          }
+        } catch (err) {
+          setCloudNotice({
+            type: 'err',
+            text:
+              err instanceof Error
+                ? err.message
+                : 'Lỗi lưu phân công bài học lên Firestore.',
+          });
+        }
+      } else {
+        setCloudNotice({
+          type: 'err',
+          text:
+            lang === 'vi'
+              ? `Đã giao bài cho lớp ${normCid} trên máy này. Hãy bấm "Kết nối lưu trữ Cloud Firestore" để học sinh mở ẩn danh/máy khác thấy ngay bài học này!`
+              : `Assigned to ${normCid} locally. Connect Cloud Firestore so incognito/other student devices receive this lesson immediately.`,
+        });
       }
     }
     await onRefreshData();
@@ -713,7 +868,7 @@ export function TeacherStudio({
     setConfirmDeleteLessonId(null);
     if (cloudUser) {
       await deleteLessonFromFirestore(id);
-      await publishLatestPublicSnapshot(cloudUser.uid);
+      await publishLatestPublicSnapshot(cloudUser.uid, { deletedLessonId: id });
     }
     await onRefreshData();
   };
@@ -744,7 +899,7 @@ export function TeacherStudio({
       }
       if (cloudUser && data?.classRoom) {
         await saveClassToFirestore(data.classRoom, cloudUser.uid);
-        await publishLatestPublicSnapshot(cloudUser.uid);
+        await publishLatestPublicSnapshot(cloudUser.uid, { updatedClass: data.classRoom });
       }
       setNewClassCode('');
       setNewClassName('');
@@ -790,9 +945,24 @@ export function TeacherStudio({
       if (cloudUser) {
         if (data.oldId && data.oldId !== data.classRoom.id) {
           await deleteClassFromFirestore(data.oldId);
+          // Re-save lessons whose assignedClassIds cascaded from oldId -> newId so Firestore stays aligned
+          const exportRes = await apiRequestJson<{ lessons?: Lesson[] }>(
+            '/api/workspace/export',
+            {},
+            lang,
+          ).catch(() => null);
+          const cascadedLessons = exportRes?.ok && Array.isArray(exportRes.data?.lessons)
+            ? exportRes.data.lessons.filter((l) => isLessonAssignedToClass(l, data.classRoom!.id))
+            : [];
+          for (const lesson of cascadedLessons) {
+            await saveLessonToFirestore(lesson, cloudUser.uid).catch(() => undefined);
+          }
         }
         await saveClassToFirestore(data.classRoom, cloudUser.uid);
-        await publishLatestPublicSnapshot(cloudUser.uid);
+        await publishLatestPublicSnapshot(cloudUser.uid, {
+          updatedClass: data.classRoom,
+          ...(data.oldId && data.oldId !== data.classRoom.id ? { deletedClassId: data.oldId } : {}),
+        });
       }
       setEditingClass(null);
       await onRefreshData();
@@ -820,7 +990,7 @@ export function TeacherStudio({
       setConfirmDeleteClassId(null);
       if (cloudUser) {
         await deleteClassFromFirestore(classId);
-        await publishLatestPublicSnapshot(cloudUser.uid);
+        await publishLatestPublicSnapshot(cloudUser.uid, { deletedClassId: classId });
       }
       await onRefreshData();
     } catch (err) {
@@ -1044,23 +1214,44 @@ export function TeacherStudio({
                     ? 'Học sinh mở link web sẽ tự động tải đúng danh sách lớp & bài đã đồng bộ từ Firebase (không tự tạo lớp ảo).'
                     : 'Students auto-load real classes & lessons synced from Firebase (zero virtual classes).'}
               </p>
-              {syncMeta && (
-                <p className="text-[11px] font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1 mt-1.5 inline-flex flex-wrap items-center gap-x-2 gap-y-0.5 tabular-nums">
-                  <span>
-                    {lang === 'vi'
-                      ? `Ghi chép đồng bộ #${syncMeta.syncRevision}`
-                      : `Sync Ledger #${syncMeta.syncRevision}`}
-                  </span>
-                  <span>·</span>
-                  <span>{new Date(syncMeta.lastSyncedAt).toLocaleString('vi-VN')}</span>
-                  <span>·</span>
-                  <span>
-                    {syncMeta.classesCount} {lang === 'vi' ? 'lớp thật' : 'classes'} ·{' '}
-                    {syncMeta.lessonsCount} {lang === 'vi' ? 'bài' : 'lessons'} ·{' '}
-                    {syncMeta.submissionsCount} {lang === 'vi' ? 'bài làm' : 'submissions'}
-                  </span>
-                </p>
-              )}
+              <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                {syncMeta && (
+                  <p className="text-[11px] font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1 inline-flex flex-wrap items-center gap-x-2 gap-y-0.5 tabular-nums">
+                    <span>
+                      {lang === 'vi'
+                        ? `Ghi chép đồng bộ #${syncMeta.syncRevision}`
+                        : `Sync Ledger #${syncMeta.syncRevision}`}
+                    </span>
+                    <span>·</span>
+                    <span>{new Date(syncMeta.lastSyncedAt).toLocaleString('vi-VN')}</span>
+                    <span>·</span>
+                    <span>
+                      {syncMeta.classesCount} {lang === 'vi' ? 'lớp thật' : 'classes'} ·{' '}
+                      {syncMeta.lessonsCount} {lang === 'vi' ? 'bài' : 'lessons'} ·{' '}
+                      {syncMeta.submissionsCount} {lang === 'vi' ? 'bài làm' : 'submissions'}
+                    </span>
+                  </p>
+                )}
+                {publicPublishInfo && (
+                  <p
+                    className={`text-[11px] font-medium rounded-lg px-2.5 py-1 border inline-flex items-center gap-1.5 tabular-nums ${
+                      publicPublishInfo.publishedDefault
+                        ? 'text-sky-800 bg-sky-50 border-sky-200'
+                        : 'text-amber-900 bg-amber-50 border-amber-300'
+                    }`}
+                  >
+                    <span>
+                      {publicPublishInfo.publishedDefault
+                        ? lang === 'vi'
+                          ? `Công khai ẩn danh (không cần đăng nhập): ${publicPublishInfo.classesCount} lớp · ${publicPublishInfo.lessonsCount} bài đã mở`
+                          : `Zero-login student view live: ${publicPublishInfo.classesCount} classes · ${publicPublishInfo.lessonsCount} lessons`
+                        : lang === 'vi'
+                          ? `Chưa xuất bản mặc định (chỉ có mã ${publicPublishInfo.workspaceId}) — bấm Đồng bộ bằng Admin chính`
+                          : `Default public workspace not updated (${publicPublishInfo.workspaceId} only)`}
+                    </span>
+                  </p>
+                )}
+              </div>
             </div>
           </div>
 
@@ -2118,7 +2309,7 @@ export function TeacherStudio({
                   </div>
                   <div className="flex flex-wrap gap-2">
                     {classes.map((cls) => {
-                      const assigned = lesson.assignedClassIds.includes(cls.id);
+                      const assigned = isLessonAssignedToClass(lesson, cls.id);
                       return (
                         <button
                           key={cls.id}
@@ -2287,7 +2478,7 @@ export function TeacherStudio({
           (s) => !reviewClassId || s.classId === reviewClassId,
         );
         const classLessonsForReview = lessons.filter(
-          (l) => !reviewClassId || l.assignedClassIds.includes(reviewClassId),
+          (l) => !reviewClassId || isLessonAssignedToClass(l, reviewClassId),
         );
         const distinctGroups = Array.from(
           new Set(classSubs.map((s) => s.groupId)),
@@ -2650,7 +2841,7 @@ export function TeacherStudio({
             rememberAiLessons([updated]);
             if (cloudUser) {
               await saveLessonToFirestore(updated, cloudUser.uid);
-              await publishLatestPublicSnapshot(cloudUser.uid);
+              await publishLatestPublicSnapshot(cloudUser.uid, { updatedLesson: updated });
             }
             await onRefreshData();
           }}

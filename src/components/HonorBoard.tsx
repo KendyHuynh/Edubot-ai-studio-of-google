@@ -22,6 +22,7 @@ import {
   PublicLearnerHonorEntry,
 } from '../shared/types';
 import { apiRequestJson } from '../utils/apiClient';
+import { isLessonAssignedToClass } from '../utils/firestoreHelpers';
 
 interface HonorBoardProps {
   classes: ClassRoom[];
@@ -87,7 +88,7 @@ export function HonorBoard({
   const effectiveClassId = lockedClassId || selectedClassId;
   const activeClassObj = classes.find((c) => c.id === effectiveClassId);
   const classLessons = lessons.filter(
-    (l) => !effectiveClassId || l.assignedClassIds.includes(effectiveClassId),
+    (l) => !effectiveClassId || isLessonAssignedToClass(l, effectiveClassId),
   );
 
   const handleDownloadJson = () => {

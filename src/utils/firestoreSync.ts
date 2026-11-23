@@ -36,6 +36,7 @@ import {
   isDemoSeedClass,
   mergeLatestSubmissions,
   mergeSubmissionActivityLogs,
+  normalizeClassCode,
   sanitizeLessonFieldsForFirestore,
   toFirestoreDocId,
 } from './firestoreHelpers';
@@ -600,6 +601,12 @@ export async function fetchTeacherCloudData(ownerUid: string): Promise<{
   }
 }
 
+export interface PushWorkspaceResult {
+  savedClasses: number;
+  savedLessons: number;
+  warnings: string[];
+}
+
 export async function pushWorkspaceToFirestore(
   ownerUid: string,
   payload: {
@@ -610,38 +617,65 @@ export async function pushWorkspaceToFirestore(
     activityLogs: ActivityLog[];
   },
   existingLogIds?: Set<string>,
-): Promise<void> {
+): Promise<PushWorkspaceResult> {
+  const warnings: string[] = [];
+  let savedClasses = 0;
+  let savedLessons = 0;
+
   const realClasses = dedupeById(payload.classes.filter((c) => !isDemoSeedClass(c)));
   for (const cls of realClasses) {
-    if (!isActiveOwner(ownerUid)) return;
-    await saveClassToFirestore(cls, ownerUid);
+    if (!isActiveOwner(ownerUid)) return { savedClasses, savedLessons, warnings };
+    try {
+      await saveClassToFirestore(cls, ownerUid);
+      savedClasses += 1;
+    } catch (err) {
+      warnings.push(`class:${cls.id}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   const uniqueLessons = dedupeById(payload.lessons);
   for (const lesson of uniqueLessons) {
-    if (!isActiveOwner(ownerUid)) return;
-    await saveLessonToFirestore(lesson, ownerUid);
+    if (!isActiveOwner(ownerUid)) return { savedClasses, savedLessons, warnings };
+    try {
+      await saveLessonToFirestore(lesson, ownerUid);
+      savedLessons += 1;
+    } catch (err) {
+      warnings.push(`lesson:${lesson.id}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   const realSubs = payload.submissions.filter((s) => !isDemoSeedArtifactId(s.id));
   for (const sub of realSubs.slice(0, 40)) {
-    if (!isActiveOwner(ownerUid)) return;
-    await saveSubmissionToFirestore(sub, ownerUid);
+    if (!isActiveOwner(ownerUid)) return { savedClasses, savedLessons, warnings };
+    try {
+      await saveSubmissionToFirestore(sub, ownerUid);
+    } catch (err) {
+      warnings.push(`sub:${sub.id}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   const realNotifs = dedupeById(
     payload.notifications.filter((n) => !isDemoSeedArtifactId(n.id)),
   );
   for (const notif of realNotifs.slice(0, 20)) {
-    if (!isActiveOwner(ownerUid)) return;
-    await saveNotificationToFirestore(notif, ownerUid);
+    if (!isActiveOwner(ownerUid)) return { savedClasses, savedLessons, warnings };
+    try {
+      await saveNotificationToFirestore(notif, ownerUid);
+    } catch (err) {
+      warnings.push(`notif:${notif.id}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   const realLogs = dedupeById(
     payload.activityLogs.filter((l) => !isDemoSeedArtifactId(l.id)),
   );
   for (const log of realLogs.slice(0, 30)) {
-    if (!isActiveOwner(ownerUid)) return;
+    if (!isActiveOwner(ownerUid)) return { savedClasses, savedLessons, warnings };
     const docId = toFirestoreDocId(log.id, 80);
     const knownExists = existingLogIds ? existingLogIds.has(docId) : undefined;
-    await saveActivityLogToFirestore(log, ownerUid, knownExists);
+    try {
+      await saveActivityLogToFirestore(log, ownerUid, knownExists);
+    } catch (err) {
+      warnings.push(`log:${log.id}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
+  return { savedClasses, savedLessons, warnings };
 }
 
 export function defaultShareCodeForUid(uid: string): string {
@@ -678,62 +712,97 @@ async function writeSinglePublicWorkspaceDoc(
   }
 }
 
+export interface PublishPublicWorkspaceResult {
+  workspaceId: string;
+  publishedPersonal: boolean;
+  publishedDefault: boolean;
+  personalError?: string;
+  defaultError?: string;
+  skippedStrippedAnswers?: boolean;
+  classesCount: number;
+  lessonsCount: number;
+  notificationsCount: number;
+}
+
 export async function publishPublicWorkspace(
   workspaceCode: string,
   ownerUid: string,
   classes: ClassRoom[],
   lessons: Lesson[],
   notifications: PushNotification[] = [],
-): Promise<string> {
+): Promise<PublishPublicWorkspaceResult> {
   const docId = toFirestoreDocId(workspaceCode, 64);
-  if (!isActiveOwner(ownerUid)) return docId;
-  const path = `publicWorkspaces/${docId}`;
-  try {
-    let existingLessons: Lesson[] = [];
+  if (!isActiveOwner(ownerUid)) {
+    return {
+      workspaceId: docId,
+      publishedPersonal: false,
+      publishedDefault: false,
+      classesCount: 0,
+      lessonsCount: 0,
+      notificationsCount: 0,
+    };
+  }
+
+  let existingLessons: Lesson[] = [];
+  for (const checkId of Array.from(new Set([docId, DEFAULT_PUBLIC_WORKSPACE_ID]))) {
     try {
-      const existingSnap = await getDoc(doc(db, 'publicWorkspaces', docId));
+      const existingSnap = await getDoc(doc(db, 'publicWorkspaces', checkId));
       if (existingSnap.exists() && Array.isArray(existingSnap.data()?.lessons)) {
-        existingLessons = existingSnap.data().lessons as Lesson[];
+        existingLessons = [...existingLessons, ...(existingSnap.data().lessons as Lesson[])];
       }
     } catch {
       // Non-fatal
     }
-    const healedLessons = dedupeById(recoverMissingCorrectAnswers(lessons, existingLessons));
-    // Hard anti-wipe guard: never publish student-sanitized lessons (all blank answers) to publicWorkspaces
-    if (hasStrippedAnswers(healedLessons)) {
-      return docId;
-    }
-    const cleanClasses = dedupeById(classes.filter((c) => !isDemoSeedClass(c)))
-      .slice(0, 100)
-      .map((c) => ({
-        id: String(c.id).slice(0, 64),
-        name: String(c.name || c.id).slice(0, 160),
-        grade: String(c.grade || 'Khối 5').slice(0, 60),
-        teacherName: String(c.teacherName || 'Giáo viên').slice(0, 120),
-        createdAt: String(c.createdAt || new Date().toISOString()).slice(0, 64),
-      }));
-    const cleanLessons = healedLessons.slice(0, 100).map((l) => {
-      const lid = toFirestoreDocId(l.id, 80);
-      return {
-        id: lid,
-        createdAt: String(l.createdAt || new Date().toISOString()).slice(0, 64),
-        ...sanitizeLessonFieldsForFirestore(l, lid),
-      };
-    });
-    const cleanNotifications = dedupeById(
-      notifications.filter((n) => !isDemoSeedArtifactId(n.id)),
-    )
-      .slice(0, 50)
-      .map((n) => ({
-        id: toFirestoreDocId(n.id || 'notif', 80),
-        classId: String(n.classId || '').slice(0, 64),
-        lessonId: toFirestoreDocId(n.lessonId || 'lesson', 80),
-        title: String(n.title || 'Thông báo').slice(0, 240),
-        message: String(n.message || '').slice(0, 1000),
-        createdAt: String(n.createdAt || new Date().toISOString()).slice(0, 64),
-        readByGroupIds: (n.readByGroupIds ?? []).slice(0, 100).map((g) => String(g).slice(0, 120)),
-      }));
+  }
 
+  const healedLessons = dedupeById(recoverMissingCorrectAnswers(lessons, existingLessons));
+  // Hard anti-wipe guard: never publish student-sanitized lessons (all blank answers) to publicWorkspaces
+  if (hasStrippedAnswers(healedLessons)) {
+    return {
+      workspaceId: docId,
+      publishedPersonal: false,
+      publishedDefault: false,
+      skippedStrippedAnswers: true,
+      classesCount: 0,
+      lessonsCount: 0,
+      notificationsCount: 0,
+    };
+  }
+
+  const cleanClasses = dedupeById(classes.filter((c) => !isDemoSeedClass(c)))
+    .slice(0, 100)
+    .map((c) => ({
+      id: normalizeClassCode(String(c.id)),
+      name: String(c.name || c.id).slice(0, 160),
+      grade: String(c.grade || 'Khối 5').slice(0, 60),
+      teacherName: String(c.teacherName || 'Giáo viên').slice(0, 120),
+      createdAt: String(c.createdAt || new Date().toISOString()).slice(0, 64),
+    }));
+  const cleanLessons = healedLessons.slice(0, 100).map((l) => {
+    const lid = toFirestoreDocId(l.id, 80);
+    return {
+      id: lid,
+      createdAt: String(l.createdAt || new Date().toISOString()).slice(0, 64),
+      ...sanitizeLessonFieldsForFirestore(l, lid),
+    };
+  });
+  const cleanNotifications = dedupeById(
+    notifications.filter((n) => !isDemoSeedArtifactId(n.id)),
+  )
+    .slice(0, 50)
+    .map((n) => ({
+      id: toFirestoreDocId(n.id || 'notif', 80),
+      classId: n.classId ? normalizeClassCode(String(n.classId)) : '',
+      lessonId: toFirestoreDocId(n.lessonId || 'lesson', 80),
+      title: String(n.title || 'Thông báo').slice(0, 240),
+      message: String(n.message || '').slice(0, 1000),
+      createdAt: String(n.createdAt || new Date().toISOString()).slice(0, 64),
+      readByGroupIds: (n.readByGroupIds ?? []).slice(0, 100).map((g) => String(g).slice(0, 120)),
+    }));
+
+  let publishedPersonal = false;
+  let personalError: string | undefined;
+  try {
     await writeSinglePublicWorkspaceDoc(
       docId,
       ownerUid,
@@ -741,28 +810,44 @@ export async function publishPublicWorkspace(
       cleanLessons,
       cleanNotifications,
     );
-
-    // Also update the school-wide `default` public workspace so students opening the root URL
-    // (without ?ws=...) automatically receive the teacher's latest classes, lessons & alerts.
-    if (docId !== DEFAULT_PUBLIC_WORKSPACE_ID && isActiveOwner(ownerUid)) {
-      try {
-        await writeSinglePublicWorkspaceDoc(
-          DEFAULT_PUBLIC_WORKSPACE_ID,
-          ownerUid,
-          cleanClasses,
-          cleanLessons,
-          cleanNotifications,
-        );
-      } catch {
-        // Non-admin secondary teachers only write their own WS-<code> doc; ignore permission denial on `default`.
-      }
-    }
-
-    return docId;
+    publishedPersonal = true;
   } catch (error) {
-    if (!isActiveOwner(ownerUid)) return docId;
-    handleFirestoreError(error, OperationType.WRITE, path);
+    personalError = error instanceof Error ? error.message : String(error);
+    console.warn(`Failed to publish publicWorkspaces/${docId}:`, personalError);
   }
+
+  // Also update the school-wide `default` public workspace so students opening the root URL
+  // in an incognito tab (without ?ws=... or login) automatically see all classes & assigned lessons.
+  let publishedDefault = docId === DEFAULT_PUBLIC_WORKSPACE_ID ? publishedPersonal : false;
+  let defaultError: string | undefined =
+    docId === DEFAULT_PUBLIC_WORKSPACE_ID ? personalError : undefined;
+
+  if (docId !== DEFAULT_PUBLIC_WORKSPACE_ID && isActiveOwner(ownerUid)) {
+    try {
+      await writeSinglePublicWorkspaceDoc(
+        DEFAULT_PUBLIC_WORKSPACE_ID,
+        ownerUid,
+        cleanClasses,
+        cleanLessons,
+        cleanNotifications,
+      );
+      publishedDefault = true;
+    } catch (error) {
+      defaultError = error instanceof Error ? error.message : String(error);
+      console.warn('Failed to publish publicWorkspaces/default:', defaultError);
+    }
+  }
+
+  return {
+    workspaceId: docId,
+    publishedPersonal,
+    publishedDefault,
+    personalError,
+    defaultError,
+    classesCount: cleanClasses.length,
+    lessonsCount: cleanLessons.length,
+    notificationsCount: cleanNotifications.length,
+  };
 }
 
 // =========================================================================

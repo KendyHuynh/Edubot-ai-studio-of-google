@@ -8,6 +8,7 @@ import {
   Clock,
   Copy,
   HelpCircle,
+  RefreshCw,
   Search,
   Send,
   WifiOff,
@@ -30,6 +31,7 @@ import {
   SessionIdentity,
   UiMode,
 } from '../shared/types';
+import { isLessonAssignedToClass } from '../utils/firestoreHelpers';
 
 export interface GroupLessonProgress {
   answeredQuestionIds: string[];
@@ -46,6 +48,7 @@ interface StudentArenaProps {
   notifications: PushNotification[];
   onGoToIdentity: () => void;
   onGoToHonorBoard: () => void;
+  onRefreshLessons?: () => Promise<void> | void;
   isOfflineEffective: boolean;
   onOnlineSubmission: (submission: AnswerSubmission) => void;
   onQueueOffline: (item: OfflineQueueItem) => void;
@@ -78,6 +81,7 @@ export function StudentArena({
   notifications,
   onGoToIdentity,
   onGoToHonorBoard,
+  onRefreshLessons,
   isOfflineEffective,
   onOnlineSubmission,
   onQueueOffline,
@@ -90,6 +94,7 @@ export function StudentArena({
   const [tfMultiSelections, setTfMultiSelections] = useState<Array<boolean | null>>([]);
   const [textAnswer, setTextAnswer] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [refreshingLessons, setRefreshingLessons] = useState(false);
   const [copiedHint, setCopiedHint] = useState(false);
   const [feedback, setFeedback] = useState<LocalFeedbackState | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -97,7 +102,7 @@ export function StudentArena({
   const startTimeRef = useRef<number>(Date.now());
 
   const classLessons = session
-    ? lessons.filter((l) => l.assignedClassIds.includes(session.classId))
+    ? lessons.filter((l) => isLessonAssignedToClass(l, session.classId))
     : [];
 
   // Strictly restrict activeLesson to lessons assigned to the student's checked-in class
@@ -219,18 +224,46 @@ export function StudentArena({
         )}
 
         {classLessons.length === 0 ? (
-          <div className="bg-white border border-slate-200 rounded-2xl p-10 text-center space-y-2">
+          <div className="bg-white border border-slate-200 rounded-2xl p-10 text-center space-y-3">
             <BookOpen className="w-8 h-8 text-slate-400 mx-auto" />
             <h2 className="text-base font-semibold text-slate-900">
               {lang === 'vi'
                 ? `Lớp ${session.classId} chưa có bài học nào được giao`
                 : `No lessons assigned to ${session.classId} yet`}
             </h2>
-            <p className="text-sm text-slate-500">
+            <p className="text-sm text-slate-500 max-w-lg mx-auto">
               {lang === 'vi'
-                ? 'Giáo viên có thể tải tài liệu bài học hoặc giao bài có sẵn tại mục Giáo viên.'
-                : 'Teachers can upload a lesson or assign existing lessons in Teacher Studio.'}
+                ? 'Học sinh không cần đăng nhập tài khoản. Nếu Thầy/Cô vừa giao bài hoặc đồng bộ Firestore xong, hãy bấm nút tải lại bên dưới.'
+                : 'No student login required. If your teacher just assigned or synced a lesson, tap refresh below.'}
             </p>
+            {onRefreshLessons && (
+              <div className="pt-1">
+                <button
+                  type="button"
+                  disabled={refreshingLessons || isOfflineEffective}
+                  onClick={async () => {
+                    setRefreshingLessons(true);
+                    try {
+                      await onRefreshLessons();
+                    } finally {
+                      setRefreshingLessons(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-2 px-4 py-2 text-xs sm:text-sm font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-xl disabled:opacity-50 cursor-pointer"
+                >
+                  <RefreshCw className={`w-4 h-4 ${refreshingLessons ? 'animate-spin' : ''}`} />
+                  <span>
+                    {refreshingLessons
+                      ? lang === 'vi'
+                        ? 'Đang tải bài học mới nhất...'
+                        : 'Refreshing lessons...'
+                      : lang === 'vi'
+                        ? 'Tải lại bài học từ máy chủ'
+                        : 'Refresh lessons from cloud'}
+                  </span>
+                </button>
+              </div>
+            )}
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">

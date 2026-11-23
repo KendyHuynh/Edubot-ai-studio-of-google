@@ -49,6 +49,7 @@ import {
   isDefaultSeedClassesOnly,
   isDemoSeedArtifactId,
   isDemoSeedClass,
+  isLessonAssignedToClass,
   LEGACY_FALLBACK_WORKSPACE_ID,
   mergeLatestSubmissions,
   mergeSubmissionActivityLogs,
@@ -397,7 +398,7 @@ function gradeOneLocally(
   if (
     item.classId &&
     lesson.assignedClassIds.length > 0 &&
-    !lesson.assignedClassIds.includes(item.classId)
+    !isLessonAssignedToClass(lesson, item.classId)
   ) {
     return { status: 'forbidden' };
   }
@@ -812,7 +813,7 @@ export async function handleLocalApi(
     // Strict class isolation for students: only expose lessons assigned to their class
     const visibleLessons =
       !includeAnswers && classId
-        ? store.lessons.filter((l) => l.assignedClassIds.includes(classId))
+        ? store.lessons.filter((l) => isLessonAssignedToClass(l, classId))
         : store.lessons;
 
     const sanitizedLessons = visibleLessons.map((lesson) => ({
@@ -1109,8 +1110,10 @@ export async function handleLocalApi(
     if (!lesson) {
       return { ok: false, status: 404, data: { error: 'Không tìm thấy bài học.' } };
     }
-    const previous = new Set(lesson.assignedClassIds);
-    const nextList = Array.from(new Set(classIds ?? []));
+    const previous = new Set(lesson.assignedClassIds.map((c) => normalizeClassCode(c)));
+    const nextList = Array.from(
+      new Set((classIds ?? []).map((c) => normalizeClassCode(String(c ?? ''))).filter(Boolean)),
+    );
     lesson.assignedClassIds = nextList;
     for (const cid of nextList) {
       if (!previous.has(cid)) {

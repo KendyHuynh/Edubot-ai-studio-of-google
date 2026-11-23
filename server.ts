@@ -11,6 +11,7 @@ import {
   isDefaultSeedClassesOnly,
   isDemoSeedArtifactId,
   isDemoSeedClass,
+  isLessonAssignedToClass,
   LEGACY_FALLBACK_WORKSPACE_ID,
   mergeLatestSubmissions,
   mergeSubmissionActivityLogs,
@@ -622,7 +623,7 @@ async function startServer() {
     // Strict class isolation for students: only expose lessons assigned to their checked-in class
     const visibleLessons =
       !includeAnswers && classId
-        ? store.lessons.filter((l) => l.assignedClassIds.includes(classId))
+        ? store.lessons.filter((l) => isLessonAssignedToClass(l, classId))
         : store.lessons;
 
     const sanitizedLessons = visibleLessons.map((lesson) => ({
@@ -1087,8 +1088,10 @@ async function startServer() {
       return;
     }
 
-    const previous = new Set(lesson.assignedClassIds);
-    const nextList = Array.from(new Set(classIds ?? []));
+    const previous = new Set(lesson.assignedClassIds.map((c) => normalizeClassCode(c)));
+    const nextList = Array.from(
+      new Set((classIds ?? []).map((c) => normalizeClassCode(String(c ?? ''))).filter(Boolean)),
+    );
     lesson.assignedClassIds = nextList;
 
     for (const cid of nextList) {
@@ -1151,7 +1154,7 @@ async function startServer() {
     if (
       Array.isArray(lesson.assignedClassIds) &&
       lesson.assignedClassIds.length > 0 &&
-      !lesson.assignedClassIds.includes(item.classId)
+      !isLessonAssignedToClass(lesson, item.classId)
     ) {
       return { status: 'forbidden' };
     }

@@ -64,6 +64,26 @@ export function normalizeClassCode(raw: string): string {
   return toFirestoreDocId(raw, 64).toUpperCase();
 }
 
+/**
+ * Matches a lesson's assignedClassIds against a class code using normalized uppercase ASCII comparison
+ * so minor spacing, case, or Vietnamese accent differences never hide a lesson from students.
+ */
+export function isLessonAssignedToClass(
+  lesson: Pick<Lesson, 'assignedClassIds'> | null | undefined,
+  classId: string | null | undefined,
+): boolean {
+  if (!lesson || !Array.isArray(lesson.assignedClassIds) || !classId?.trim()) {
+    return false;
+  }
+  const target = normalizeClassCode(classId);
+  if (!target) return false;
+  return lesson.assignedClassIds.some((cid) => {
+    const raw = String(cid ?? '').trim();
+    if (!raw) return false;
+    return raw === classId.trim() || normalizeClassCode(raw) === target;
+  });
+}
+
 const DEMO_SEED_CLASS_SIGNATURES = new Map<string, string>([
   ['LOP-5A', 'Cô Minh Anh'],
   ['LOP-5B', 'Thầy Quốc Bảo'],
@@ -325,12 +345,21 @@ export function sanitizeQuestionForFirestore(q: Question, idx: number, lessonId:
  * Prepares Lesson mutable payload matching firestore.rules isValidLesson bounds.
  */
 export function sanitizeLessonFieldsForFirestore(lesson: Lesson, docId: string) {
+  const cleanAssigned = Array.from(
+    new Set(
+      (lesson.assignedClassIds ?? [])
+        .map((c) => String(c ?? '').trim())
+        .filter(Boolean)
+        .map((c) => normalizeClassCode(c))
+        .filter(Boolean),
+    ),
+  ).slice(0, 50);
   return {
     title: (lesson.title || 'Bài học Công dân số').slice(0, 240),
     topic: (lesson.topic || lesson.title || 'Công dân số').slice(0, 240),
     sourceFileName: (lesson.sourceFileName || 'BaiHoc_CongDanSo.txt').slice(0, 200),
     summary: (lesson.summary || '').slice(0, 2000),
-    assignedClassIds: (lesson.assignedClassIds ?? []).slice(0, 50).map((c) => String(c).slice(0, 64)),
+    assignedClassIds: cleanAssigned,
     questions: (lesson.questions ?? [])
       .slice(0, 30)
       .map((q, idx) => sanitizeQuestionForFirestore(q, idx, docId)),
