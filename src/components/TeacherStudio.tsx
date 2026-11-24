@@ -223,6 +223,9 @@ export function TeacherStudio({
     lessonsCount: number;
     checkedAt: string;
   } | null>(null);
+  const [homeLearnersCount, setHomeLearnersCount] = useState<number>(
+    () => syncMeta?.learnersCount ?? 0,
+  );
   const cloudSyncingRef = useRef(false);
   const hydratedUidRef = useRef<string | null>(null);
 
@@ -1351,7 +1354,9 @@ export function TeacherStudio({
             >
               <Gift className="w-4 h-4 text-amber-600" />
               <span>
-                {lang === 'vi' ? 'Tự đánh giá & Khen thưởng' : 'Self-Study & Awards'}
+                {lang === 'vi'
+                  ? `Tự đánh giá & Vinh danh${homeLearnersCount > 0 ? ` (${homeLearnersCount})` : ''}`
+                  : `Self-Study & Honors${homeLearnersCount > 0 ? ` (${homeLearnersCount})` : ''}`}
               </span>
             </button>
             <button
@@ -3081,6 +3086,26 @@ export function TeacherStudio({
           workspaceCode={shareCode}
           cloudSignedIn={Boolean(cloudUser)}
           teacherEmail={cloudUser?.email}
+          onSignInCloud={async () => {
+            setSigningInCloud(true);
+            setCloudNotice(null);
+            try {
+              const res = await firebaseGoogleSignIn();
+              if (res?.user) {
+                await syncWithCloud(res.user, true);
+              }
+            } catch (err) {
+              const formatted = formatFirebaseAuthError(err, lang);
+              setCloudNotice({
+                type: 'err',
+                text: formatted.message,
+                suggestNewTab: formatted.suggestNewTab,
+              });
+            } finally {
+              setSigningInCloud(false);
+            }
+          }}
+          onLearnersCountChange={setHomeLearnersCount}
           lang={lang}
         />
       )}

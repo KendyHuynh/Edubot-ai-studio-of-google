@@ -629,6 +629,7 @@ export default function App() {
             <HonorBoard
               classes={classes}
               selectedClassId={honorClassId}
+              isTeacherPortal
               onChangeClass={(cid) => {
                 setHonorClassId(cid);
                 setHonorLessonId('');

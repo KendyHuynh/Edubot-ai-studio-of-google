@@ -10,8 +10,10 @@ import {
   applyAssessmentOutcomesDetailed,
   applyAssessmentOutcomesToProfile,
   buildAdvancedExpansionDeck,
+  buildCohortCompetencyOverview,
   buildCompetencyFocusDeck,
   buildDiagnosticDeck,
+  buildHomeHonorNominations,
   buildLevelChallengeDeck,
   buildPublicLearnerHonorList,
   buildVarietySprintDeck,
@@ -19,8 +21,11 @@ import {
   createEmptyLearnerProfile,
   getExerciseBaseXp,
   getExpansionUnlockSummary,
+  getLearnerActivityStatus,
   getUnlockedAssessmentBank,
   gradeAssessmentExercise,
+  mergeLearnerProfiles,
+  sanitizeMasteryForFirestore,
   shuffleStepsNonTrivial,
 } from './assessmentEngine';
 
@@ -391,3 +396,155 @@ test('progressive level unlocking expands bank 96 -> 108 -> 126 -> 144 and prior
     'Deck builder should prioritize all 10 unattempted expansion items ahead of already-mastered ones',
   );
 });
+
+test('mergeLearnerProfiles monotonically preserves cross-device mastery, exerciseHistory, and XP without data loss', () => {
+  const deviceA = createEmptyLearnerProfile({
+    uid: 'u-merge-1',
+    authType: 'google',
+    email: 'an.nguyen@gmail.com',
+    fullName: 'Nguyễn An',
+    className: '6A',
+    schoolName: 'THCS Lê Lợi',
+    gradeBand: 'middle',
+  });
+  deviceA.totalXp = 320;
+  deviceA.totalExercisesDone = 8;
+  deviceA.totalCorrect = 7;
+  deviceA.bestCombo = 5;
+  deviceA.currentLevel = 2;
+  deviceA.updatedAt = '2026-11-23T08:00:00Z';
+  deviceA.lastActiveAt = '2026-11-23T08:00:00Z';
+  deviceA.masteryByCompetency = {
+    '1.1': {
+      competencyId: '1.1',
+      highestLevel: 3,
+      attempts: 3,
+      correctCount: 3,
+      xp: 125,
+      lastPracticedAt: '2026-11-23T08:00:00Z',
+      exerciseHistory: {
+        'ex-1.1-l1': { attempts: 1, correctCount: 1, reviewBonusCount: 0, lastAttemptAt: '2026-11-23T08:00:00Z' },
+      },
+    },
+  };
+
+  const deviceB = createEmptyLearnerProfile({
+    uid: 'u-merge-1',
+    authType: 'google',
+    email: 'an.nguyen@gmail.com',
+    fullName: 'Nguyễn Văn An',
+    className: '6A',
+    schoolName: 'THCS Lê Lợi',
+    gradeBand: 'middle',
+  });
+  deviceB.totalXp = 180;
+  deviceB.totalExercisesDone = 4;
+  deviceB.totalCorrect = 4;
+  deviceB.updatedAt = '2026-11-24T09:00:00Z';
+  deviceB.lastActiveAt = '2026-11-24T09:00:00Z';
+  deviceB.masteryByCompetency = {
+    '4.2': {
+      competencyId: '4.2',
+      highestLevel: 2,
+      attempts: 2,
+      correctCount: 2,
+      xp: 65,
+      lastPracticedAt: '2026-11-24T09:00:00Z',
+      exerciseHistory: {
+        'ex-4.2-l2': { attempts: 1, correctCount: 1, reviewBonusCount: 0, lastAttemptAt: '2026-11-24T09:00:00Z' },
+      },
+    },
+  };
+
+  const merged = mergeLearnerProfiles(deviceA, deviceB);
+  assert.equal(merged.fullName, 'Nguyễn Văn An'); // newer metadata
+  assert.equal(merged.totalXp, 320); // never regresses
+  assert.equal(merged.totalExercisesDone, 8);
+  assert.equal(merged.bestCombo, 5);
+  assert.equal(merged.masteryByCompetency['1.1']?.highestLevel, 3);
+  assert.equal(merged.masteryByCompetency['4.2']?.highestLevel, 2);
+  assert.equal(merged.masteryByCompetency['1.1']?.exerciseHistory?.['ex-1.1-l1']?.correctCount, 1);
+  assert.equal(merged.masteryByCompetency['4.2']?.exerciseHistory?.['ex-4.2-l2']?.correctCount, 1);
+
+  // sanitizeMasteryForFirestore removes invalid/undefined fields cleanly
+  const clean = sanitizeMasteryForFirestore({
+    '1.1': {
+      competencyId: '1.1',
+      highestLevel: 4,
+      attempts: 5,
+      correctCount: 5,
+      xp: 200,
+      lastPracticedAt: '2026-11-24T09:00:00Z',
+      exerciseHistory: undefined,
+    },
+  });
+  assert.deepEqual(clean['1.1'].exerciseHistory, {});
+});
+
+test('buildCohortCompetencyOverview and buildHomeHonorNominations summarize home learners for Teacher Honors', () => {
+  const nowMs = Date.parse('2026-11-24T12:00:00Z');
+
+  const s1 = createEmptyLearnerProfile({
+    uid: 's-1',
+    authType: 'google',
+    email: 'hoa@gmail.com',
+    fullName: 'Lê Quỳnh Hoa',
+    className: '9A',
+    schoolName: 'THCS Nguyễn Du',
+    gradeBand: 'middle',
+  });
+  s1.totalXp = 540;
+  s1.currentLevel = 3;
+  s1.totalExercisesDone = 12;
+  s1.totalCorrect = 11;
+  s1.bestCombo = 8;
+  s1.lastActiveAt = '2026-11-24T08:00:00Z'; // today
+  s1.masteryByCompetency = {
+    '1.1': { competencyId: '1.1', highestLevel: 3, attempts: 3, correctCount: 3, xp: 125, lastPracticedAt: s1.lastActiveAt },
+    '4.2': { competencyId: '4.2', highestLevel: 4, attempts: 4, correctCount: 4, xp: 200, lastPracticedAt: s1.lastActiveAt },
+  };
+
+  const s2 = createEmptyLearnerProfile({
+    uid: 's-2',
+    authType: 'google',
+    email: 'nam@gmail.com',
+    fullName: 'Phạm Hoàng Nam',
+    className: '9A',
+    schoolName: 'THCS Nguyễn Du',
+    gradeBand: 'middle',
+  });
+  s2.totalXp = 210;
+  s2.currentLevel = 2;
+  s2.totalExercisesDone = 15;
+  s2.totalCorrect = 10;
+  s2.bestCombo = 4;
+  s2.lastActiveAt = '2026-11-21T10:00:00Z'; // within 7 days
+  s2.masteryByCompetency = {
+    '1.1': { competencyId: '1.1', highestLevel: 1, attempts: 2, correctCount: 2, xp: 50, lastPracticedAt: s2.lastActiveAt },
+  };
+
+  assert.equal(getLearnerActivityStatus(s1, nowMs), 'today');
+  assert.equal(getLearnerActivityStatus(s2, nowMs), 'week');
+
+  const overview = buildCohortCompetencyOverview([s1, s2], nowMs);
+  assert.equal(overview.learnerCount, 2);
+  assert.equal(overview.activeTodayCount, 1);
+  assert.equal(overview.activeWeekCount, 2);
+  assert.equal(overview.domains.length, 6);
+  const comp11 = overview.domains[0].competencies.find((c) => c.competencyId === '1.1')!;
+  assert.equal(comp11.masteredLearners, 2);
+  assert.equal(comp11.masteryRatePercent, 100);
+  assert.equal(overview.strongestCompetencies[0].competencyId, '1.1');
+
+  const nominations = buildHomeHonorNominations([s1, s2]);
+  assert.ok(nominations.length >= 3);
+  assert.equal(
+    nominations.find((n) => n.categoryId === 'overall_champion')?.learner.uid,
+    's-1',
+  );
+  assert.equal(
+    nominations.find((n) => n.categoryId === 'diligent_learner')?.learner.uid,
+    's-2',
+  );
+});
+

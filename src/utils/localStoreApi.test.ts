@@ -1062,7 +1062,7 @@ test('localStoreApi awards partial credit for fuzzy fill_blank near-match and al
   );
 });
 
-test('localStoreApi requires verified Google login (rejects guest with 401) and enforces anti-farming retry XP caps on assessment-submit', async () => {
+test('localStoreApi isolates Google accounts (401 without token), enforces anti-farming retry XP caps, and supports zero-login guestUid end-to-end', async () => {
   const storage = createMemoryStorage();
   await withMockFetch(
     async (input, init) => {
@@ -1087,35 +1087,35 @@ test('localStoreApi requires verified Google login (rejects guest with 401) and 
       return new Response(JSON.stringify({}), { status: 404 });
     },
     async () => {
-      // 1) Guest / anonymous calls without verified Google idToken MUST be rejected with 401
-      const guestProfileRes = await handleLocalApi(
+      // 1) Unauthenticated calls without idToken or valid guestUid MUST still be rejected with 401
+      const spoofProfileRes = await handleLocalApi(
         '/api/learners/profile',
         {
           method: 'POST',
           body: JSON.stringify({
-            uid: 'guest-peek-1',
-            fullName: 'Khách xem trộm',
+            uid: 'uid-google-student-2',
+            fullName: 'Giả mạo Google UID',
             className: '5A',
             schoolName: 'TH Test',
           }),
         },
         storage,
       );
-      assert.equal(guestProfileRes.status, 401);
+      assert.equal(spoofProfileRes.status, 401);
 
-      const guestMeRes = await handleLocalApi(
-        '/api/learners/me?uid=guest-peek-1',
+      const spoofMeRes = await handleLocalApi(
+        '/api/learners/me?uid=uid-google-student-2',
         { method: 'GET' },
         storage,
       );
-      assert.equal(guestMeRes.status, 401);
+      assert.equal(spoofMeRes.status, 401);
 
-      const guestSubmitRes = await handleLocalApi(
+      const spoofSubmitRes = await handleLocalApi(
         '/api/learners/assessment-submit',
         {
           method: 'POST',
           body: JSON.stringify({
-            uid: 'guest-peek-1',
+            uid: 'uid-google-student-2',
             mode: 'diagnostic',
             maxCombo: 1,
             outcomes: [
@@ -1125,7 +1125,23 @@ test('localStoreApi requires verified Google login (rejects guest with 401) and 
         },
         storage,
       );
-      assert.equal(guestSubmitRes.status, 401);
+      assert.equal(spoofSubmitRes.status, 401);
+
+      // Invalid short guestUid must also be rejected with 401
+      const invalidGuestRes = await handleLocalApi(
+        '/api/learners/profile',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            guestUid: 'bad-id',
+            fullName: 'Sai định dạng',
+            className: '5A',
+            schoolName: 'TH Test',
+          }),
+        },
+        storage,
+      );
+      assert.equal(invalidGuestRes.status, 401);
 
       // 2) Verified Google student completes profile
       const profileRes = await handleLocalApi(
@@ -1217,6 +1233,95 @@ test('localStoreApi requires verified Google login (rejects guest with 401) and 
       assert.equal(run3Data.attempt.xpEarned, 0);
       assert.equal(run3Data.attempt.outcomes[0].retryTier, 'practice_no_xp');
       assert.equal(run3Data.profile.totalXp, 87);
+
+      // 6) Zero-login student (valid guestUid) creates profile, submits 24-skill assessment, appears on Honor Board, and receives Teacher Award!
+      const guestUid = 'guest-5a-minh-khoi-test1';
+      const guestCreate = await handleLocalApi(
+        '/api/learners/profile',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            guestUid,
+            fullName: 'Trần Minh Khôi',
+            className: '5A',
+            schoolName: 'TH Nguyễn Du',
+            gradeBand: 'primary',
+          }),
+        },
+        storage,
+      );
+      assert.equal(guestCreate.ok, true);
+      assert.equal((guestCreate.data as { profile: { authType: string } }).profile.authType, 'guest');
+
+      const guestRun1 = await handleLocalApi(
+        '/api/learners/assessment-submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            guestUid,
+            mode: 'diagnostic',
+            maxCombo: 2,
+            outcomes: [
+              { exerciseId: 'ex-1.1-l1', competencyId: '1.1', level: 1, type: 'scenario_choice', isCorrect: true, xpEarned: 25 },
+              { exerciseId: 'ex-4.1-l1', competencyId: '4.1', level: 1, type: 'scenario_choice', isCorrect: true, xpEarned: 25 },
+            ],
+          }),
+        },
+        storage,
+      );
+      assert.equal(guestRun1.ok, true);
+      assert.equal((guestRun1.data as { profile: { totalXp: number } }).profile.totalXp, 50);
+
+      // Zero-login student can resume via GET /api/learners/me?uid=guest-...
+      const guestMe = await handleLocalApi(
+        `/api/learners/me?uid=${encodeURIComponent(guestUid)}`,
+        { method: 'GET' },
+        storage,
+      );
+      assert.equal(guestMe.ok, true);
+      assert.equal((guestMe.data as { profile: { totalXp: number; fullName: string } }).profile.totalXp, 50);
+
+      // Both Google student and Zero-Login student appear on public Honor Board with zero PII leaked
+      const honorRes = await handleLocalApi('/api/learners/honor', { method: 'GET' }, storage);
+      assert.equal(honorRes.ok, true);
+      const honorEntries = (honorRes.data as { entries: Array<{ uid: string; email?: string; authType: string }> }).entries;
+      assert.equal(honorEntries.length, 2);
+      assert.ok(honorEntries.some((h) => h.uid === guestUid && h.authType === 'guest'));
+      assert.ok(honorEntries.every((h) => h.email === undefined));
+
+      // Teacher sees BOTH students and can award bonus XP to the Zero-Login student
+      const teacherToken = await seedAuthenticatedTeacherToken(storage);
+      const teacherList = await handleLocalApi(
+        '/api/teacher/learners',
+        { method: 'GET', authToken: teacherToken },
+        storage,
+      );
+      assert.equal(teacherList.ok, true);
+      assert.equal((teacherList.data as { learners: unknown[] }).learners.length, 2);
+
+      const awardRes = await handleLocalApi(
+        '/api/teacher/awards',
+        {
+          method: 'POST',
+          authToken: teacherToken,
+          body: JSON.stringify({
+            learnerUid: guestUid,
+            badgeId: 'digital_star',
+            badgeTitle: 'Ngôi sao Tự học ở nhà',
+            bonusXp: 100,
+            message: 'Tuyên dương em Minh Khôi tự học rất tốt!',
+          }),
+        },
+        storage,
+      );
+      assert.equal(awardRes.ok, true);
+      const guestAfterAward = await handleLocalApi(
+        `/api/learners/me?uid=${encodeURIComponent(guestUid)}`,
+        { method: 'GET' },
+        storage,
+      );
+      assert.equal((guestAfterAward.data as { profile: { totalXp: number }; awards: unknown[] }).profile.totalXp, 150);
+      assert.equal((guestAfterAward.data as { awards: unknown[] }).awards.length, 1);
     },
   );
 });
@@ -1683,6 +1788,155 @@ test('dedicated Student Public Memory serves classes & lessons to students with 
       assert.equal(memData.classes[0].id, 'LOP-9-5');
       assert.equal(memData.lessons[0].id, 'lesson-95-student-mem');
       assert.equal(memData.lessons[0].questions[0].correctAnswer, undefined);
+    },
+  );
+});
+
+test('cross-device personal email learner hydration & baseProfile prevent XP wipe and teacher can honor remote cloud learners', async () => {
+  await withMockFetch(
+    (url) => {
+      if (url.includes('identitytoolkit.googleapis.com/v1/accounts:lookup')) {
+        return new Response(
+          JSON.stringify({
+            users: [
+              {
+                localId: 'student-home-uid-99',
+                email: 'minh.an.9a@gmail.com',
+                emailVerified: true,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    },
+    async () => {
+      resetLocalHydrationCache();
+      const deviceBStorage = createMemoryStorage();
+
+      const cloudProfileFromDeviceA = {
+        uid: 'student-home-uid-99',
+        authType: 'google' as const,
+        email: 'minh.an.9a@gmail.com',
+        fullName: 'Trần Minh An',
+        className: '9A',
+        schoolName: 'THCS Nguyễn Du',
+        gradeBand: 'middle' as const,
+        role: 'student' as const,
+        profileCompleted: true,
+        currentLevel: 2 as const,
+        totalXp: 420,
+        bestCombo: 6,
+        totalExercisesDone: 10,
+        totalCorrect: 9,
+        masteryByCompetency: {
+          '1.1': {
+            competencyId: '1.1',
+            highestLevel: 2 as const,
+            attempts: 2,
+            correctCount: 2,
+            xp: 65,
+            lastPracticedAt: '2026-11-23T10:00:00Z',
+            exerciseHistory: {
+              'ex-1.1-l1': { attempts: 1, correctCount: 1, reviewBonusCount: 0, lastAttemptAt: '2026-11-23T10:00:00Z' },
+              'ex-1.1-l2': { attempts: 1, correctCount: 1, reviewBonusCount: 0, lastAttemptAt: '2026-11-23T10:00:00Z' },
+            },
+          },
+        },
+        createdAt: '2026-11-20T08:00:00Z',
+        updatedAt: '2026-11-23T10:00:00Z',
+        lastActiveAt: '2026-11-23T10:00:00Z',
+      };
+
+      // 1) Device B hydrates from Cloud Firestore via POST /api/learners/hydrate
+      const hydrateRes = await handleLocalApi(
+        '/api/learners/hydrate',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idToken: 'fake-google-token',
+            profile: cloudProfileFromDeviceA,
+          }),
+        },
+        deviceBStorage,
+      );
+      assert.equal(hydrateRes.ok, true);
+      const hydrated = (hydrateRes.data as { profile: { totalXp: number; email?: string } }).profile;
+      assert.equal(hydrated.totalXp, 420);
+      assert.equal(hydrated.email, 'minh.an.9a@gmail.com');
+
+      // 2) Even if storage was cleared again right before submitting, baseProfile preserves prior 420 XP!
+      const freshStorageAfterClear = createMemoryStorage();
+      const submitRes = await handleLocalApi(
+        '/api/learners/assessment-submit',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            idToken: 'fake-google-token',
+            learnerName: 'Trần Minh An',
+            className: '9A',
+            schoolName: 'THCS Nguyễn Du',
+            gradeBand: 'middle',
+            baseProfile: cloudProfileFromDeviceA,
+            mode: 'competency_focus',
+            targetCompetencyId: '4.2',
+            maxCombo: 2,
+            outcomes: [
+              {
+                exerciseId: 'ex-4.2-l1',
+                competencyId: '4.2',
+                level: 1,
+                type: 'scenario_choice',
+                isCorrect: true,
+                xpEarned: 25,
+              },
+            ],
+          }),
+        },
+        freshStorageAfterClear,
+      );
+      assert.equal(submitRes.ok, true);
+      const afterSubmit = (
+        submitRes.data as {
+          profile: {
+            totalXp: number;
+            totalExercisesDone: number;
+            masteryByCompetency: Record<string, { highestLevel: number }>;
+          };
+        }
+      ).profile;
+      assert.equal(afterSubmit.totalXp, 445);
+      assert.equal(afterSubmit.totalExercisesDone, 11);
+      assert.equal(afterSubmit.masteryByCompetency['1.1']?.highestLevel, 2);
+      assert.equal(afterSubmit.masteryByCompetency['4.2']?.highestLevel, 1);
+
+      // 3) Teacher on a separate browser awards a remote Cloud student using learnerSnapshot
+      const teacherStorage = createMemoryStorage();
+      const teacherToken = await seedAuthenticatedTeacherToken(teacherStorage);
+      const awardRes = await handleLocalApi(
+        '/api/teacher/awards',
+        {
+          method: 'POST',
+          authToken: teacherToken,
+          body: JSON.stringify({
+            learnerUid: 'student-home-uid-99',
+            learnerSnapshot: afterSubmit,
+            badgeId: 'master_24',
+            badgeTitle: 'Thủ khoa 24 Năng lực',
+            message: 'Cô tuyên dương tinh thần tự học ở nhà rất xuất sắc!',
+            bonusXp: 100,
+          }),
+        },
+        teacherStorage,
+      );
+      assert.equal(awardRes.ok, true);
+      const awardData = awardRes.data as {
+        award: { badgeTitle: string; bonusXp: number };
+        learner: { totalXp: number };
+      };
+      assert.equal(awardData.award.badgeTitle, 'Thủ khoa 24 Năng lực');
+      assert.equal(awardData.learner.totalXp, 545);
     },
   );
 });

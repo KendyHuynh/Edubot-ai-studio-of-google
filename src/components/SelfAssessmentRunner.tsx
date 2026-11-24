@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDown,
   ArrowLeft,
@@ -7,6 +7,8 @@ import {
   Award,
   Check,
   CheckCircle2,
+  Cloud,
+  CloudOff,
   Flame,
   Lightbulb,
   Link2,
@@ -39,6 +41,11 @@ import {
   UiMode,
 } from '../shared/types';
 
+export interface SessionSaveOutcome {
+  cloudSaved: boolean;
+  error?: string;
+}
+
 interface SelfAssessmentRunnerProps {
   title: string;
   mode: AssessmentSessionMode;
@@ -52,7 +59,7 @@ interface SelfAssessmentRunnerProps {
     targetCompetencyId?: string;
     outcomes: AssessmentExerciseOutcome[];
     maxCombo: number;
-  }) => Promise<void>;
+  }) => Promise<SessionSaveOutcome | void>;
   onExit: () => void;
   lang: Language;
   uiMode: UiMode;
@@ -107,6 +114,8 @@ export function SelfAssessmentRunner({
   } | null>(null);
   const [finished, setFinished] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveOutcome, setSaveOutcome] = useState<SessionSaveOutcome | null>(null);
+  const flushedRef = useRef(false);
 
   // Per-mechanic interactive state
   const [selectedOption, setSelectedOption] = useState<string>('');
@@ -267,24 +276,52 @@ export function SelfAssessmentRunner({
     });
   };
 
-  const handleNext = async () => {
-    if (index + 1 < exercises.length) {
-      setIndex((i) => i + 1);
-      return;
-    }
-    setFinished(true);
+  const flushSession = async (): Promise<SessionSaveOutcome | void> => {
+    if (flushedRef.current || outcomes.length === 0) return;
+    flushedRef.current = true;
     setSaving(true);
     try {
-      await onCompleteSession({
+      const res = await onCompleteSession({
         mode,
         targetLevel,
         targetCompetencyId,
         outcomes,
         maxCombo,
       });
+      if (res) {
+        setSaveOutcome(res);
+      } else {
+        setSaveOutcome({ cloudSaved: true });
+      }
+      return res;
+    } catch (err) {
+      flushedRef.current = false;
+      const errOutcome: SessionSaveOutcome = {
+        cloudSaved: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      setSaveOutcome(errOutcome);
+      return errOutcome;
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleNext = async () => {
+    if (index + 1 < exercises.length) {
+      setIndex((i) => i + 1);
+      return;
+    }
+    setFinished(true);
+    await flushSession();
+  };
+
+  const handleSafeExit = async () => {
+    if (saving) return;
+    if (outcomes.length > 0 && !flushedRef.current) {
+      await flushSession();
+    }
+    onExit();
   };
 
   // Completion Summary Screen
@@ -391,15 +428,33 @@ export function SelfAssessmentRunner({
         )}
 
         <div className="pt-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3">
-          <span className="text-xs text-slate-500">
-            {saving
-              ? lang === 'vi'
-                ? 'Đang lưu kết quả vào hồ sơ 24 năng lực...'
-                : 'Saving results to your 24-competency profile...'
-              : lang === 'vi'
-                ? 'Kết quả đã được lưu vào Hồ sơ 24 Năng lực của em!'
-                : 'Results saved to your 24-Competency Profile!'}
-          </span>
+          <div className="flex items-center gap-2 text-xs">
+            {saving ? (
+              <span className="text-sky-700 font-semibold">
+                {lang === 'vi'
+                  ? 'Đang lưu thành tích vào Hồ sơ 24 Năng lực & Đám mây...'
+                  : 'Saving achievement to your 24-competency cloud profile...'}
+              </span>
+            ) : saveOutcome?.cloudSaved === false ? (
+              <span className="inline-flex items-center gap-1.5 text-amber-800 font-semibold">
+                <CloudOff className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>
+                  {lang === 'vi'
+                    ? `Đã lưu tạm trên máy (chưa đồng bộ Đám mây: ${saveOutcome.error || 'mất mạng'}). Em có thể bấm Đồng bộ lại ở màn hình chính.`
+                    : `Saved locally (Cloud sync pending: ${saveOutcome.error || 'offline'}).`}
+                </span>
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 text-emerald-700 font-semibold">
+                <Cloud className="w-4 h-4 shrink-0" />
+                <span>
+                  {lang === 'vi'
+                    ? 'Đã lưu thành tích lên Đám mây — Thầy/Cô có thể xem tổng hợp và vinh danh em ngay!'
+                    : 'Saved to Cloud — Your teacher can now review your progress and honor you!'}
+                </span>
+              </span>
+            )}
+          </div>
           <button
             type="button"
             disabled={saving}
@@ -437,11 +492,24 @@ export function SelfAssessmentRunner({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <button
             type="button"
-            onClick={onExit}
-            className="inline-flex items-center gap-1.5 text-xs sm:text-sm font-semibold text-slate-600 hover:text-slate-900 cursor-pointer"
+            disabled={saving}
+            onClick={() => void handleSafeExit()}
+            className="inline-flex items-center gap-1.5 text-xs sm:text-sm font-semibold text-slate-600 hover:text-slate-900 disabled:opacity-50 cursor-pointer"
           >
             <ArrowLeft className="w-4 h-4" />
-            <span>{lang === 'vi' ? 'Thoát bài' : 'Exit'}</span>
+            <span>
+              {saving
+                ? lang === 'vi'
+                  ? 'Đang lưu tiến độ...'
+                  : 'Saving progress...'
+                : outcomes.length > 0
+                  ? lang === 'vi'
+                    ? `Lưu ${outcomes.length} câu & Thoát`
+                    : `Save ${outcomes.length} & Exit`
+                  : lang === 'vi'
+                    ? 'Thoát bài'
+                    : 'Exit'}
+            </span>
           </button>
 
           <div className="flex flex-wrap items-center gap-2">

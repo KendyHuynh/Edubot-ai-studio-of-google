@@ -18,13 +18,20 @@ import firebaseConfig from '../../firebase-applet-config.json';
 import {
   ActivityLog,
   AnswerSubmission,
+  AssessmentSessionAttempt,
   ClassRoom,
   LearnerProfile,
   Lesson,
+  PublicLearnerHonorEntry,
   PushNotification,
   Question,
   TeacherAward,
 } from '../shared/types';
+import {
+  computeOverallLevel,
+  sanitizeMasteryForFirestore,
+} from '../shared/assessmentEngine';
+import { isValidGuestLearnerUid } from '../shared/learnerStoreOps';
 import {
   hasStrippedAnswers,
   recoverMissingCorrectAnswers,
@@ -894,37 +901,222 @@ export async function publishPublicWorkspace(
 }
 
 // =========================================================================
-// PERSONAL HOME LEARNER PROFILES & TEACHER AWARDS (CLOUD FIRESTORE SYNC)
+// PERSONAL HOME LEARNER PROFILES, ATTEMPTS, HONORS & TEACHER AWARDS SYNC
 // =========================================================================
+
+export interface LearnerCloudWriteResult {
+  ok: boolean;
+  savedAt?: string;
+  error?: string;
+  permissionDenied?: boolean;
+  honorSynced?: boolean;
+}
+
+function isPermissionDeniedError(err: unknown): boolean {
+  const code =
+    typeof err === 'object' && err && 'code' in err
+      ? String((err as { code?: unknown }).code ?? '').toLowerCase()
+      : '';
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err ?? '').toLowerCase();
+  return code.includes('permission-denied') || msg.includes('permission') || msg.includes('insufficient');
+}
+
+function parseLearnerDoc(id: string, d: Record<string, unknown>): LearnerProfile {
+  return {
+    uid: String(d.uid ?? id),
+    authType: d.authType === 'guest' ? 'guest' : 'google',
+    email: d.email ? String(d.email) : undefined,
+    photoUrl: d.photoUrl ? String(d.photoUrl) : undefined,
+    fullName: String(d.fullName ?? ''),
+    className: String(d.className ?? ''),
+    schoolName: String(d.schoolName ?? ''),
+    gradeBand:
+      d.gradeBand === 'middle' || d.gradeBand === 'high' ? d.gradeBand : 'primary',
+    role: 'student',
+    profileCompleted: Boolean(d.profileCompleted),
+    currentLevel: Math.max(1, Math.min(4, Number(d.currentLevel ?? 1))) as 1 | 2 | 3 | 4,
+    totalXp: Number(d.totalXp ?? 0),
+    bestCombo: Number(d.bestCombo ?? 0),
+    totalExercisesDone: Number(d.totalExercisesDone ?? 0),
+    totalCorrect: Number(d.totalCorrect ?? 0),
+    masteryByCompetency:
+      d.masteryByCompetency && typeof d.masteryByCompetency === 'object'
+        ? sanitizeMasteryForFirestore(
+            d.masteryByCompetency as LearnerProfile['masteryByCompetency'],
+          )
+        : {},
+    createdAt: normalizeTimestampToIso(d.createdAt),
+    updatedAt: normalizeTimestampToIso(d.updatedAt),
+    lastActiveAt: String(d.lastActiveAt ?? normalizeTimestampToIso(d.updatedAt)),
+  };
+}
+
+function parseAwardDoc(id: string, d: Record<string, unknown>): TeacherAward {
+  return {
+    id: String(d.id ?? id),
+    learnerUid: String(d.learnerUid ?? ''),
+    learnerName: String(d.learnerName ?? ''),
+    className: String(d.className ?? ''),
+    schoolName: String(d.schoolName ?? ''),
+    badgeId: String(d.badgeId ?? 'custom'),
+    badgeTitle: String(d.badgeTitle ?? ''),
+    message: String(d.message ?? ''),
+    bonusXp: Number(d.bonusXp ?? 0),
+    awardedByName: String(d.awardedByName ?? 'Giáo viên'),
+    awardedByEmail: d.awardedByEmail ? String(d.awardedByEmail) : undefined,
+    createdAt: normalizeTimestampToIso(d.createdAt),
+  };
+}
+
+function parseAttemptDoc(id: string, d: Record<string, unknown>): AssessmentSessionAttempt {
+  const rawMode = String(d.mode ?? 'variety_sprint');
+  const mode: AssessmentSessionAttempt['mode'] =
+    rawMode === 'diagnostic' ||
+    rawMode === 'level_challenge' ||
+    rawMode === 'competency_focus' ||
+    rawMode === 'advanced_pack'
+      ? rawMode
+      : 'variety_sprint';
+  const rawTargetLvl = Number(d.targetLevel);
+  return {
+    id: String(d.id ?? id),
+    learnerUid: String(d.learnerUid ?? ''),
+    learnerName: String(d.learnerName ?? ''),
+    className: String(d.className ?? ''),
+    schoolName: String(d.schoolName ?? ''),
+    mode,
+    targetLevel:
+      Number.isInteger(rawTargetLvl) && rawTargetLvl >= 1 && rawTargetLvl <= 4
+        ? (rawTargetLvl as 1 | 2 | 3 | 4)
+        : undefined,
+    targetCompetencyId: d.targetCompetencyId ? String(d.targetCompetencyId) : undefined,
+    totalQuestions: Number(d.totalQuestions ?? 0),
+    correctCount: Number(d.correctCount ?? 0),
+    accuracyPercent: Number(d.accuracyPercent ?? 0),
+    xpEarned: Number(d.xpEarned ?? 0),
+    maxCombo: Number(d.maxCombo ?? 0),
+    competencyIds: Array.isArray(d.competencyIds)
+      ? d.competencyIds.map((c) => String(c))
+      : [],
+    completedAt: String(d.completedAt ?? normalizeTimestampToIso(d.createdAt)),
+  };
+}
+
+export async function savePublicLearnerHonorToFirestore(
+  profile: LearnerProfile,
+  awardsCount = 0,
+  latestBadgeTitle?: string,
+): Promise<boolean> {
+  const isGuest = profile.authType === 'guest' && isValidGuestLearnerUid(profile.uid);
+  if (!isGuest && !isSignedInVerified()) return false;
+  try {
+    const docId = isGuest ? profile.uid.trim() : toFirestoreDocId(profile.uid, 128);
+    const cleanMastery = sanitizeMasteryForFirestore(profile.masteryByCompetency);
+    const records = Object.values(cleanMastery);
+    const masteredCount = Math.min(
+      24,
+      records.filter((r) => r.highestLevel >= 1).length,
+    );
+    const expertCount = Math.min(
+      24,
+      records.filter((r) => r.highestLevel >= 3).length,
+    );
+    const totalDone = Math.max(0, Math.min(100000, Math.round(profile.totalExercisesDone || 0)));
+    const totalCorrect = Math.max(0, Math.min(totalDone, Math.round(profile.totalCorrect || 0)));
+    const accuracyPercent =
+      totalDone > 0 ? Math.min(100, Math.round((totalCorrect / totalDone) * 100)) : 0;
+
+    // Strictly PII-free payload (NO email or photoUrl!)
+    await setDoc(doc(db, 'publicLearnerHonor', docId), {
+      uid: docId,
+      fullName: (profile.fullName || 'Học sinh').trim().slice(0, 120) || 'Học sinh',
+      className: (profile.className || 'Tự học').trim().slice(0, 60) || 'Tự học',
+      schoolName: (profile.schoolName || 'Trường học').trim().slice(0, 160) || 'Trường học',
+      gradeBand:
+        profile.gradeBand === 'middle' || profile.gradeBand === 'high'
+          ? profile.gradeBand
+          : 'primary',
+      authType: isGuest ? 'guest' : 'google',
+      currentLevel: Math.max(1, Math.min(4, Math.round(profile.currentLevel || 1))),
+      totalXp: Math.max(0, Math.min(1000000, Math.round(profile.totalXp || 0))),
+      masteredCount,
+      expertCount,
+      accuracyPercent,
+      totalExercisesDone: totalDone,
+      awardsCount: Math.max(0, Math.min(1000, Math.round(awardsCount || 0))),
+      ...(latestBadgeTitle?.trim()
+        ? { latestBadgeTitle: latestBadgeTitle.trim().slice(0, 140) }
+        : {}),
+      lastActiveAt: (profile.lastActiveAt || new Date().toISOString()).slice(0, 64),
+      updatedAt: serverTimestamp(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export async function saveLearnerProfileToFirestore(
   profile: LearnerProfile,
-): Promise<boolean> {
+  options: {
+    allowAdminWrite?: boolean;
+    awardsCount?: number;
+    latestBadgeTitle?: string;
+  } = {},
+): Promise<LearnerCloudWriteResult> {
+  const isGuest = profile.authType === 'guest' && isValidGuestLearnerUid(profile.uid);
   const current = auth.currentUser;
-  if (!current || !current.emailVerified || current.uid !== profile.uid) {
-    return false;
+
+  if (!isGuest) {
+    if (!current || !current.emailVerified) {
+      return {
+        ok: false,
+        error: 'Chưa đăng nhập tài khoản Google đã xác thực.',
+      };
+    }
+    if (!options.allowAdminWrite && current.uid !== profile.uid) {
+      return {
+        ok: false,
+        error: 'Tài khoản đăng nhập không khớp với hồ sơ học sinh.',
+      };
+    }
   }
+
+  const targetCollection = isGuest ? 'guestLearnerProfiles' : 'learnerProfiles';
   try {
-    const docId = toFirestoreDocId(profile.uid, 128);
-    const ref = doc(db, 'learnerProfiles', docId);
+    const docId = isGuest ? profile.uid.trim() : toFirestoreDocId(profile.uid, 128);
+    const ref = doc(db, targetCollection, docId);
     const snap = await getDoc(ref);
+    const cleanMastery = sanitizeMasteryForFirestore(profile.masteryByCompetency);
+    const cleanFullName = (profile.fullName || 'Học sinh').trim().slice(0, 120) || 'Học sinh';
+    const cleanClassName = (profile.className || 'Tự học').trim().slice(0, 60) || 'Tự học';
+    const cleanSchoolName =
+      (profile.schoolName || 'Trường học').trim().slice(0, 160) || 'Trường học';
+    const totalDone = Math.max(0, Math.min(100000, Math.round(profile.totalExercisesDone || 0)));
+    const totalCorrect = Math.max(0, Math.min(totalDone, Math.round(profile.totalCorrect || 0)));
+
     const payload = {
       uid: docId,
-      authType: 'google' as const,
-      ...(profile.email ? { email: profile.email.slice(0, 200) } : {}),
-      ...(profile.photoUrl ? { photoUrl: profile.photoUrl.slice(0, 500) } : {}),
-      fullName: (profile.fullName || 'Học sinh').slice(0, 120),
-      className: (profile.className || 'Tự học').slice(0, 60),
-      schoolName: (profile.schoolName || 'Trường học').slice(0, 160),
-      gradeBand: profile.gradeBand || 'primary',
+      authType: isGuest ? ('guest' as const) : ('google' as const),
+      ...(!isGuest && profile.email?.trim() ? { email: profile.email.trim().slice(0, 200) } : {}),
+      ...(!isGuest && profile.photoUrl?.trim()
+        ? { photoUrl: profile.photoUrl.trim().slice(0, 500) }
+        : {}),
+      fullName: cleanFullName,
+      className: cleanClassName,
+      schoolName: cleanSchoolName,
+      gradeBand:
+        profile.gradeBand === 'middle' || profile.gradeBand === 'high'
+          ? profile.gradeBand
+          : 'primary',
       role: 'student' as const,
       profileCompleted: Boolean(profile.profileCompleted),
       currentLevel: Math.max(1, Math.min(4, Math.round(profile.currentLevel || 1))),
       totalXp: Math.max(0, Math.min(1000000, Math.round(profile.totalXp || 0))),
       bestCombo: Math.max(0, Math.min(1000, Math.round(profile.bestCombo || 0))),
-      totalExercisesDone: Math.max(0, Math.min(100000, Math.round(profile.totalExercisesDone || 0))),
-      totalCorrect: Math.max(0, Math.min(100000, Math.round(profile.totalCorrect || 0))),
-      masteryByCompetency: profile.masteryByCompetency ?? {},
+      totalExercisesDone: totalDone,
+      totalCorrect,
+      masteryByCompetency: cleanMastery,
       lastActiveAt: (profile.lastActiveAt || new Date().toISOString()).slice(0, 64),
       updatedAt: serverTimestamp(),
     };
@@ -933,6 +1125,65 @@ export async function saveLearnerProfileToFirestore(
     } else {
       await updateDoc(ref, payload);
     }
+
+    // Best-effort sync of PII-free entry for the public Home Self-Study Honor Board
+    const honorSynced = await savePublicLearnerHonorToFirestore(
+      { ...profile, masteryByCompetency: cleanMastery },
+      options.awardsCount ?? 0,
+      options.latestBadgeTitle,
+    );
+
+    return {
+      ok: true,
+      savedAt: new Date().toISOString(),
+      honorSynced,
+    };
+  } catch (err) {
+    const permissionDenied = isPermissionDeniedError(err);
+    const rawMsg = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      permissionDenied,
+      error: permissionDenied
+        ? `Quyền ghi Cloud Firestore cho bộ sưu tập ${targetCollection} bị từ chối. Vui lòng Publish file firestore.rules mới trên Firebase Console.`
+        : rawMsg,
+    };
+  }
+}
+
+export async function saveAssessmentAttemptToFirestore(
+  attempt: AssessmentSessionAttempt,
+): Promise<boolean> {
+  const isGuest = isValidGuestLearnerUid(attempt.learnerUid);
+  const current = auth.currentUser;
+  if (!isGuest && (!current || !current.emailVerified || current.uid !== attempt.learnerUid)) {
+    return false;
+  }
+  const targetCollection = isGuest ? 'guestAssessmentAttempts' : 'assessmentAttempts';
+  try {
+    const docId = toFirestoreDocId(attempt.id, 80);
+    await setDoc(doc(db, targetCollection, docId), {
+      id: docId,
+      learnerUid: isGuest ? attempt.learnerUid.trim() : toFirestoreDocId(attempt.learnerUid, 128),
+      learnerName: (attempt.learnerName || 'Học sinh').slice(0, 120),
+      className: (attempt.className || 'Tự học').slice(0, 60),
+      schoolName: (attempt.schoolName || 'Trường học').slice(0, 160),
+      mode: attempt.mode,
+      ...(typeof attempt.targetLevel === 'number'
+        ? { targetLevel: Math.max(1, Math.min(4, Math.round(attempt.targetLevel))) }
+        : {}),
+      ...(attempt.targetCompetencyId
+        ? { targetCompetencyId: String(attempt.targetCompetencyId).slice(0, 16) }
+        : {}),
+      totalQuestions: Math.max(0, Math.min(100, Math.round(attempt.totalQuestions || 0))),
+      correctCount: Math.max(0, Math.min(100, Math.round(attempt.correctCount || 0))),
+      accuracyPercent: Math.max(0, Math.min(100, Math.round(attempt.accuracyPercent || 0))),
+      xpEarned: Math.max(0, Math.min(10000, Math.round(attempt.xpEarned || 0))),
+      maxCombo: Math.max(0, Math.min(100, Math.round(attempt.maxCombo || 0))),
+      competencyIds: (attempt.competencyIds ?? []).slice(0, 24).map((c) => String(c).slice(0, 16)),
+      completedAt: (attempt.completedAt || new Date().toISOString()).slice(0, 64),
+      createdAt: serverTimestamp(),
+    });
     return true;
   } catch {
     return false;
@@ -941,145 +1192,177 @@ export async function saveLearnerProfileToFirestore(
 
 export async function fetchLearnerCloudBundle(uid: string): Promise<{
   profile: LearnerProfile | null;
+  attempts: AssessmentSessionAttempt[];
   awards: TeacherAward[];
+  error?: string;
+  permissionDenied?: boolean;
 }> {
+  const isGuest = isValidGuestLearnerUid(uid);
   const current = auth.currentUser;
-  if (!current || !current.emailVerified || current.uid !== uid) {
-    return { profile: null, awards: [] };
+  if (!isGuest && (!current || !current.emailVerified || current.uid !== uid)) {
+    return { profile: null, attempts: [], awards: [] };
   }
   try {
-    const docId = toFirestoreDocId(uid, 128);
-    const [profileSnap, awardsSnap] = await Promise.all([
-      getDoc(doc(db, 'learnerProfiles', docId)),
-      getDocs(query(collection(db, 'teacherAwards'), where('learnerUid', '==', docId))),
+    const docId = isGuest ? uid.trim() : toFirestoreDocId(uid, 128);
+    const profileCollection = isGuest ? 'guestLearnerProfiles' : 'learnerProfiles';
+    const attemptCollection = isGuest ? 'guestAssessmentAttempts' : 'assessmentAttempts';
+
+    const [profileSnap, awardsSnap, attemptsSnap] = await Promise.all([
+      getDoc(doc(db, profileCollection, docId)),
+      getDocs(
+        query(collection(db, 'teacherAwards'), where('learnerUid', '==', docId), limit(50)),
+      ).catch(() => null),
+      getDocs(
+        query(collection(db, attemptCollection), where('learnerUid', '==', docId), limit(40)),
+      ).catch(() => null),
     ]);
 
-    let profile: LearnerProfile | null = null;
-    if (profileSnap.exists()) {
-      const d = profileSnap.data();
-      profile = {
-        uid: String(d.uid),
-        authType: d.authType === 'guest' ? 'guest' : 'google',
-        email: d.email ? String(d.email) : undefined,
-        photoUrl: d.photoUrl ? String(d.photoUrl) : undefined,
-        fullName: String(d.fullName ?? ''),
-        className: String(d.className ?? ''),
-        schoolName: String(d.schoolName ?? ''),
-        gradeBand:
-          d.gradeBand === 'middle' || d.gradeBand === 'high' ? d.gradeBand : 'primary',
-        role: 'student',
-        profileCompleted: Boolean(d.profileCompleted),
-        currentLevel: Math.max(1, Math.min(4, Number(d.currentLevel ?? 1))) as 1 | 2 | 3 | 4,
-        totalXp: Number(d.totalXp ?? 0),
-        bestCombo: Number(d.bestCombo ?? 0),
-        totalExercisesDone: Number(d.totalExercisesDone ?? 0),
-        totalCorrect: Number(d.totalCorrect ?? 0),
-        masteryByCompetency:
-          d.masteryByCompetency && typeof d.masteryByCompetency === 'object'
-            ? d.masteryByCompetency
-            : {},
-        createdAt: normalizeTimestampToIso(d.createdAt),
-        updatedAt: normalizeTimestampToIso(d.updatedAt),
-        lastActiveAt: String(d.lastActiveAt ?? normalizeTimestampToIso(d.updatedAt)),
-      };
-    }
+    const profile = profileSnap.exists()
+      ? parseLearnerDoc(profileSnap.id, profileSnap.data() as Record<string, unknown>)
+      : null;
 
-    const awards: TeacherAward[] = awardsSnap.docs
-      .map((row) => {
-        const d = row.data();
-        return {
-          id: String(d.id ?? row.id),
-          learnerUid: String(d.learnerUid ?? ''),
-          learnerName: String(d.learnerName ?? ''),
-          className: String(d.className ?? ''),
-          schoolName: String(d.schoolName ?? ''),
-          badgeId: String(d.badgeId ?? 'custom'),
-          badgeTitle: String(d.badgeTitle ?? ''),
-          message: String(d.message ?? ''),
-          bonusXp: Number(d.bonusXp ?? 0),
-          awardedByName: String(d.awardedByName ?? 'Giáo viên'),
-          awardedByEmail: d.awardedByEmail ? String(d.awardedByEmail) : undefined,
-          createdAt: normalizeTimestampToIso(d.createdAt),
-        };
-      })
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const awards: TeacherAward[] = awardsSnap
+      ? awardsSnap.docs
+          .map((row) => parseAwardDoc(row.id, row.data() as Record<string, unknown>))
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      : [];
 
-    return { profile, awards };
-  } catch {
-    return { profile: null, awards: [] };
+    const attempts: AssessmentSessionAttempt[] = attemptsSnap
+      ? attemptsSnap.docs
+          .map((row) => parseAttemptDoc(row.id, row.data() as Record<string, unknown>))
+          .sort((a, b) => b.completedAt.localeCompare(a.completedAt))
+          .slice(0, 40)
+      : [];
+
+    return { profile, attempts, awards };
+  } catch (err) {
+    const permissionDenied = isPermissionDeniedError(err);
+    return {
+      profile: null,
+      attempts: [],
+      awards: [],
+      permissionDenied,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
 export async function fetchAllLearnersFromFirestore(): Promise<{
   learners: LearnerProfile[];
+  attempts: AssessmentSessionAttempt[];
   awards: TeacherAward[];
+  error?: string;
+  permissionDenied?: boolean;
 }> {
-  if (!isSignedInVerified()) return { learners: [], awards: [] };
+  if (!isSignedInVerified()) {
+    return { learners: [], attempts: [], awards: [] };
+  }
   try {
-    const [profilesSnap, awardsSnap] = await Promise.all([
-      getDocs(collection(db, 'learnerProfiles')),
-      getDocs(collection(db, 'teacherAwards')),
-    ]);
+    const [profilesSnap, guestProfilesSnap, awardsSnap, attemptsSnap, guestAttemptsSnap] =
+      await Promise.all([
+        getDocs(collection(db, 'learnerProfiles')),
+        getDocs(collection(db, 'guestLearnerProfiles')).catch(() => null),
+        getDocs(collection(db, 'teacherAwards')),
+        getDocs(collection(db, 'assessmentAttempts')).catch(() => null),
+        getDocs(collection(db, 'guestAssessmentAttempts')).catch(() => null),
+      ]);
 
-    const learners: LearnerProfile[] = profilesSnap.docs.map((row) => {
-      const d = row.data();
-      return {
-        uid: String(d.uid ?? row.id),
-        authType: d.authType === 'guest' ? 'guest' : 'google',
-        email: d.email ? String(d.email) : undefined,
-        photoUrl: d.photoUrl ? String(d.photoUrl) : undefined,
-        fullName: String(d.fullName ?? ''),
-        className: String(d.className ?? ''),
-        schoolName: String(d.schoolName ?? ''),
-        gradeBand:
-          d.gradeBand === 'middle' || d.gradeBand === 'high' ? d.gradeBand : 'primary',
-        role: 'student',
-        profileCompleted: Boolean(d.profileCompleted),
-        currentLevel: Math.max(1, Math.min(4, Number(d.currentLevel ?? 1))) as 1 | 2 | 3 | 4,
-        totalXp: Number(d.totalXp ?? 0),
-        bestCombo: Number(d.bestCombo ?? 0),
-        totalExercisesDone: Number(d.totalExercisesDone ?? 0),
-        totalCorrect: Number(d.totalCorrect ?? 0),
-        masteryByCompetency:
-          d.masteryByCompetency && typeof d.masteryByCompetency === 'object'
-            ? d.masteryByCompetency
-            : {},
-        createdAt: normalizeTimestampToIso(d.createdAt),
-        updatedAt: normalizeTimestampToIso(d.updatedAt),
-        lastActiveAt: String(d.lastActiveAt ?? normalizeTimestampToIso(d.updatedAt)),
-      };
-    });
+    const learners: LearnerProfile[] = [
+      ...profilesSnap.docs.map((row) =>
+        parseLearnerDoc(row.id, row.data() as Record<string, unknown>),
+      ),
+      ...(guestProfilesSnap
+        ? guestProfilesSnap.docs.map((row) =>
+            parseLearnerDoc(row.id, row.data() as Record<string, unknown>),
+          )
+        : []),
+    ];
 
     const awards: TeacherAward[] = awardsSnap.docs
+      .map((row) => parseAwardDoc(row.id, row.data() as Record<string, unknown>))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+    const attempts: AssessmentSessionAttempt[] = [
+      ...(attemptsSnap
+        ? attemptsSnap.docs.map((row) =>
+            parseAttemptDoc(row.id, row.data() as Record<string, unknown>),
+          )
+        : []),
+      ...(guestAttemptsSnap
+        ? guestAttemptsSnap.docs.map((row) =>
+            parseAttemptDoc(row.id, row.data() as Record<string, unknown>),
+          )
+        : []),
+    ]
+      .sort((a, b) => b.completedAt.localeCompare(a.completedAt))
+      .slice(0, 300);
+
+    return { learners, attempts, awards };
+  } catch (err) {
+    const permissionDenied = isPermissionDeniedError(err);
+    return {
+      learners: [],
+      attempts: [],
+      awards: [],
+      permissionDenied,
+      error: permissionDenied
+        ? 'Tài khoản hiện tại không có quyền đọc danh sách learnerProfiles trên Firestore (hoặc firestore.rules chưa được cập nhật lên Firebase Console).'
+        : err instanceof Error
+          ? err.message
+          : String(err),
+    };
+  }
+}
+
+export async function fetchPublicLearnerHonorFromFirestore(): Promise<
+  PublicLearnerHonorEntry[]
+> {
+  try {
+    const snap = await getDocs(
+      query(collection(db, 'publicLearnerHonor'), limit(200)),
+    );
+    return snap.docs
       .map((row) => {
         const d = row.data();
         return {
-          id: String(d.id ?? row.id),
-          learnerUid: String(d.learnerUid ?? ''),
-          learnerName: String(d.learnerName ?? ''),
+          uid: String(d.uid ?? row.id),
+          fullName: String(d.fullName ?? ''),
           className: String(d.className ?? ''),
           schoolName: String(d.schoolName ?? ''),
-          badgeId: String(d.badgeId ?? 'custom'),
-          badgeTitle: String(d.badgeTitle ?? ''),
-          message: String(d.message ?? ''),
-          bonusXp: Number(d.bonusXp ?? 0),
-          awardedByName: String(d.awardedByName ?? 'Giáo viên'),
-          awardedByEmail: d.awardedByEmail ? String(d.awardedByEmail) : undefined,
-          createdAt: normalizeTimestampToIso(d.createdAt),
+          gradeBand: (
+            d.gradeBand === 'middle' || d.gradeBand === 'high' ? d.gradeBand : 'primary'
+          ) as PublicLearnerHonorEntry['gradeBand'],
+          authType: (d.authType === 'guest' ? 'guest' : 'google') as PublicLearnerHonorEntry['authType'],
+          currentLevel: Math.max(1, Math.min(4, Number(d.currentLevel ?? 1))) as 1 | 2 | 3 | 4,
+          totalXp: Number(d.totalXp ?? 0),
+          masteredCount: Number(d.masteredCount ?? 0),
+          expertCount: Number(d.expertCount ?? 0),
+          accuracyPercent: Number(d.accuracyPercent ?? 0),
+          totalExercisesDone: Number(d.totalExercisesDone ?? 0),
+          awardsCount: Number(d.awardsCount ?? 0),
+          latestBadgeTitle: d.latestBadgeTitle ? String(d.latestBadgeTitle) : undefined,
+          lastActiveAt: String(d.lastActiveAt ?? normalizeTimestampToIso(d.updatedAt)),
         };
       })
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-
-    return { learners, awards };
+      .filter((e) => e.fullName.length > 0)
+      .sort((a, b) => {
+        if (b.totalXp !== a.totalXp) return b.totalXp - a.totalXp;
+        if (b.masteredCount !== a.masteredCount) return b.masteredCount - a.masteredCount;
+        return b.accuracyPercent - a.accuracyPercent;
+      });
   } catch {
-    return { learners: [], awards: [] };
+    return [];
   }
 }
 
 export async function saveTeacherAwardToFirestore(
   award: TeacherAward,
-): Promise<boolean> {
-  if (!isSignedInVerified()) return false;
+  learnerProfile?: LearnerProfile,
+  nextAwardsCount?: number,
+): Promise<{ ok: boolean; error?: string; xpUpdated?: boolean }> {
+  if (!isSignedInVerified()) {
+    return { ok: false, error: 'Giáo viên chưa đăng nhập Google Đám mây.' };
+  }
   try {
     const docId = toFirestoreDocId(award.id, 80);
     await setDoc(doc(db, 'teacherAwards', docId), {
@@ -1098,9 +1381,36 @@ export async function saveTeacherAwardToFirestore(
         : {}),
       createdAt: serverTimestamp(),
     });
-    return true;
-  } catch {
-    return false;
+
+    // Also update the student's learnerProfiles/{uid} XP & level + public honor board in Firestore!
+    let xpUpdated = false;
+    if (learnerProfile) {
+      const bonus = Math.max(0, Math.min(500, Math.round(award.bonusXp || 0)));
+      const nextXp = Math.min(1000000, (learnerProfile.totalXp || 0) + bonus);
+      const nextLevel = Math.max(
+        learnerProfile.currentLevel || 1,
+        computeOverallLevel(learnerProfile.masteryByCompetency ?? {}, nextXp),
+      ) as 1 | 2 | 3 | 4;
+      const updatedProfile: LearnerProfile = {
+        ...learnerProfile,
+        totalXp: nextXp,
+        currentLevel: nextLevel,
+        updatedAt: new Date().toISOString(),
+      };
+      const profileRes = await saveLearnerProfileToFirestore(updatedProfile, {
+        allowAdminWrite: true,
+        awardsCount: nextAwardsCount ?? 1,
+        latestBadgeTitle: award.badgeTitle,
+      });
+      xpUpdated = profileRes.ok;
+    }
+
+    return { ok: true, xpUpdated };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 

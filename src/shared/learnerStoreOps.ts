@@ -1,7 +1,9 @@
 import {
   applyAssessmentOutcomesDetailed,
   buildPublicLearnerHonorList,
+  computeOverallLevel,
   createEmptyLearnerProfile,
+  mergeLearnerProfiles,
 } from './assessmentEngine';
 import { StoreData } from './seedData';
 import {
@@ -14,6 +16,27 @@ import {
   PublicLearnerHonorEntry,
   TeacherAward,
 } from './types';
+
+export const GUEST_LEARNER_UID_RE = /^guest-[A-Za-z0-9_-]{4,80}$/;
+
+export function isValidGuestLearnerUid(uid: unknown): uid is string {
+  return typeof uid === 'string' && GUEST_LEARNER_UID_RE.test(uid.trim());
+}
+
+export function generateGuestLearnerUid(className: string, fullName: string): string {
+  const slugify = (s: string, maxLen: number) =>
+    s
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[đĐ]/g, 'd')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '')
+      .slice(0, maxLen);
+  const clsPart = slugify(className, 8) || 'hs';
+  const namePart = slugify(fullName, 12) || 'hocsinh';
+  const rand = Math.random().toString(36).slice(2, 6).padEnd(4, '0');
+  return `guest-${clsPart}-${namePart}-${rand}`;
+}
 
 export function ensureLearnerCollections(store: StoreData): {
   learnerProfiles: LearnerProfile[];
@@ -28,6 +51,65 @@ export function ensureLearnerCollections(store: StoreData): {
     assessmentAttempts: store.assessmentAttempts,
     teacherAwards: store.teacherAwards,
   };
+}
+
+/**
+ * Monotonically merges a Cloud Firestore learner profile (plus optional attempts/awards)
+ * into the local/server store so switching devices or clearing browser cache NEVER resets progress.
+ */
+export function hydrateLearnerProfileInStore(
+  store: StoreData,
+  incomingProfile: LearnerProfile,
+  incomingAttempts: AssessmentSessionAttempt[] = [],
+  incomingAwards: TeacherAward[] = [],
+): LearnerProfile {
+  const { learnerProfiles, assessmentAttempts, teacherAwards } =
+    ensureLearnerCollections(store);
+  const cleanUid = String(incomingProfile.uid || '').trim().slice(0, 128);
+  const idx = learnerProfiles.findIndex((p) => p.uid === cleanUid);
+
+  let resolved: LearnerProfile;
+  if (idx >= 0) {
+    resolved = mergeLearnerProfiles(learnerProfiles[idx], {
+      ...incomingProfile,
+      uid: cleanUid,
+    });
+    learnerProfiles[idx] = resolved;
+  } else {
+    resolved = {
+      ...incomingProfile,
+      uid: cleanUid,
+      role: 'student',
+    };
+    learnerProfiles.unshift(resolved);
+  }
+
+  if (incomingAttempts.length > 0) {
+    const existingAttIds = new Set(assessmentAttempts.map((a) => a.id));
+    for (const att of incomingAttempts) {
+      if (att?.id && !existingAttIds.has(att.id)) {
+        assessmentAttempts.push(att);
+        existingAttIds.add(att.id);
+      }
+    }
+    assessmentAttempts.sort((a, b) => b.completedAt.localeCompare(a.completedAt));
+    if (assessmentAttempts.length > 500) {
+      assessmentAttempts.length = 500;
+    }
+  }
+
+  if (incomingAwards.length > 0) {
+    const existingAwdIds = new Set(teacherAwards.map((a) => a.id));
+    for (const awd of incomingAwards) {
+      if (awd?.id && !existingAwdIds.has(awd.id)) {
+        teacherAwards.push(awd);
+        existingAwdIds.add(awd.id);
+      }
+    }
+    teacherAwards.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  return resolved;
 }
 
 export interface UpsertLearnerProfileInput {
@@ -104,6 +186,7 @@ export interface RecordAssessmentInput {
   authType?: 'google' | 'guest';
   email?: string;
   gradeBand?: LearnerGradeBand;
+  baseProfile?: LearnerProfile;
   mode: AssessmentSessionMode;
   targetLevel?: AssessmentLevel;
   targetCompetencyId?: string;
@@ -120,16 +203,27 @@ export function recordAssessmentAttemptInStore(
   let idx = learnerProfiles.findIndex((p) => p.uid === uid);
 
   if (idx < 0) {
-    const created = upsertLearnerProfileInStore(store, {
-      uid,
-      authType: input.authType === 'google' ? 'google' : 'guest',
-      email: input.email,
-      fullName: input.learnerName || 'Học sinh thử nghiệm',
-      className: input.className || 'Tự học',
-      schoolName: input.schoolName || 'Trường học',
-      gradeBand: input.gradeBand,
-    });
-    idx = learnerProfiles.findIndex((p) => p.uid === created.uid);
+    if (input.baseProfile && input.baseProfile.uid === uid) {
+      hydrateLearnerProfileInStore(store, {
+        ...input.baseProfile,
+        authType: input.authType === 'google' ? 'google' : input.baseProfile.authType,
+        email: input.email || input.baseProfile.email,
+      });
+      idx = learnerProfiles.findIndex((p) => p.uid === uid);
+    } else {
+      const created = upsertLearnerProfileInStore(store, {
+        uid,
+        authType: input.authType === 'google' ? 'google' : 'guest',
+        email: input.email,
+        fullName: input.learnerName || 'Học sinh thử nghiệm',
+        className: input.className || 'Tự học',
+        schoolName: input.schoolName || 'Trường học',
+        gradeBand: input.gradeBand,
+      });
+      idx = learnerProfiles.findIndex((p) => p.uid === created.uid);
+    }
+  } else if (input.baseProfile && input.baseProfile.uid === uid) {
+    learnerProfiles[idx] = mergeLearnerProfiles(learnerProfiles[idx], input.baseProfile);
   }
 
   const safeOutcomes = (Array.isArray(input.outcomes) ? input.outcomes : []).slice(0, 50);
@@ -180,6 +274,7 @@ export function recordAssessmentAttemptInStore(
 
 export interface CreateTeacherAwardInput {
   learnerUid: string;
+  learnerSnapshot?: LearnerProfile;
   badgeId: string;
   badgeTitle: string;
   message: string;
@@ -193,7 +288,10 @@ export function createTeacherAwardInStore(
   input: CreateTeacherAwardInput,
 ): { award: TeacherAward; learner: LearnerProfile } | null {
   const { learnerProfiles, teacherAwards } = ensureLearnerCollections(store);
-  const learner = learnerProfiles.find((p) => p.uid === input.learnerUid);
+  let learner = learnerProfiles.find((p) => p.uid === input.learnerUid);
+  if (!learner && input.learnerSnapshot && input.learnerSnapshot.uid === input.learnerUid) {
+    learner = hydrateLearnerProfileInStore(store, input.learnerSnapshot);
+  }
   if (!learner) return null;
 
   const bonusXp = Math.max(0, Math.min(500, Math.round(Number(input.bonusXp) || 0)));
@@ -217,6 +315,10 @@ export function createTeacherAwardInStore(
 
   teacherAwards.unshift(award);
   learner.totalXp += bonusXp;
+  learner.currentLevel = Math.max(
+    learner.currentLevel,
+    computeOverallLevel(learner.masteryByCompetency, learner.totalXp),
+  ) as AssessmentLevel;
   learner.updatedAt = now;
 
   return { award, learner };

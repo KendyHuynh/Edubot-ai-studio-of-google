@@ -413,6 +413,10 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    function isValidGuestId(id) {
+      return id is string && id.size() >= 10 && id.size() <= 96 && id.matches('^guest-[A-Za-z0-9_\\-]+$');
+    }
+
     match /learnerProfiles/{userId} {
       allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
       allow list: if isAdmin();
@@ -433,15 +437,141 @@ service cloud.firestore {
       allow delete: if isValidId(userId) && isAdmin();
     }
 
+    // Zero-login Home Self-Assessment Learner Profiles (for young students without personal Gmail)
+    // Strictly separated from verified Google learnerProfiles; monotonic XP guard prevents resets; list is Admin-only.
+    match /guestLearnerProfiles/{guestId} {
+      allow get: if isValidGuestId(guestId);
+      allow list: if isAdmin();
+      allow create: if isValidGuestId(guestId)
+        && incoming().authType == 'guest'
+        && isValidLearnerProfile(incoming(), guestId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidGuestId(guestId)
+        && incoming().authType == 'guest'
+        && existing().authType == 'guest'
+        && isValidLearnerProfile(incoming(), guestId)
+        && incoming().uid == existing().uid
+        && incoming().role == 'student'
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            incoming().totalXp >= existing().totalXp
+            && incoming().totalExercisesDone >= existing().totalExercisesDone
+          )
+        );
+      allow delete: if isValidGuestId(guestId) && isAdmin();
+    }
+
     match /teacherAwards/{awardId} {
-      allow get: if isValidId(awardId) && (isAdmin() || (isVerifiedUser() && existing().learnerUid == request.auth.uid));
-      allow list: if isAdmin() || (isVerifiedUser() && resource.data.learnerUid == request.auth.uid);
+      allow get: if isValidId(awardId) && (
+        isAdmin()
+        || (isVerifiedUser() && existing().learnerUid == request.auth.uid)
+        || isValidGuestId(existing().learnerUid)
+      );
+      allow list: if isAdmin()
+        || (isVerifiedUser() && resource.data.learnerUid == request.auth.uid)
+        || (isValidGuestId(resource.data.learnerUid) && request.query.limit <= 50);
       allow create: if isValidId(awardId)
         && isAdmin()
         && isValidTeacherAward(incoming(), awardId)
         && incoming().createdAt == request.time;
       allow update: if false;
       allow delete: if isValidId(awardId) && isAdmin();
+    }
+
+    function isValidAssessmentAttempt(data, attemptId) {
+      return data.keys().hasAll(['id', 'learnerUid', 'learnerName', 'className', 'schoolName', 'mode', 'totalQuestions', 'correctCount', 'accuracyPercent', 'xpEarned', 'maxCombo', 'competencyIds', 'completedAt', 'createdAt'])
+        && data.keys().hasOnly(['id', 'learnerUid', 'learnerName', 'className', 'schoolName', 'mode', 'targetLevel', 'targetCompetencyId', 'totalQuestions', 'correctCount', 'accuracyPercent', 'xpEarned', 'maxCombo', 'competencyIds', 'completedAt', 'createdAt'])
+        && data.id is string && data.id == attemptId && data.id.size() <= 80
+        && data.learnerUid is string && data.learnerUid.size() >= 1 && data.learnerUid.size() <= 128
+        && data.learnerName is string && data.learnerName.size() <= 120
+        && data.className is string && data.className.size() <= 60
+        && data.schoolName is string && data.schoolName.size() <= 160
+        && data.mode in ['diagnostic', 'level_challenge', 'competency_focus', 'variety_sprint', 'advanced_pack']
+        && (!('targetLevel' in data) || (data.targetLevel is int && data.targetLevel >= 1 && data.targetLevel <= 4))
+        && (!('targetCompetencyId' in data) || (data.targetCompetencyId is string && data.targetCompetencyId.size() <= 16))
+        && data.totalQuestions is int && data.totalQuestions >= 0 && data.totalQuestions <= 100
+        && data.correctCount is int && data.correctCount >= 0 && data.correctCount <= 100
+        && data.accuracyPercent is int && data.accuracyPercent >= 0 && data.accuracyPercent <= 100
+        && data.xpEarned is int && data.xpEarned >= 0 && data.xpEarned <= 10000
+        && data.maxCombo is int && data.maxCombo >= 0 && data.maxCombo <= 100
+        && data.competencyIds is list && data.competencyIds.size() <= 24
+        && (data.competencyIds.size() == 0 || data.competencyIds[0] is string)
+        && data.completedAt is string && data.completedAt.size() <= 64
+        && data.createdAt is timestamp;
+    }
+
+    match /assessmentAttempts/{attemptId} {
+      allow get: if isValidId(attemptId) && (isAdmin() || (isVerifiedUser() && existing().learnerUid == request.auth.uid));
+      allow list: if isAdmin() || (isVerifiedUser() && resource.data.learnerUid == request.auth.uid);
+      allow create: if isValidId(attemptId)
+        && isVerifiedUser()
+        && incoming().learnerUid == request.auth.uid
+        && isValidAssessmentAttempt(incoming(), attemptId)
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(attemptId) && isAdmin();
+    }
+
+    match /guestAssessmentAttempts/{attemptId} {
+      allow get: if isValidId(attemptId) && (isAdmin() || isValidGuestId(existing().learnerUid));
+      allow list: if isAdmin() || (isValidGuestId(resource.data.learnerUid) && request.query.limit <= 40);
+      allow create: if isValidId(attemptId)
+        && isValidGuestId(incoming().learnerUid)
+        && isValidAssessmentAttempt(incoming(), attemptId)
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(attemptId) && isAdmin();
+    }
+
+    // Strictly PII-free Public Home Self-Assessment Honor Entry (NO email or photoUrl permitted!)
+    function isValidPublicLearnerHonor(data, userId) {
+      return data.keys().hasAll(['uid', 'fullName', 'className', 'schoolName', 'gradeBand', 'authType', 'currentLevel', 'totalXp', 'masteredCount', 'expertCount', 'accuracyPercent', 'totalExercisesDone', 'awardsCount', 'lastActiveAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'fullName', 'className', 'schoolName', 'gradeBand', 'authType', 'currentLevel', 'totalXp', 'masteredCount', 'expertCount', 'accuracyPercent', 'totalExercisesDone', 'awardsCount', 'latestBadgeTitle', 'lastActiveAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && data.uid.size() <= 128
+        && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120
+        && data.className is string && data.className.size() >= 1 && data.className.size() <= 60
+        && data.schoolName is string && data.schoolName.size() >= 1 && data.schoolName.size() <= 160
+        && data.gradeBand in ['primary', 'middle', 'high']
+        && data.authType in ['google', 'guest']
+        && data.currentLevel is int && data.currentLevel >= 1 && data.currentLevel <= 4
+        && data.totalXp is int && data.totalXp >= 0 && data.totalXp <= 1000000
+        && data.masteredCount is int && data.masteredCount >= 0 && data.masteredCount <= 24
+        && data.expertCount is int && data.expertCount >= 0 && data.expertCount <= 24
+        && data.accuracyPercent is int && data.accuracyPercent >= 0 && data.accuracyPercent <= 100
+        && data.totalExercisesDone is int && data.totalExercisesDone >= 0 && data.totalExercisesDone <= 100000
+        && data.awardsCount is int && data.awardsCount >= 0 && data.awardsCount <= 1000
+        && (!('latestBadgeTitle' in data) || (data.latestBadgeTitle is string && data.latestBadgeTitle.size() <= 140))
+        && data.lastActiveAt is string && data.lastActiveAt.size() <= 64
+        && data.updatedAt is timestamp;
+    }
+
+    match /publicLearnerHonor/{userId} {
+      allow get: if isValidId(userId);
+      allow list: if request.query.limit <= 200;
+      allow create: if isValidId(userId)
+        && isValidPublicLearnerHonor(incoming(), userId)
+        && incoming().updatedAt == request.time
+        && (
+          (isVerifiedUser() && (isOwner(userId) || isAdmin()))
+          || (isValidGuestId(userId) && incoming().authType == 'guest')
+        );
+      allow update: if isValidId(userId)
+        && isValidPublicLearnerHonor(incoming(), userId)
+        && incoming().updatedAt == request.time
+        && (
+          (isVerifiedUser() && (isOwner(userId) || isAdmin()))
+          || (
+            isValidGuestId(userId)
+            && incoming().authType == 'guest'
+            && existing().authType == 'guest'
+            && incoming().totalXp >= existing().totalXp
+          )
+        );
+      allow delete: if isValidId(userId) && isAdmin();
     }
   }
 }

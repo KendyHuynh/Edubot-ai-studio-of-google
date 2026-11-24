@@ -2,15 +2,22 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import {
   Award,
+  Check,
   CheckCircle2,
+  Cloud,
+  CloudOff,
+  Copy,
   Edit3,
   Flame,
   Gift,
   GraduationCap,
+  KeyRound,
   Layers,
   Lock,
   LogOut,
+  Mail,
   Play,
+  RefreshCw,
   RotateCcw,
   School,
   ShieldCheck,
@@ -21,6 +28,7 @@ import {
   Trophy,
   Unlock,
   UserCircle2,
+  UserPlus,
   Zap,
 } from 'lucide-react';
 import { ASSESSMENT_LEVELS } from '../shared/assessmentBank';
@@ -34,8 +42,13 @@ import {
   getExpansionUnlockSummary,
   getLevelMeta,
   getRecommendedCompetencies,
+  mergeLearnerProfiles,
 } from '../shared/assessmentEngine';
 import { COMPETENCIES_24, COMPETENCY_DOMAINS, getCompetencyById } from '../shared/competencies';
+import {
+  generateGuestLearnerUid,
+  isValidGuestLearnerUid,
+} from '../shared/learnerStoreOps';
 import {
   AssessmentExercise,
   AssessmentExerciseOutcome,
@@ -53,18 +66,43 @@ import { apiRequestJson } from '../utils/apiClient';
 import { formatFirebaseAuthError } from '../utils/authErrors';
 import {
   fetchLearnerCloudBundle,
+  saveAssessmentAttemptToFirestore,
   saveLearnerProfileToFirestore,
 } from '../utils/firestoreSync';
 import {
   auth,
   firebaseGoogleSignIn,
   logoutGoogle,
+  waitForAuthReady,
 } from '../utils/googleDrive';
 import { AuthErrorBanner } from './AuthErrorBanner';
 import { GoogleSignInButton } from './GoogleSignInButton';
-import { SelfAssessmentRunner } from './SelfAssessmentRunner';
+import { SelfAssessmentRunner, SessionSaveOutcome } from './SelfAssessmentRunner';
 
-const LEGACY_GUEST_UID_STORAGE_KEY = 'edubot_guest_learner_uid_v1';
+const GUEST_UID_STORAGE_KEY = 'edubot_guest_learner_uid_v1';
+
+function loadSavedGuestUid(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(GUEST_UID_STORAGE_KEY)?.trim() || '';
+    return isValidGuestLearnerUid(raw) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistGuestUid(uid: string | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (uid && isValidGuestLearnerUid(uid)) {
+      window.localStorage.setItem(GUEST_UID_STORAGE_KEY, uid);
+    } else {
+      window.localStorage.removeItem(GUEST_UID_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
 
 interface SelfAssessmentHubProps {
   classes: ClassRoom[];
@@ -82,6 +120,13 @@ interface ActiveSessionConfig {
   exercises: AssessmentExercise[];
 }
 
+interface CloudSyncState {
+  status: 'idle' | 'syncing' | 'synced' | 'error';
+  savedAt?: string;
+  error?: string;
+  permissionDenied?: boolean;
+}
+
 export function SelfAssessmentHub({
   classes,
   onSwitchToClassroom,
@@ -89,7 +134,9 @@ export function SelfAssessmentHub({
   lang,
   uiMode,
 }: SelfAssessmentHubProps) {
+  const [authReady, setAuthReady] = useState(false);
   const [googleUser, setGoogleUser] = useState<User | null>(() => auth.currentUser);
+  const [guestUid, setGuestUid] = useState<string | null>(() => loadSavedGuestUid());
   const [profile, setProfile] = useState<LearnerProfile | null>(null);
   const [attempts, setAttempts] = useState<AssessmentSessionAttempt[]>([]);
   const [awards, setAwards] = useState<TeacherAward[]>([]);
@@ -97,8 +144,20 @@ export function SelfAssessmentHub({
   const [signingIn, setSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuggestNewTab, setAuthSuggestNewTab] = useState(false);
+  const [cloudSyncState, setCloudSyncState] = useState<CloudSyncState>({ status: 'idle' });
+  const [copiedGuestCode, setCopiedGuestCode] = useState(false);
 
-  // Onboarding / Edit profile modal state (Google-authenticated only)
+  // Zero-login quick-start & resume-by-code state (for young students without Gmail)
+  const [guestTab, setGuestTab] = useState<'new' | 'resume'>('new');
+  const [quickFullName, setQuickFullName] = useState('');
+  const [quickClassName, setQuickClassName] = useState('');
+  const [quickSchoolName, setQuickSchoolName] = useState('');
+  const [quickGradeBand, setQuickGradeBand] = useState<LearnerGradeBand>('primary');
+  const [resumeCodeInput, setResumeCodeInput] = useState('');
+  const [guestSubmitting, setGuestSubmitting] = useState(false);
+  const [guestError, setGuestError] = useState('');
+
+  // Onboarding / Edit profile modal state
   const [editingProfile, setEditingProfile] = useState(false);
   const [formFullName, setFormFullName] = useState('');
   const [formClassName, setFormClassName] = useState('');
@@ -110,18 +169,33 @@ export function SelfAssessmentHub({
   // Active exercise runner state
   const [activeRun, setActiveRun] = useState<ActiveSessionConfig | null>(null);
 
-  // Sync Firebase auth state for Student Google Login
+  const isGoogleActive = Boolean(googleUser && googleUser.emailVerified);
+  const isGuestActive = !isGoogleActive && Boolean(guestUid && isValidGuestLearnerUid(guestUid));
+
+  // Sync Firebase auth state cleanly without flashing login gate on reload
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (u) => {
+    let active = true;
+    waitForAuthReady().then((u) => {
+      if (!active) return;
       setGoogleUser(u);
+      setAuthReady(true);
     });
-    return () => unsub();
+    const unsub = onAuthStateChanged(auth, (u) => {
+      if (!active) return;
+      setGoogleUser(u);
+      setAuthReady(true);
+    });
+    return () => {
+      active = false;
+      unsub();
+    };
   }, []);
 
   const hydrateLearnerData = useCallback(
-    async (user: User | null) => {
+    async (user: User | null, activeGuestUid: string | null) => {
       setLoading(true);
       try {
+        // MODE 1: Verified Personal Google Email
         if (user && user.emailVerified) {
           const idToken = await user.getIdToken();
           const [apiRes, cloudBundle] = await Promise.all([
@@ -136,31 +210,124 @@ export function SelfAssessmentHub({
             ).catch(() => null),
             fetchLearnerCloudBundle(user.uid).catch(() => ({
               profile: null,
+              attempts: [] as AssessmentSessionAttempt[],
               awards: [] as TeacherAward[],
+              error: undefined as string | undefined,
+              permissionDenied: false,
             })),
           ]);
 
           const apiProfile = apiRes?.ok ? apiRes.data.profile : null;
           const cloudProfile = cloudBundle.profile;
-          // Pick whichever profile has more progress / newer update
+
           let resolved: LearnerProfile | null = null;
           if (apiProfile && cloudProfile) {
-            resolved =
-              cloudProfile.totalXp >= apiProfile.totalXp ? cloudProfile : apiProfile;
+            resolved = mergeLearnerProfiles(apiProfile, cloudProfile);
           } else {
             resolved = cloudProfile ?? apiProfile;
           }
 
+          // If student upgraded from a zero-login profile on this device, merge their guest progress seamlessly!
+          if (activeGuestUid && isValidGuestLearnerUid(activeGuestUid)) {
+            const guestRes = await apiRequestJson<{
+              profile: LearnerProfile | null;
+            }>(`/api/learners/me?uid=${encodeURIComponent(activeGuestUid)}`, {}, lang).catch(
+              () => null,
+            );
+            const guestProf = guestRes?.ok ? guestRes.data.profile : null;
+            if (guestProf && (guestProf.totalXp > 0 || guestProf.totalExercisesDone > 0)) {
+              const adoptedGuest: LearnerProfile = {
+                ...guestProf,
+                uid: user.uid,
+                authType: 'google',
+                email: user.email || undefined,
+                photoUrl: user.photoURL || undefined,
+              };
+              resolved = resolved ? mergeLearnerProfiles(resolved, adoptedGuest) : adoptedGuest;
+            }
+            persistGuestUid(null);
+            setGuestUid(null);
+          }
+
+          const mergedAttemptsMap = new Map<string, AssessmentSessionAttempt>();
+          for (const att of [
+            ...(apiRes?.ok ? apiRes.data.attempts : []),
+            ...(cloudBundle.attempts ?? []),
+          ]) {
+            if (att?.id) mergedAttemptsMap.set(att.id, att);
+          }
+          const mergedAttempts = Array.from(mergedAttemptsMap.values())
+            .sort((a, b) => b.completedAt.localeCompare(a.completedAt))
+            .slice(0, 40);
+
           const mergedAwardsMap = new Map<string, TeacherAward>();
-          for (const a of [...(apiRes?.ok ? apiRes.data.awards : []), ...cloudBundle.awards]) {
-            mergedAwardsMap.set(a.id, a);
+          for (const a of [
+            ...(apiRes?.ok ? apiRes.data.awards : []),
+            ...(cloudBundle.awards ?? []),
+          ]) {
+            if (a?.id) mergedAwardsMap.set(a.id, a);
           }
           const mergedAwards = Array.from(mergedAwardsMap.values()).sort((a, b) =>
             b.createdAt.localeCompare(a.createdAt),
           );
 
+          if (resolved) {
+            const hydrateRes = await apiRequestJson<{
+              profile?: LearnerProfile;
+            }>(
+              '/api/learners/hydrate',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  idToken,
+                  profile: resolved,
+                  attempts: mergedAttempts,
+                  awards: mergedAwards,
+                }),
+              },
+              lang,
+            ).catch(() => null);
+            if (hydrateRes?.ok && hydrateRes.data.profile) {
+              resolved = hydrateRes.data.profile;
+            }
+
+            const cloudBehind =
+              !cloudProfile ||
+              resolved.totalXp > cloudProfile.totalXp ||
+              resolved.totalExercisesDone > cloudProfile.totalExercisesDone;
+
+            if (cloudBehind && resolved.profileCompleted) {
+              setCloudSyncState({ status: 'syncing' });
+              const pushRes = await saveLearnerProfileToFirestore(resolved, {
+                awardsCount: mergedAwards.length,
+                latestBadgeTitle: mergedAwards[0]?.badgeTitle,
+              });
+              setCloudSyncState(
+                pushRes.ok
+                  ? { status: 'synced', savedAt: pushRes.savedAt }
+                  : {
+                      status: 'error',
+                      error: pushRes.error,
+                      permissionDenied: pushRes.permissionDenied,
+                    },
+              );
+            } else if (cloudBundle.error) {
+              setCloudSyncState({
+                status: 'error',
+                error: cloudBundle.error,
+                permissionDenied: cloudBundle.permissionDenied,
+              });
+            } else if (cloudProfile) {
+              setCloudSyncState({
+                status: 'synced',
+                savedAt: cloudProfile.updatedAt || cloudProfile.lastActiveAt,
+              });
+            }
+          }
+
           setProfile(resolved);
-          setAttempts(apiRes?.ok ? apiRes.data.attempts : []);
+          setAttempts(mergedAttempts);
           setAwards(mergedAwards);
 
           if (!resolved || !resolved.profileCompleted) {
@@ -175,13 +342,132 @@ export function SelfAssessmentHub({
           return;
         }
 
-        // Clear any legacy local guest session so Home Self-Assessment strictly requires Google Sign-In
-        if (typeof window !== 'undefined') {
-          window.localStorage.removeItem(LEGACY_GUEST_UID_STORAGE_KEY);
+        // MODE 2: Zero-Login Student Profile (Cloud-Synced via guestLearnerProfiles!)
+        if (activeGuestUid && isValidGuestLearnerUid(activeGuestUid)) {
+          const [apiRes, cloudBundle] = await Promise.all([
+            apiRequestJson<{
+              profile: LearnerProfile | null;
+              attempts: AssessmentSessionAttempt[];
+              awards: TeacherAward[];
+            }>(`/api/learners/me?uid=${encodeURIComponent(activeGuestUid)}`, {}, lang).catch(
+              () => null,
+            ),
+            fetchLearnerCloudBundle(activeGuestUid).catch(() => ({
+              profile: null,
+              attempts: [] as AssessmentSessionAttempt[],
+              awards: [] as TeacherAward[],
+              error: undefined as string | undefined,
+              permissionDenied: false,
+            })),
+          ]);
+
+          const apiProfile = apiRes?.ok ? apiRes.data.profile : null;
+          const cloudProfile = cloudBundle.profile;
+          let resolved: LearnerProfile | null = null;
+          if (apiProfile && cloudProfile) {
+            resolved = mergeLearnerProfiles(apiProfile, cloudProfile);
+          } else {
+            resolved = cloudProfile ?? apiProfile;
+          }
+
+          if (!resolved) {
+            // Stale guest code that exists nowhere — clear and return to entry gate
+            persistGuestUid(null);
+            setGuestUid(null);
+            setProfile(null);
+            setAttempts([]);
+            setAwards([]);
+            setCloudSyncState({ status: 'idle' });
+            return;
+          }
+
+          const mergedAttemptsMap = new Map<string, AssessmentSessionAttempt>();
+          for (const att of [
+            ...(apiRes?.ok ? apiRes.data.attempts : []),
+            ...(cloudBundle.attempts ?? []),
+          ]) {
+            if (att?.id) mergedAttemptsMap.set(att.id, att);
+          }
+          const mergedAttempts = Array.from(mergedAttemptsMap.values())
+            .sort((a, b) => b.completedAt.localeCompare(a.completedAt))
+            .slice(0, 40);
+
+          const mergedAwardsMap = new Map<string, TeacherAward>();
+          for (const a of [
+            ...(apiRes?.ok ? apiRes.data.awards : []),
+            ...(cloudBundle.awards ?? []),
+          ]) {
+            if (a?.id) mergedAwardsMap.set(a.id, a);
+          }
+          const mergedAwards = Array.from(mergedAwardsMap.values()).sort((a, b) =>
+            b.createdAt.localeCompare(a.createdAt),
+          );
+
+          const hydrateRes = await apiRequestJson<{
+            profile?: LearnerProfile;
+          }>(
+            '/api/learners/hydrate',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                guestUid: activeGuestUid,
+                profile: resolved,
+                attempts: mergedAttempts,
+                awards: mergedAwards,
+              }),
+            },
+            lang,
+          ).catch(() => null);
+          if (hydrateRes?.ok && hydrateRes.data.profile) {
+            resolved = hydrateRes.data.profile;
+          }
+
+          const cloudBehind =
+            !cloudProfile ||
+            resolved.totalXp > cloudProfile.totalXp ||
+            resolved.totalExercisesDone > cloudProfile.totalExercisesDone;
+
+          if (cloudBehind && resolved.profileCompleted) {
+            setCloudSyncState({ status: 'syncing' });
+            const pushRes = await saveLearnerProfileToFirestore(resolved, {
+              awardsCount: mergedAwards.length,
+              latestBadgeTitle: mergedAwards[0]?.badgeTitle,
+            });
+            setCloudSyncState(
+              pushRes.ok
+                ? { status: 'synced', savedAt: pushRes.savedAt }
+                : {
+                    status: 'error',
+                    error: pushRes.error,
+                    permissionDenied: pushRes.permissionDenied,
+                  },
+            );
+          } else if (cloudBundle.error) {
+            setCloudSyncState({
+              status: 'error',
+              error: cloudBundle.error,
+              permissionDenied: cloudBundle.permissionDenied,
+            });
+          } else if (cloudProfile) {
+            setCloudSyncState({
+              status: 'synced',
+              savedAt: cloudProfile.updatedAt || cloudProfile.lastActiveAt,
+            });
+          }
+
+          setProfile(resolved);
+          setAttempts(mergedAttempts);
+          setAwards(mergedAwards);
+          setEditingProfile(!resolved.profileCompleted);
+          return;
         }
+
+        // Neither Google nor active Guest profile -> show Dual Entry Gate
         setProfile(null);
         setAttempts([]);
         setAwards([]);
+        setCloudSyncState({ status: 'idle' });
         setEditingProfile(false);
         setActiveRun(null);
       } finally {
@@ -192,8 +478,9 @@ export function SelfAssessmentHub({
   );
 
   useEffect(() => {
-    void hydrateLearnerData(googleUser);
-  }, [googleUser, hydrateLearnerData]);
+    if (!authReady) return;
+    void hydrateLearnerData(googleUser, guestUid);
+  }, [authReady, googleUser, guestUid, hydrateLearnerData]);
 
   const handleGoogleLogin = async () => {
     if (signingIn) return;
@@ -214,19 +501,163 @@ export function SelfAssessmentHub({
     }
   };
 
+  const handleQuickGuestStart = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanName = quickFullName.trim();
+    const cleanClass = quickClassName.trim();
+    const cleanSchool = quickSchoolName.trim();
+    if (!cleanName || !cleanClass || !cleanSchool) {
+      setGuestError(
+        lang === 'vi'
+          ? 'Vui lòng nhập đầy đủ Họ tên, Lớp học và Trường học để lưu thành tích lên Đám mây.'
+          : 'Please enter Full Name, Class, and School to save your achievements to the Cloud.',
+      );
+      return;
+    }
+
+    setGuestError('');
+    setGuestSubmitting(true);
+    setCloudSyncState({ status: 'syncing' });
+    try {
+      const newUid = generateGuestLearnerUid(cleanClass, cleanName);
+      const res = await apiRequestJson<{
+        profile?: LearnerProfile;
+        error?: string;
+      }>(
+        '/api/learners/profile',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            guestUid: newUid,
+            fullName: cleanName,
+            className: cleanClass,
+            schoolName: cleanSchool,
+            gradeBand: quickGradeBand,
+          }),
+        },
+        lang,
+      );
+
+      if (!res.ok || !res.data.profile) {
+        setGuestError(
+          res.data?.error ||
+            (lang === 'vi'
+              ? 'Không thể tạo hồ sơ học sinh. Vui lòng thử lại.'
+              : 'Could not create student profile.'),
+        );
+        return;
+      }
+
+      const created = res.data.profile;
+      persistGuestUid(newUid);
+      setGuestUid(newUid);
+      setProfile(created);
+      setAttempts([]);
+      setAwards([]);
+      setEditingProfile(false);
+
+      const cloudRes = await saveLearnerProfileToFirestore(created, { awardsCount: 0 });
+      setCloudSyncState(
+        cloudRes.ok
+          ? { status: 'synced', savedAt: cloudRes.savedAt }
+          : {
+              status: 'error',
+              error: cloudRes.error,
+              permissionDenied: cloudRes.permissionDenied,
+            },
+      );
+    } finally {
+      setGuestSubmitting(false);
+    }
+  };
+
+  const handleResumeGuestCode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const code = resumeCodeInput.trim();
+    if (!isValidGuestLearnerUid(code)) {
+      setGuestError(
+        lang === 'vi'
+          ? 'Mã hồ sơ không hợp lệ (mã bắt đầu bằng "guest-", ví dụ: guest-5a-khoi-a8f2).'
+          : 'Invalid profile code (starts with "guest-", e.g. guest-5a-khoi-a8f2).',
+      );
+      return;
+    }
+
+    setGuestError('');
+    setGuestSubmitting(true);
+    try {
+      const [apiRes, cloudBundle] = await Promise.all([
+        apiRequestJson<{ profile: LearnerProfile | null }>(
+          `/api/learners/me?uid=${encodeURIComponent(code)}`,
+          {},
+          lang,
+        ).catch(() => null),
+        fetchLearnerCloudBundle(code).catch(() => ({
+          profile: null,
+          attempts: [] as AssessmentSessionAttempt[],
+          awards: [] as TeacherAward[],
+        })),
+      ]);
+      const found = cloudBundle.profile ?? (apiRes?.ok ? apiRes.data.profile : null);
+      if (!found) {
+        setGuestError(
+          lang === 'vi'
+            ? `Không tìm thấy Mã hồ sơ "${code}" trên Đám mây hay thiết bị này. Hãy kiểm tra lại mã hoặc tạo hồ sơ mới.`
+            : `Profile code "${code}" not found on Cloud or this device.`,
+        );
+        return;
+      }
+      persistGuestUid(code);
+      setGuestUid(code);
+      setResumeCodeInput('');
+    } finally {
+      setGuestSubmitting(false);
+    }
+  };
+
   const handleSignOut = async () => {
     if (googleUser) {
       await logoutGoogle().catch(() => undefined);
     }
-    if (typeof window !== 'undefined') {
-      window.localStorage.removeItem(LEGACY_GUEST_UID_STORAGE_KEY);
-    }
+    persistGuestUid(null);
     setGoogleUser(null);
+    setGuestUid(null);
     setProfile(null);
     setAttempts([]);
     setAwards([]);
+    setCloudSyncState({ status: 'idle' });
     setEditingProfile(false);
     setActiveRun(null);
+  };
+
+  const handleCopyGuestCode = async () => {
+    if (!profile?.uid) return;
+    try {
+      await navigator.clipboard.writeText(profile.uid);
+      setCopiedGuestCode(true);
+      window.setTimeout(() => setCopiedGuestCode(false), 2500);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleRetryCloudSync = async () => {
+    if (!profile || (!isGoogleActive && !isGuestActive)) return;
+    setCloudSyncState({ status: 'syncing' });
+    const res = await saveLearnerProfileToFirestore(profile, {
+      awardsCount: awards.length,
+      latestBadgeTitle: awards[0]?.badgeTitle,
+    });
+    setCloudSyncState(
+      res.ok
+        ? { status: 'synced', savedAt: res.savedAt }
+        : {
+            status: 'error',
+            error: res.error,
+            permissionDenied: res.permissionDenied,
+          },
+    );
   };
 
   const handleSaveProfile = async (e: React.FormEvent) => {
@@ -238,25 +669,26 @@ export function SelfAssessmentHub({
     if (!cleanName || !cleanClass || !cleanSchool) {
       setFormError(
         lang === 'vi'
-          ? 'Vui lòng nhập đầy đủ Họ và tên, Lớp học và Trường học để Thầy/Cô theo dõi và khen thưởng.'
-          : 'Please enter Full Name, Class, and School so your teacher can view progress and reward you.',
+          ? 'Vui lòng nhập đầy đủ Họ và tên, Lớp học và Trường học để Thầy/Cô theo dõi và vinh danh.'
+          : 'Please enter Full Name, Class, and School so your teacher can view progress and honor you.',
       );
       return;
     }
 
-    if (!googleUser || !googleUser.emailVerified) {
+    if (!isGoogleActive && !isGuestActive) {
       setFormError(
         lang === 'vi'
-          ? 'Vui lòng đăng nhập tài khoản Google trước khi lưu hồ sơ Tự đánh giá.'
-          : 'Please sign in with Google before saving your self-assessment profile.',
+          ? 'Vui lòng đăng nhập Email cá nhân (Google) hoặc tạo hồ sơ không cần đăng nhập.'
+          : 'Please sign in with Google or create a quick student profile.',
       );
       return;
     }
 
     setFormError('');
     setSavingProfile(true);
+    setCloudSyncState({ status: 'syncing' });
     try {
-      const idToken = await googleUser.getIdToken();
+      const idToken = isGoogleActive && googleUser ? await googleUser.getIdToken() : undefined;
 
       const res = await apiRequestJson<{
         profile?: LearnerProfile;
@@ -269,8 +701,7 @@ export function SelfAssessmentHub({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            idToken,
-            photoUrl: googleUser.photoURL || undefined,
+            ...(idToken ? { idToken, photoUrl: googleUser?.photoURL || undefined } : { guestUid }),
             fullName: cleanName,
             className: cleanClass,
             schoolName: cleanSchool,
@@ -290,14 +721,33 @@ export function SelfAssessmentHub({
         return;
       }
 
-      const saved = res.data.profile;
-      setProfile(saved);
-      setAttempts(res.data.attempts ?? []);
-      setAwards((prev) =>
-        res.data.awards && res.data.awards.length > prev.length ? res.data.awards : prev,
-      );
+      const saved = profile
+        ? mergeLearnerProfiles(profile, res.data.profile)
+        : res.data.profile;
+      const nextAwards =
+        res.data.awards && res.data.awards.length > awards.length
+          ? res.data.awards
+          : awards;
 
-      void saveLearnerProfileToFirestore(saved);
+      setProfile(saved);
+      if (res.data.attempts && res.data.attempts.length > attempts.length) {
+        setAttempts(res.data.attempts);
+      }
+      setAwards(nextAwards);
+
+      const cloudRes = await saveLearnerProfileToFirestore(saved, {
+        awardsCount: nextAwards.length,
+        latestBadgeTitle: nextAwards[0]?.badgeTitle,
+      });
+      setCloudSyncState(
+        cloudRes.ok
+          ? { status: 'synced', savedAt: cloudRes.savedAt }
+          : {
+              status: 'error',
+              error: cloudRes.error,
+              permissionDenied: cloudRes.permissionDenied,
+            },
+      );
       setEditingProfile(false);
     } finally {
       setSavingProfile(false);
@@ -310,40 +760,94 @@ export function SelfAssessmentHub({
     targetCompetencyId?: string;
     outcomes: AssessmentExerciseOutcome[];
     maxCombo: number;
-  }) => {
-    if (!googleUser || !googleUser.emailVerified) {
-      return;
+  }): Promise<SessionSaveOutcome> => {
+    if (!isGoogleActive && !isGuestActive) {
+      return {
+        cloudSaved: false,
+        error: 'Chưa có hồ sơ học sinh để lưu thành tích.',
+      };
     }
-    const idToken = await googleUser.getIdToken().catch(() => undefined);
-    if (!idToken) return;
+
+    const idToken =
+      isGoogleActive && googleUser
+        ? await googleUser.getIdToken().catch(() => undefined)
+        : undefined;
+    if (isGoogleActive && !idToken) {
+      return {
+        cloudSaved: false,
+        error: 'Không lấy được phiên xác thực Google. Vui lòng đăng nhập lại.',
+      };
+    }
+
+    setCloudSyncState({ status: 'syncing' });
     const res = await apiRequestJson<{
       profile?: LearnerProfile;
       attempt?: AssessmentSessionAttempt;
       awards?: TeacherAward[];
+      error?: string;
     }>(
       '/api/learners/assessment-submit',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          idToken,
+          ...(idToken ? { idToken } : { guestUid }),
           learnerName: profile?.fullName,
           className: profile?.className,
           schoolName: profile?.schoolName,
           gradeBand: profile?.gradeBand,
+          baseProfile: profile ?? undefined,
           ...payload,
         }),
       },
       lang,
     );
 
-    if (res.ok && res.data.profile) {
-      setProfile(res.data.profile);
-      if (res.data.attempt) {
-        setAttempts((prev) => [res.data.attempt!, ...prev].slice(0, 30));
-      }
-      void saveLearnerProfileToFirestore(res.data.profile);
+    if (!res.ok || !res.data.profile) {
+      const errMsg = res.data?.error || 'Không thể lưu kết quả tự đánh giá.';
+      setCloudSyncState({ status: 'error', error: errMsg });
+      return { cloudSaved: false, error: errMsg };
     }
+
+    const updatedProfile = res.data.profile;
+    const nextAwards =
+      res.data.awards && res.data.awards.length > awards.length
+        ? res.data.awards
+        : awards;
+
+    setProfile(updatedProfile);
+    if (res.data.attempt) {
+      setAttempts((prev) =>
+        [res.data.attempt!, ...prev.filter((a) => a.id !== res.data.attempt!.id)].slice(0, 40),
+      );
+    }
+    setAwards(nextAwards);
+
+    // AWAIT Cloud Firestore persistence (works for BOTH Google Email AND Zero-Login profiles!)
+    const [cloudRes] = await Promise.all([
+      saveLearnerProfileToFirestore(updatedProfile, {
+        awardsCount: nextAwards.length,
+        latestBadgeTitle: nextAwards[0]?.badgeTitle,
+      }),
+      res.data.attempt
+        ? saveAssessmentAttemptToFirestore(res.data.attempt)
+        : Promise.resolve(false),
+    ]);
+
+    setCloudSyncState(
+      cloudRes.ok
+        ? { status: 'synced', savedAt: cloudRes.savedAt }
+        : {
+            status: 'error',
+            error: cloudRes.error,
+            permissionDenied: cloudRes.permissionDenied,
+          },
+    );
+
+    return {
+      cloudSaved: cloudRes.ok,
+      error: cloudRes.error,
+    };
   };
 
   const mastery = profile?.masteryByCompetency ?? {};
@@ -365,8 +869,8 @@ export function SelfAssessmentHub({
     [currentLevel, mastery],
   );
 
-  // Active Interactive Assessment Runner View (Strictly Google-Authenticated Only!)
-  if (activeRun && googleUser?.emailVerified && profile?.profileCompleted) {
+  // Active Interactive Assessment Runner View (Google Email OR Completed Zero-Login Profile!)
+  if (activeRun && (isGoogleActive || isGuestActive) && profile?.profileCompleted) {
     return (
       <SelfAssessmentRunner
         title={activeRun.title}
@@ -393,17 +897,17 @@ export function SelfAssessmentHub({
     );
   }
 
-  // STEP A: Mandatory Google Sign-In Gate (Prevents guest peeking at questions & answers!)
-  if (!googleUser || !googleUser.emailVerified) {
+  // STEP A: Dual-Mode Entry Gate (Google Personal Email OR Zero-Login Cloud Sync!)
+  if (!isGoogleActive && !isGuestActive) {
     return (
-      <section className="max-w-4xl mx-auto space-y-6">
+      <section className="max-w-5xl mx-auto space-y-6">
         <div className="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-6">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="space-y-2 max-w-2xl">
               <p className="text-xs font-bold uppercase tracking-wide text-emerald-700">
                 {lang === 'vi'
-                  ? 'Tự học ở nhà · Bắt buộc Đăng nhập Google để bảo mật đề & lưu tiến độ'
-                  : 'Home Self-Assessment · Google Sign-In Required for Fairness & Cloud Sync'}
+                  ? 'Tự học ở nhà · Lưu thành tích 24 năng lực lên Cloud Firestore để Thầy/Cô vinh danh'
+                  : 'Home Self-Assessment · Sync 24 Competencies to Cloud Firestore for Teacher Honors'}
               </p>
               <h1 className="text-2xl sm:text-3xl font-bold text-slate-900">
                 {lang === 'vi'
@@ -412,133 +916,360 @@ export function SelfAssessmentHub({
               </h1>
               <p className="text-sm text-slate-600 leading-relaxed">
                 {lang === 'vi'
-                  ? 'Chinh phục 96 bài tập cốt lõi và mở khóa thêm 48 câu hỏi nâng cao (tổng 144 bài tập, 5 dạng trò chơi tương tác) khi em đạt các cấp độ cao hơn. Để đảm bảo công bằng — không tạo tài khoản khách xem trước câu hỏi và đáp án — học sinh cần đăng nhập Google trước khi mở kho đề.'
-                  : 'Master 96 core exercises and unlock 48 extra higher-level challenges (144 total across 5 interactive formats) as you level up. Google Sign-In is required before viewing questions to ensure fairness and save your cloud progress.'}
+                  ? 'Chinh phục 96 bài tập cốt lõi và mở khóa thêm 48 câu hỏi nâng cao (tổng 144 bài tập, 5 dạng trò chơi tương tác). Em có thể chọn đăng nhập Email cá nhân (Google) hoặc vào ngay KHÔNG cần đăng nhập — cả 2 cách đều tự động lưu Đám mây (Google Cloud Firestore) để Thầy/Cô tổng hợp và vinh danh.'
+                  : 'Master 96 core exercises and unlock 48 advanced items (144 total across 5 interactive formats). Choose Personal Google Email OR Quick Start without login — both sync directly to Google Cloud Firestore for teacher review and class honors.'}
               </p>
             </div>
             <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-800">
-              <Lock className="w-4 h-4 shrink-0" />
+              <Cloud className="w-4 h-4 shrink-0" />
               <span>
-                {lang === 'vi' ? 'Chống xem trước đề · Lưu đám mây' : 'Anti-Peek · Cloud Sync'}
+                {lang === 'vi' ? 'Đồng bộ Đám mây · 2 Chế độ' : 'Cloud Firestore · Dual Mode'}
               </span>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-            {/* Primary Mandatory Google Login Card */}
-            <div className="lg:col-span-3 p-5 sm:p-6 rounded-2xl border-2 border-sky-200 bg-sky-50/40 flex flex-col justify-between gap-5">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+            {/* Option 1: Personal Google Email (Recommended for multi-device sync) */}
+            <div className="p-5 sm:p-6 rounded-2xl border-2 border-sky-200 bg-sky-50/40 flex flex-col justify-between gap-5">
               <div className="space-y-3">
-                <span className="inline-flex items-center gap-1.5 text-xs font-bold text-sky-700">
-                  <ShieldCheck className="w-4 h-4" />
-                  <span>
-                    {lang === 'vi'
-                      ? 'Bước 1 · Xác thực tài khoản Học sinh bằng Google'
-                      : 'Step 1 · Verify Student Account with Google'}
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-sky-700">
+                    <ShieldCheck className="w-4 h-4" />
+                    <span>
+                      {lang === 'vi'
+                        ? 'Cách 1 · Khuyên dùng (Đồng bộ đa thiết bị)'
+                        : 'Option 1 · Recommended (Cross-Device Sync)'}
+                    </span>
                   </span>
-                </span>
-                <h2 className="text-lg sm:text-xl font-bold text-slate-900">
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-sky-100 text-sky-800 border border-sky-200">
+                    Google Email
+                  </span>
+                </div>
+                <h2 className="text-lg font-bold text-slate-900">
                   {lang === 'vi'
-                    ? 'Đăng nhập Google để mở khóa bài tự đánh giá'
-                    : 'Sign in with Google to Unlock Exercises'}
+                    ? 'Đăng nhập bằng Email cá nhân (Google)'
+                    : 'Sign in with Personal Email (Google)'}
                 </h2>
                 <ul className="text-xs sm:text-sm text-slate-700 space-y-2">
                   <li className="flex items-start gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                     <span>
                       {lang === 'vi'
-                        ? 'Công bằng tuyệt đối: Khóa hoàn toàn chế độ khách để học sinh không thể vào xem trước câu hỏi hay đáp án.'
-                        : 'Fair testing: Guest preview is disabled so students cannot peek at questions or answers beforehand.'}
+                        ? 'Tự động lưu 24 năng lực thành phần, XP, Cấp độ 1–4 và lịch sử tự học gắn với email cá nhân.'
+                        : 'Automatically saves 24 competencies, XP, Levels 1–4, and session history under your personal email.'}
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                     <span>
                       {lang === 'vi'
-                        ? 'Lưu vĩnh viễn lịch sử từng câu đã làm, điểm XP, Cấp độ 1–4 và Huy hiệu khen thưởng từ Thầy/Cô trên mọi thiết bị.'
-                        : 'Permanently syncs per-question history, XP, Levels 1–4, and Teacher Awards across devices.'}
+                        ? 'Đổi máy tính bảng hay điện thoại chỉ cần đăng nhập lại Gmail — không cần nhớ mã hồ sơ.'
+                        : 'Switch devices seamlessly by signing into your Gmail — no profile code required.'}
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                     <span>
                       {lang === 'vi'
-                        ? 'Phân quyền chặt chẽ: Tài khoản học sinh chỉ dùng để tự học, không thể truy cập Cổng Giáo Viên.'
-                        : 'Strict role separation: Student Google accounts cannot access the Teacher Admin Portal.'}
+                        ? 'Bảo mật riêng tư: tài khoản học sinh chỉ dùng để tự học, không vào được Cổng Giáo Viên.'
+                        : 'Role-isolated & private: student accounts cannot access the Teacher Admin Portal.'}
                     </span>
                   </li>
                 </ul>
               </div>
 
-              <div className="space-y-2">
+              <div className="space-y-2.5">
                 <GoogleSignInButton
                   onClick={handleGoogleLogin}
                   loading={signingIn}
                   label={
                     lang === 'vi'
-                      ? 'Đăng nhập Học sinh bằng Google'
-                      : 'Student Sign in with Google'
+                      ? 'Đăng nhập bằng Email cá nhân (Google)'
+                      : 'Sign in with Personal Email (Google)'
                   }
                 />
+                {authError && (
+                  <AuthErrorBanner
+                    message={authError}
+                    lang={lang}
+                    suggestNewTab={authSuggestNewTab}
+                    tone="error"
+                  />
+                )}
               </div>
             </div>
 
-            {/* Scoring & Progressive Unlock Overview Card */}
-            <div className="lg:col-span-2 p-5 rounded-2xl border border-slate-200 bg-slate-50/70 space-y-4">
-              <div className="space-y-1.5">
-                <span className="inline-flex items-center gap-1.5 text-xs font-bold text-indigo-700">
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>
-                    {lang === 'vi' ? 'Điểm làm lại công bằng & Mở khóa câu mới' : 'Fair Retry Scoring & Unlocks'}
+            {/* Option 2: Zero-Login Cloud Sync (For young students without Gmail) */}
+            <div className="p-5 sm:p-6 rounded-2xl border-2 border-emerald-200 bg-emerald-50/30 flex flex-col justify-between gap-4">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700">
+                    <UserPlus className="w-4 h-4" />
+                    <span>
+                      {lang === 'vi'
+                        ? 'Cách 2 · Không cần Gmail (Vẫn lưu Đám mây!)'
+                        : 'Option 2 · No Login Required (Cloud Saved!)'}
+                    </span>
                   </span>
-                </span>
-                <h3 className="text-sm font-bold text-slate-900">
-                  {lang === 'vi' ? 'Càng lên cấp cao, kho đề càng phong phú!' : 'Level Up to Unlock More Questions!'}
-                </h3>
-              </div>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                    Firestore
+                  </span>
+                </div>
+                <h2 className="text-lg font-bold text-slate-900">
+                  {lang === 'vi'
+                    ? 'Tự đánh giá nhanh KHÔNG cần đăng nhập'
+                    : 'Quick Self-Assessment Without Login'}
+                </h2>
 
-              <ul className="space-y-2 text-xs text-slate-700">
-                <li className="p-2.5 rounded-xl bg-white border border-slate-200">
-                  <strong className="text-emerald-700">100% XP</strong>{' '}
-                  {lang === 'vi'
-                    ? 'khi làm đúng lần đầu (câu mở rộng thưởng tới +105 XP/câu).'
-                    : 'for first-try mastery (up to +105 XP on expansion items).'}
-                </li>
-                <li className="p-2.5 rounded-xl bg-white border border-slate-200">
-                  <strong className="text-sky-700">80% XP</strong>{' '}
-                  {lang === 'vi'
-                    ? 'khi quay lại sửa đúng câu từng làm sai (khuyến khích tự ôn!).'
-                    : 'when mastering a previously missed exercise.'}
-                </li>
-                <li className="p-2.5 rounded-xl bg-white border border-slate-200">
-                  <strong className="text-amber-700">25% XP (1 lần) → 0 XP</strong>{' '}
-                  {lang === 'vi'
-                    ? 'khi ôn lại câu đã đạt để tránh cày điểm lặp lại.'
-                    : 'for 1 spaced review, then free 0 XP practice to prevent farming.'}
-                </li>
-                <li className="p-2.5 rounded-xl bg-indigo-50/70 border border-indigo-200 text-indigo-950">
-                  <strong>96 → 144 {lang === 'vi' ? 'câu' : 'items'}:</strong>{' '}
-                  {lang === 'vi'
-                    ? 'Đạt Cấp 2 mở +12 câu · Cấp 3 mở +18 câu · Cấp 4 mở +18 câu Chuyên gia!'
-                    : 'Level 2 unlocks +12 · Level 3 unlocks +18 · Level 4 unlocks +18 Master items!'}
-                </li>
-              </ul>
+                {/* Sub-tabs: New Profile vs Resume by Code */}
+                <div className="flex items-center gap-1 p-1 rounded-xl bg-white border border-emerald-200/80 text-xs font-semibold">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setGuestTab('new');
+                      setGuestError('');
+                    }}
+                    className={`flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg cursor-pointer transition-colors ${
+                      guestTab === 'new'
+                        ? 'bg-emerald-600 text-white shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    <span>{lang === 'vi' ? 'Tạo hồ sơ mới' : 'New Profile'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setGuestTab('resume');
+                      setGuestError('');
+                    }}
+                    className={`flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg cursor-pointer transition-colors ${
+                      guestTab === 'resume'
+                        ? 'bg-emerald-600 text-white shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <KeyRound className="w-3.5 h-3.5" />
+                    <span>{lang === 'vi' ? 'Tiếp tục bằng Mã hồ sơ' : 'Resume with Code'}</span>
+                  </button>
+                </div>
+
+                {guestTab === 'new' ? (
+                  <form onSubmit={handleQuickGuestStart} className="space-y-3">
+                    <div>
+                      <label
+                        htmlFor="quick-guest-name"
+                        className="block text-xs font-semibold text-slate-800 mb-1"
+                      >
+                        {lang === 'vi' ? 'Họ và tên học sinh *' : 'Student Full Name *'}
+                      </label>
+                      <input
+                        id="quick-guest-name"
+                        type="text"
+                        required
+                        value={quickFullName}
+                        onChange={(e) => setQuickFullName(e.target.value)}
+                        placeholder={lang === 'vi' ? 'Ví dụ: Nguyễn Minh Khôi' : 'e.g. Minh Khoi Nguyen'}
+                        className="w-full px-3.5 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <div>
+                        <label
+                          htmlFor="quick-guest-class"
+                          className="block text-xs font-semibold text-slate-800 mb-1"
+                        >
+                          {lang === 'vi' ? 'Lớp học *' : 'Class *'}
+                        </label>
+                        <input
+                          id="quick-guest-class"
+                          type="text"
+                          required
+                          value={quickClassName}
+                          onChange={(e) => setQuickClassName(e.target.value)}
+                          placeholder={lang === 'vi' ? 'VD: 5A, 6B' : 'e.g. 5A, 6B'}
+                          className="w-full px-3.5 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                        />
+                        {classes.length > 0 && (
+                          <div className="flex flex-wrap gap-1 pt-1">
+                            {classes.slice(0, 4).map((c) => (
+                              <button
+                                key={c.id}
+                                type="button"
+                                onClick={() => setQuickClassName(c.id)}
+                                className="px-2 py-0.5 text-[10px] font-semibold bg-white border border-slate-200 hover:border-emerald-400 hover:text-emerald-700 text-slate-600 rounded-md cursor-pointer"
+                              >
+                                {c.id}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor="quick-guest-grade"
+                          className="block text-xs font-semibold text-slate-800 mb-1"
+                        >
+                          {lang === 'vi' ? 'Cấp học' : 'School Level'}
+                        </label>
+                        <select
+                          id="quick-guest-grade"
+                          value={quickGradeBand}
+                          onChange={(e) => setQuickGradeBand(e.target.value as LearnerGradeBand)}
+                          className="w-full px-3 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                        >
+                          <option value="primary">
+                            {lang === 'vi' ? 'Tiểu học (Cấp 1–2)' : 'Primary (L1–L2)'}
+                          </option>
+                          <option value="middle">
+                            {lang === 'vi' ? 'THCS (Cấp 2–3)' : 'Middle (L2–L3)'}
+                          </option>
+                          <option value="high">
+                            {lang === 'vi' ? 'THPT (Cấp 3–4)' : 'High (L3–L4)'}
+                          </option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label
+                        htmlFor="quick-guest-school"
+                        className="block text-xs font-semibold text-slate-800 mb-1"
+                      >
+                        {lang === 'vi' ? 'Trường học *' : 'School Name *'}
+                      </label>
+                      <input
+                        id="quick-guest-school"
+                        type="text"
+                        required
+                        value={quickSchoolName}
+                        onChange={(e) => setQuickSchoolName(e.target.value)}
+                        placeholder={
+                          lang === 'vi'
+                            ? 'Ví dụ: Trường Tiểu học Nguyễn Du'
+                            : 'e.g. Nguyen Du Primary School'
+                        }
+                        className="w-full px-3.5 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                      />
+                    </div>
+
+                    {guestError && (
+                      <p role="alert" className="text-xs font-semibold text-rose-700">
+                        {guestError}
+                      </p>
+                    )}
+
+                    <button
+                      type="submit"
+                      disabled={guestSubmitting}
+                      className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 rounded-xl cursor-pointer shadow-xs"
+                    >
+                      <Play className="w-4 h-4" />
+                      <span>
+                        {guestSubmitting
+                          ? lang === 'vi'
+                            ? 'Đang tạo hồ sơ Đám mây...'
+                            : 'Creating Cloud Profile...'
+                          : lang === 'vi'
+                            ? 'Bắt đầu Tự đánh giá ngay (Lưu Đám mây)'
+                            : 'Start Now (Cloud Saved)'}
+                      </span>
+                    </button>
+                    <p className="text-[11px] text-slate-600 leading-snug">
+                      {lang === 'vi'
+                        ? 'Hệ thống sẽ cấp cho em 1 Mã hồ sơ riêng (VD: guest-5a-khoi-...) để lưu kết quả lên Google Cloud Firestore cho Thầy/Cô và bạn bè cùng thấy.'
+                        : 'You will get a personal Profile Code (e.g. guest-5a-khoi-...) synced to Google Cloud Firestore for your teacher & honor board.'}
+                    </p>
+                  </form>
+                ) : (
+                  <form onSubmit={handleResumeGuestCode} className="space-y-3 pt-1">
+                    <p className="text-xs text-slate-700 leading-relaxed">
+                      {lang === 'vi'
+                        ? 'Nếu em đã từng làm trên máy khác mà không đăng nhập Gmail, hãy dán Mã hồ sơ cá nhân của em vào đây để tải lại toàn bộ điểm XP, 24 năng lực và huy hiệu từ Đám mây.'
+                        : 'If you practiced on another device without Gmail, paste your personal Profile Code here to restore your XP, 24 competencies, and teacher awards from the Cloud.'}
+                    </p>
+                    <div>
+                      <label
+                        htmlFor="resume-guest-code"
+                        className="block text-xs font-semibold text-slate-800 mb-1"
+                      >
+                        {lang === 'vi' ? 'Mã hồ sơ cá nhân *' : 'Personal Profile Code *'}
+                      </label>
+                      <input
+                        id="resume-guest-code"
+                        type="text"
+                        required
+                        value={resumeCodeInput}
+                        onChange={(e) => setResumeCodeInput(e.target.value)}
+                        placeholder="guest-5a-minh-khoi-a1b2"
+                        className="w-full px-3.5 py-2.5 text-sm font-mono-num bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                      />
+                    </div>
+
+                    {guestError && (
+                      <p role="alert" className="text-xs font-semibold text-rose-700">
+                        {guestError}
+                      </p>
+                    )}
+
+                    <button
+                      type="submit"
+                      disabled={guestSubmitting}
+                      className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 rounded-xl cursor-pointer"
+                    >
+                      <KeyRound className="w-4 h-4" />
+                      <span>
+                        {guestSubmitting
+                          ? lang === 'vi'
+                            ? 'Đang tải hồ sơ từ Đám mây...'
+                            : 'Loading Cloud Profile...'
+                          : lang === 'vi'
+                            ? 'Khôi phục Hồ sơ & Tiếp tục học'
+                            : 'Restore Profile & Continue'}
+                      </span>
+                    </button>
+                  </form>
+                )}
+              </div>
             </div>
           </div>
 
-          {authError && (
-            <AuthErrorBanner
-              message={authError}
-              lang={lang}
-              suggestNewTab={authSuggestNewTab}
-              tone="error"
-            />
-          )}
+          {/* Fair Scoring & Progressive Unlock Strip */}
+          <div className="p-4 rounded-2xl border border-slate-200 bg-slate-50/70 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 text-xs text-slate-700">
+            <div className="p-2.5 rounded-xl bg-white border border-slate-200">
+              <strong className="text-emerald-700">100% XP</strong>{' '}
+              {lang === 'vi'
+                ? 'làm đúng lần đầu (câu mở rộng tới +105 XP).'
+                : 'first-try mastery (up to +105 XP).'}
+            </div>
+            <div className="p-2.5 rounded-xl bg-white border border-slate-200">
+              <strong className="text-sky-700">80% XP</strong>{' '}
+              {lang === 'vi'
+                ? 'sửa đúng câu từng làm sai (khuyến khích tự ôn!).'
+                : 'mastering a previously missed item.'}
+            </div>
+            <div className="p-2.5 rounded-xl bg-white border border-slate-200">
+              <strong className="text-amber-700">25% → 0 XP</strong>{' '}
+              {lang === 'vi'
+                ? 'chống cày điểm lặp lại câu đã đạt.'
+                : 'anti-farming cap on already-mastered repeats.'}
+            </div>
+            <div className="p-2.5 rounded-xl bg-indigo-50/70 border border-indigo-200 text-indigo-950">
+              <strong>96 → 144 {lang === 'vi' ? 'câu' : 'items'}:</strong>{' '}
+              {lang === 'vi'
+                ? 'Lên Cấp 2–4 tự mở thêm 48 câu nâng cao!'
+                : 'Levels 2–4 unlock 48 extra items!'}
+            </div>
+          </div>
 
           <div className="pt-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
             <span>
               {lang === 'vi'
-                ? 'Đang học trên lớp với 10 máy tính bảng dùng chung (không cần đăng nhập Google)?'
-                : 'In class on one of the 10 shared tablets (no Google sign-in needed)?'}
+                ? 'Đang học trên lớp với 10 máy tính bảng dùng chung?'
+                : 'In class on one of the 10 shared classroom tablets?'}
             </span>
             <button
               type="button"
@@ -564,9 +1295,13 @@ export function SelfAssessmentHub({
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold bg-sky-50 text-sky-700 border border-sky-200">
               <GraduationCap className="w-3.5 h-3.5" />
               <span>
-                {lang === 'vi'
-                  ? `Tài khoản Google đã xác thực: ${googleUser.email}`
-                  : `Verified Google Account: ${googleUser.email}`}
+                {isGoogleActive && googleUser?.email
+                  ? lang === 'vi'
+                    ? `Tài khoản Google đã xác thực: ${googleUser.email}`
+                    : `Verified Google Account: ${googleUser.email}`
+                  : lang === 'vi'
+                    ? `Hồ sơ Không cần đăng nhập (Cloud): ${guestUid || profile?.uid || ''}`
+                    : `Zero-Login Cloud Profile: ${guestUid || profile?.uid || ''}`}
               </span>
             </div>
             <h1 className="text-xl sm:text-2xl font-bold text-slate-900">
@@ -768,10 +1503,19 @@ export function SelfAssessmentHub({
                 >
                   {lang === 'vi' ? currentLevelMeta.nameVi : currentLevelMeta.nameEn}
                 </span>
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                  <ShieldCheck className="w-3 h-3" />
-                  <span>Google</span>
-                </span>
+                {isGoogleActive ? (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                    <ShieldCheck className="w-3 h-3" />
+                    <span>Google</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-sky-50 text-sky-700 border border-sky-200">
+                    <Cloud className="w-3 h-3" />
+                    <span>
+                      {lang === 'vi' ? 'Không cần đăng nhập · Lưu Đám mây' : 'Zero-Login · Cloud Synced'}
+                    </span>
+                  </span>
+                )}
               </div>
               <p className="text-xs sm:text-sm text-slate-600 mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
                 <span className="inline-flex items-center gap-1">
@@ -782,11 +1526,64 @@ export function SelfAssessmentHub({
                   <School className="w-3.5 h-3.5 text-slate-400" />
                   <strong>{lang === 'vi' ? 'Trường' : 'School'}:</strong> {profile.schoolName}
                 </span>
+                {(profile.email || googleUser?.email) ? (
+                  <span className="inline-flex items-center gap-1 text-slate-500">
+                    <Mail className="w-3.5 h-3.5 text-slate-400" />
+                    <span className="truncate max-w-[240px]">
+                      {profile.email || googleUser?.email}
+                    </span>
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyGuestCode()}
+                    title={
+                      lang === 'vi'
+                        ? 'Sao chép Mã hồ sơ cá nhân để tiếp tục học trên thiết bị khác'
+                        : 'Copy your personal Profile Code to resume on another device'
+                    }
+                    className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-slate-100 hover:bg-emerald-50 border border-slate-200 hover:border-emerald-300 text-xs font-mono-num font-semibold text-slate-700 cursor-pointer"
+                  >
+                    <KeyRound className="w-3 h-3 text-emerald-600 shrink-0" />
+                    <span>
+                      {lang === 'vi' ? 'Mã hồ sơ:' : 'Code:'} {profile.uid}
+                    </span>
+                    {copiedGuestCode ? (
+                      <Check className="w-3 h-3 text-emerald-600 shrink-0" />
+                    ) : (
+                      <Copy className="w-3 h-3 text-slate-400 shrink-0" />
+                    )}
+                  </button>
+                )}
               </p>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {isGuestActive && (
+              <button
+                type="button"
+                disabled={signingIn}
+                onClick={() => void handleGoogleLogin()}
+                title={
+                  lang === 'vi'
+                    ? 'Đăng nhập Google để gộp toàn bộ điểm XP và 24 năng lực hiện tại vào Email cá nhân'
+                    : 'Sign in with Google to merge all current XP & 24 competencies into your personal email'
+                }
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-sky-800 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-xl cursor-pointer disabled:opacity-50"
+              >
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span>
+                  {signingIn
+                    ? lang === 'vi'
+                      ? 'Đang liên kết...'
+                      : 'Linking...'
+                    : lang === 'vi'
+                      ? 'Liên kết Email Google'
+                      : 'Link Google Email'}
+                </span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => {
@@ -815,9 +1612,65 @@ export function SelfAssessmentHub({
               className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-600 bg-white border border-slate-200 hover:bg-slate-50 rounded-xl cursor-pointer"
             >
               <LogOut className="w-3.5 h-3.5" />
-              <span>{lang === 'vi' ? 'Đăng xuất' : 'Sign Out'}</span>
+              <span>
+                {isGoogleActive
+                  ? lang === 'vi'
+                    ? 'Đăng xuất'
+                    : 'Sign Out'
+                  : lang === 'vi'
+                    ? 'Đổi hồ sơ'
+                    : 'Switch Profile'}
+              </span>
             </button>
           </div>
+        </div>
+
+        {/* Cloud Achievement Persistence Status Bar */}
+        <div
+          className={`rounded-xl px-3.5 py-2.5 border flex flex-wrap items-center justify-between gap-2 text-xs ${
+            cloudSyncState.status === 'error'
+              ? 'bg-amber-50 border-amber-200 text-amber-900'
+              : 'bg-emerald-50/60 border-emerald-200 text-emerald-900'
+          }`}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            {cloudSyncState.status === 'error' ? (
+              <CloudOff className="w-4 h-4 text-amber-600 shrink-0" />
+            ) : (
+              <Cloud className="w-4 h-4 text-emerald-600 shrink-0" />
+            )}
+            <span className="font-semibold">
+              {cloudSyncState.status === 'syncing'
+                ? lang === 'vi'
+                  ? 'Đang lưu thành tích 24 năng lực lên Đám mây...'
+                  : 'Syncing your 24-competency achievements to Cloud...'
+                : cloudSyncState.status === 'error'
+                  ? lang === 'vi'
+                    ? `Đã lưu tạm trên máy · Chưa đồng bộ Đám mây (${cloudSyncState.error || 'mất mạng'})`
+                    : `Saved locally · Cloud sync pending (${cloudSyncState.error || 'offline'})`
+                  : lang === 'vi'
+                    ? `Thành tích đã đồng bộ Đám mây${
+                        cloudSyncState.savedAt
+                          ? ` (${new Date(cloudSyncState.savedAt).toLocaleTimeString('vi-VN', {
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })})`
+                          : ''
+                      } — Thầy/Cô có thể xem tổng hợp và vinh danh em!`
+                    : `Achievements synced to Cloud — Your teacher can view your summary and honor you!`}
+            </span>
+          </div>
+          <button
+            type="button"
+            disabled={cloudSyncState.status === 'syncing'}
+            onClick={() => void handleRetryCloudSync()}
+            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold disabled:opacity-50 cursor-pointer shrink-0"
+          >
+            <RefreshCw
+              className={`w-3.5 h-3.5 ${cloudSyncState.status === 'syncing' ? 'animate-spin' : ''}`}
+            />
+            <span>{lang === 'vi' ? 'Đồng bộ Đám mây' : 'Sync Cloud'}</span>
+          </button>
         </div>
 
         {/* 4 Key Stats */}

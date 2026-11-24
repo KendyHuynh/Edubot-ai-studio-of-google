@@ -861,3 +861,461 @@ export function buildPublicLearnerHonorList(
       return b.accuracyPercent - a.accuracyPercent;
     });
 }
+
+/**
+ * Deep-sanitizes masteryByCompetency for Firestore (strips undefined values,
+ * enforces finite integer bounds and string length limits).
+ */
+export function sanitizeMasteryForFirestore(
+  mastery: Record<string, CompetencyMasteryRecord> | undefined,
+): Record<string, CompetencyMasteryRecord> {
+  const clean: Record<string, CompetencyMasteryRecord> = {};
+  if (!mastery || typeof mastery !== 'object') return clean;
+
+  for (const [rawCompId, rec] of Object.entries(mastery)) {
+    if (!rec || typeof rec !== 'object') continue;
+    const compId = String(rec.competencyId || rawCompId).trim().slice(0, 16);
+    if (!compId) continue;
+
+    const cleanHistory: Record<string, ExerciseAttemptRecord> = {};
+    if (rec.exerciseHistory && typeof rec.exerciseHistory === 'object') {
+      for (const [rawExId, exRec] of Object.entries(rec.exerciseHistory)) {
+        if (!exRec || typeof exRec !== 'object') continue;
+        const exId = String(rawExId).trim().slice(0, 64);
+        if (!exId) continue;
+        cleanHistory[exId] = {
+          attempts: Math.max(0, Math.min(10000, Math.round(Number(exRec.attempts) || 0))),
+          correctCount: Math.max(0, Math.min(10000, Math.round(Number(exRec.correctCount) || 0))),
+          reviewBonusCount: Math.max(
+            0,
+            Math.min(100, Math.round(Number(exRec.reviewBonusCount) || 0)),
+          ),
+          lastAttemptAt: String(exRec.lastAttemptAt || rec.lastPracticedAt || new Date().toISOString()).slice(
+            0,
+            64,
+          ),
+        };
+      }
+    }
+
+    const lvlNum = Math.max(0, Math.min(4, Math.round(Number(rec.highestLevel) || 0)));
+    clean[compId] = {
+      competencyId: compId,
+      highestLevel: lvlNum as 0 | AssessmentLevel,
+      attempts: Math.max(0, Math.min(100000, Math.round(Number(rec.attempts) || 0))),
+      correctCount: Math.max(0, Math.min(100000, Math.round(Number(rec.correctCount) || 0))),
+      xp: Math.max(0, Math.min(1000000, Math.round(Number(rec.xp) || 0))),
+      lastPracticedAt: String(rec.lastPracticedAt || new Date().toISOString()).slice(0, 64),
+      exerciseHistory: cleanHistory,
+    };
+  }
+  return clean;
+}
+
+/**
+ * Monotonically merges two LearnerProfile snapshots for the same uid so switching devices,
+ * reloading a browser, or reconciling Cloud Firestore + local storage NEVER wipes prior
+ * 24-competency mastery, per-exercise history, XP, or unlocked levels.
+ */
+export function mergeLearnerProfiles(
+  a: LearnerProfile,
+  b: LearnerProfile,
+): LearnerProfile {
+  const aUpdatedMs = Date.parse(a.updatedAt || a.lastActiveAt || '') || 0;
+  const bUpdatedMs = Date.parse(b.updatedAt || b.lastActiveAt || '') || 0;
+  const newer = bUpdatedMs >= aUpdatedMs ? b : a;
+  const older = bUpdatedMs >= aUpdatedMs ? a : b;
+
+  const masteryA = sanitizeMasteryForFirestore(a.masteryByCompetency);
+  const masteryB = sanitizeMasteryForFirestore(b.masteryByCompetency);
+  const allCompIds = new Set([...Object.keys(masteryA), ...Object.keys(masteryB)]);
+  const mergedMastery: Record<string, CompetencyMasteryRecord> = {};
+
+  for (const cid of allCompIds) {
+    const ra = masteryA[cid];
+    const rb = masteryB[cid];
+    if (ra && !rb) {
+      mergedMastery[cid] = ra;
+      continue;
+    }
+    if (rb && !ra) {
+      mergedMastery[cid] = rb;
+      continue;
+    }
+    if (!ra || !rb) continue;
+
+    const histA = ra.exerciseHistory ?? {};
+    const histB = rb.exerciseHistory ?? {};
+    const allExIds = new Set([...Object.keys(histA), ...Object.keys(histB)]);
+    const mergedHistory: Record<string, ExerciseAttemptRecord> = {};
+
+    for (const exId of allExIds) {
+      const ea = histA[exId];
+      const eb = histB[exId];
+      if (ea && !eb) {
+        mergedHistory[exId] = ea;
+      } else if (eb && !ea) {
+        mergedHistory[exId] = eb;
+      } else if (ea && eb) {
+        mergedHistory[exId] = {
+          attempts: Math.max(ea.attempts, eb.attempts),
+          correctCount: Math.max(ea.correctCount, eb.correctCount),
+          reviewBonusCount: Math.max(ea.reviewBonusCount, eb.reviewBonusCount),
+          lastAttemptAt:
+            ea.lastAttemptAt >= eb.lastAttemptAt ? ea.lastAttemptAt : eb.lastAttemptAt,
+        };
+      }
+    }
+
+    mergedMastery[cid] = {
+      competencyId: cid,
+      highestLevel: Math.max(ra.highestLevel, rb.highestLevel) as 0 | AssessmentLevel,
+      attempts: Math.max(ra.attempts, rb.attempts),
+      correctCount: Math.max(ra.correctCount, rb.correctCount),
+      xp: Math.max(ra.xp, rb.xp),
+      lastPracticedAt:
+        ra.lastPracticedAt >= rb.lastPracticedAt ? ra.lastPracticedAt : rb.lastPracticedAt,
+      exerciseHistory: mergedHistory,
+    };
+  }
+
+  const mergedTotalXp = Math.max(a.totalXp || 0, b.totalXp || 0);
+  const mergedTotalDone = Math.max(a.totalExercisesDone || 0, b.totalExercisesDone || 0);
+  const mergedTotalCorrect = Math.min(
+    mergedTotalDone,
+    Math.max(a.totalCorrect || 0, b.totalCorrect || 0),
+  );
+  const mergedBestCombo = Math.max(a.bestCombo || 0, b.bestCombo || 0);
+  const computedLevel = computeOverallLevel(mergedMastery, mergedTotalXp);
+  const mergedLevel = Math.max(
+    a.currentLevel || 1,
+    b.currentLevel || 1,
+    computedLevel,
+  ) as AssessmentLevel;
+
+  const fullName = newer.fullName?.trim() || older.fullName?.trim() || 'Học sinh Công dân số';
+  const className = newer.className?.trim() || older.className?.trim() || '';
+  const schoolName = newer.schoolName?.trim() || older.schoolName?.trim() || '';
+
+  return {
+    uid: newer.uid || older.uid,
+    authType: a.authType === 'google' || b.authType === 'google' ? 'google' : newer.authType,
+    email: newer.email || older.email,
+    photoUrl: newer.photoUrl || older.photoUrl,
+    fullName,
+    className,
+    schoolName,
+    gradeBand: newer.gradeBand || older.gradeBand || 'primary',
+    role: 'student',
+    profileCompleted: Boolean(
+      a.profileCompleted ||
+        b.profileCompleted ||
+        (fullName.length > 0 && className.length > 0 && schoolName.length > 0),
+    ),
+    currentLevel: mergedLevel,
+    totalXp: mergedTotalXp,
+    bestCombo: mergedBestCombo,
+    totalExercisesDone: mergedTotalDone,
+    totalCorrect: mergedTotalCorrect,
+    masteryByCompetency: mergedMastery,
+    createdAt:
+      a.createdAt && b.createdAt
+        ? a.createdAt <= b.createdAt
+          ? a.createdAt
+          : b.createdAt
+        : newer.createdAt || older.createdAt,
+    updatedAt: newer.updatedAt || older.updatedAt,
+    lastActiveAt:
+      (a.lastActiveAt || '') >= (b.lastActiveAt || '')
+        ? a.lastActiveAt || b.lastActiveAt
+        : b.lastActiveAt,
+  };
+}
+
+export type LearnerActivityStatus = 'today' | 'week' | 'older' | 'not_started';
+
+export function getLearnerActivityStatus(
+  learner: Pick<LearnerProfile, 'lastActiveAt' | 'totalExercisesDone'>,
+  nowMs = Date.now(),
+): LearnerActivityStatus {
+  if (!learner.totalExercisesDone || learner.totalExercisesDone <= 0) {
+    return 'not_started';
+  }
+  const activeMs = Date.parse(learner.lastActiveAt || '');
+  if (!Number.isFinite(activeMs)) return 'older';
+  const diffHours = (nowMs - activeMs) / (1000 * 60 * 60);
+  if (diffHours <= 24) return 'today';
+  if (diffHours <= 24 * 7) return 'week';
+  return 'older';
+}
+
+export interface CohortCompetencyStat {
+  competencyId: string;
+  domainId: string;
+  nameVi: string;
+  nameEn: string;
+  practicedLearners: number;
+  masteredLearners: number; // highestLevel >= 1
+  expertLearners: number; // highestLevel >= 3
+  totalAttempts: number;
+  totalCorrect: number;
+  accuracyPercent: number;
+  masteryRatePercent: number; // masteredLearners / totalLearners * 100
+  avgLevel: number;
+}
+
+export interface CohortDomainStat {
+  domainId: string;
+  domainNumber: number;
+  nameVi: string;
+  nameEn: string;
+  avgMasteryRatePercent: number;
+  avgLevel: number;
+  competencies: CohortCompetencyStat[];
+}
+
+export interface CohortCompetencyOverview {
+  learnerCount: number;
+  activeTodayCount: number;
+  activeWeekCount: number;
+  avgMasteredCount: number;
+  avgAccuracyPercent: number;
+  domains: CohortDomainStat[];
+  strongestCompetencies: CohortCompetencyStat[];
+  weakestCompetencies: CohortCompetencyStat[];
+}
+
+/**
+ * Aggregates home self-assessment mastery across a cohort of learners for the Teacher
+ * 24-competency overview dashboard.
+ */
+export function buildCohortCompetencyOverview(
+  learners: LearnerProfile[],
+  nowMs = Date.now(),
+): CohortCompetencyOverview {
+  const learnerCount = learners.length;
+  let activeTodayCount = 0;
+  let activeWeekCount = 0;
+  let masteredSum = 0;
+  let doneSum = 0;
+  let correctSum = 0;
+
+  for (const l of learners) {
+    const status = getLearnerActivityStatus(l, nowMs);
+    if (status === 'today') {
+      activeTodayCount += 1;
+      activeWeekCount += 1;
+    } else if (status === 'week') {
+      activeWeekCount += 1;
+    }
+    const mastered = Object.values(l.masteryByCompetency ?? {}).filter(
+      (m) => m.highestLevel >= 1,
+    ).length;
+    masteredSum += mastered;
+    doneSum += l.totalExercisesDone || 0;
+    correctSum += l.totalCorrect || 0;
+  }
+
+  const allStats: CohortCompetencyStat[] = COMPETENCIES_24.map((c) => {
+    let practicedLearners = 0;
+    let masteredLearners = 0;
+    let expertLearners = 0;
+    let totalAttempts = 0;
+    let totalCorrect = 0;
+    let levelSum = 0;
+
+    for (const l of learners) {
+      const rec = l.masteryByCompetency?.[c.id];
+      if (!rec) continue;
+      if (rec.attempts > 0) practicedLearners += 1;
+      if (rec.highestLevel >= 1) masteredLearners += 1;
+      if (rec.highestLevel >= 3) expertLearners += 1;
+      totalAttempts += rec.attempts || 0;
+      totalCorrect += rec.correctCount || 0;
+      levelSum += rec.highestLevel || 0;
+    }
+
+    return {
+      competencyId: c.id,
+      domainId: c.domainId,
+      nameVi: c.nameVi,
+      nameEn: c.nameEn,
+      practicedLearners,
+      masteredLearners,
+      expertLearners,
+      totalAttempts,
+      totalCorrect,
+      accuracyPercent:
+        totalAttempts > 0 ? Math.round((totalCorrect / totalAttempts) * 100) : 0,
+      masteryRatePercent:
+        learnerCount > 0 ? Math.round((masteredLearners / learnerCount) * 100) : 0,
+      avgLevel: learnerCount > 0 ? Number((levelSum / learnerCount).toFixed(1)) : 0,
+    };
+  });
+
+  const domains: CohortDomainStat[] = COMPETENCY_DOMAINS.map((d) => {
+    const comps = allStats.filter((s) => s.domainId === d.id);
+    const avgMasteryRatePercent =
+      comps.length > 0
+        ? Math.round(comps.reduce((s, c) => s + c.masteryRatePercent, 0) / comps.length)
+        : 0;
+    const avgLevel =
+      comps.length > 0
+        ? Number((comps.reduce((s, c) => s + c.avgLevel, 0) / comps.length).toFixed(1))
+        : 0;
+    return {
+      domainId: d.id,
+      domainNumber: d.number,
+      nameVi: d.nameVi,
+      nameEn: d.nameEn,
+      avgMasteryRatePercent,
+      avgLevel,
+      competencies: comps,
+    };
+  });
+
+  const practicedStats = allStats.filter((s) => s.practicedLearners > 0);
+  const strongestCompetencies = [...practicedStats]
+    .sort((a, b) => {
+      if (b.masteryRatePercent !== a.masteryRatePercent) {
+        return b.masteryRatePercent - a.masteryRatePercent;
+      }
+      return b.accuracyPercent - a.accuracyPercent;
+    })
+    .slice(0, 3);
+
+  const weakestCompetencies = [...allStats]
+    .sort((a, b) => {
+      if (a.masteryRatePercent !== b.masteryRatePercent) {
+        return a.masteryRatePercent - b.masteryRatePercent;
+      }
+      return a.accuracyPercent - b.accuracyPercent;
+    })
+    .slice(0, 3);
+
+  return {
+    learnerCount,
+    activeTodayCount,
+    activeWeekCount,
+    avgMasteredCount:
+      learnerCount > 0 ? Number((masteredSum / learnerCount).toFixed(1)) : 0,
+    avgAccuracyPercent: doneSum > 0 ? Math.round((correctSum / doneSum) * 100) : 0,
+    domains,
+    strongestCompetencies,
+    weakestCompetencies,
+  };
+}
+
+export interface HomeHonorNomination {
+  categoryId: 'overall_champion' | 'accuracy_star' | 'diligent_learner' | 'expert_pioneer';
+  titleVi: string;
+  titleEn: string;
+  reasonVi: string;
+  reasonEn: string;
+  suggestedBadgeId: string;
+  learner: LearnerProfile;
+  metricLabel: string;
+}
+
+/**
+ * Generates automatic Teacher Honor Nominations so teachers can quickly spot
+ * and recognize outstanding home self-assessment students.
+ */
+export function buildHomeHonorNominations(
+  learners: LearnerProfile[],
+): HomeHonorNomination[] {
+  const active = learners.filter((l) => l.totalExercisesDone > 0 || l.totalXp > 0);
+  if (active.length === 0) return [];
+
+  const masteredOf = (l: LearnerProfile) =>
+    Object.values(l.masteryByCompetency ?? {}).filter((m) => m.highestLevel >= 1).length;
+  const expertOf = (l: LearnerProfile) =>
+    Object.values(l.masteryByCompetency ?? {}).filter((m) => m.highestLevel >= 3).length;
+  const accOf = (l: LearnerProfile) =>
+    l.totalExercisesDone > 0
+      ? Math.round((l.totalCorrect / l.totalExercisesDone) * 100)
+      : 0;
+
+  const nominations: HomeHonorNomination[] = [];
+
+  // 1. Overall Champion (highest XP / mastered competencies)
+  const overall = [...active].sort((a, b) => {
+    if (b.totalXp !== a.totalXp) return b.totalXp - a.totalXp;
+    return masteredOf(b) - masteredOf(a);
+  })[0];
+  if (overall) {
+    nominations.push({
+      categoryId: 'overall_champion',
+      titleVi: 'Thủ khoa Tự học 24 Năng lực',
+      titleEn: '24-Competency Overall Champion',
+      reasonVi: `Dẫn đầu với ${overall.totalXp} XP và mở khóa ${masteredOf(overall)}/24 năng lực thành phần.`,
+      reasonEn: `Leading with ${overall.totalXp} XP and ${masteredOf(overall)}/24 competencies unlocked.`,
+      suggestedBadgeId: 'master_24',
+      learner: overall,
+      metricLabel: `${overall.totalXp} XP · ${masteredOf(overall)}/24 NL`,
+    });
+  }
+
+  // 2. Accuracy Star (highest accuracy among students with >= 4 exercises done)
+  const accPool = active.filter((l) => l.totalExercisesDone >= 4);
+  const accuracyStar = [...(accPool.length > 0 ? accPool : active)].sort((a, b) => {
+    const diff = accOf(b) - accOf(a);
+    if (diff !== 0) return diff;
+    return b.totalExercisesDone - a.totalExercisesDone;
+  })[0];
+  if (accuracyStar) {
+    nominations.push({
+      categoryId: 'accuracy_star',
+      titleVi: 'Ngôi sao Chính xác',
+      titleEn: 'Precision Star',
+      reasonVi: `Đạt độ chính xác ${accOf(accuracyStar)}% qua ${accuracyStar.totalExercisesDone} bài tập tự đánh giá ở nhà.`,
+      reasonEn: `Achieved ${accOf(accuracyStar)}% accuracy across ${accuracyStar.totalExercisesDone} home exercises.`,
+      suggestedBadgeId: 'safety_shield',
+      learner: accuracyStar,
+      metricLabel: `${accOf(accuracyStar)}% (${accuracyStar.totalCorrect}/${accuracyStar.totalExercisesDone})`,
+    });
+  }
+
+  // 3. Most Diligent Home Learner (most exercises done)
+  const diligent = [...active].sort((a, b) => {
+    if (b.totalExercisesDone !== a.totalExercisesDone) {
+      return b.totalExercisesDone - a.totalExercisesDone;
+    }
+    return b.totalXp - a.totalXp;
+  })[0];
+  if (diligent) {
+    nominations.push({
+      categoryId: 'diligent_learner',
+      titleVi: 'Ong chăm chỉ Tự học ở nhà',
+      titleEn: 'Dedicated Home Learner',
+      reasonVi: `Kiên trì hoàn thành ${diligent.totalExercisesDone} bài tập tương tác tại nhà (chuỗi cao nhất x${diligent.bestCombo}).`,
+      reasonEn: `Completed ${diligent.totalExercisesDone} interactive home exercises (best streak x${diligent.bestCombo}).`,
+      suggestedBadgeId: 'home_diligent',
+      learner: diligent,
+      metricLabel: `${diligent.totalExercisesDone} bài · Combo x${diligent.bestCombo}`,
+    });
+  }
+
+  // 4. Expert Pioneer (highest level / most L3-L4 skills)
+  const pioneer = [...active].sort((a, b) => {
+    if (b.currentLevel !== a.currentLevel) return b.currentLevel - a.currentLevel;
+    const expDiff = expertOf(b) - expertOf(a);
+    if (expDiff !== 0) return expDiff;
+    return b.totalXp - a.totalXp;
+  })[0];
+  if (pioneer && (pioneer.currentLevel >= 2 || expertOf(pioneer) > 0)) {
+    nominations.push({
+      categoryId: 'expert_pioneer',
+      titleVi: 'Tiên phong Cấp độ Cao',
+      titleEn: 'Advanced Level Pioneer',
+      reasonVi: `Đạt Cấp ${pioneer.currentLevel}/4 với ${expertOf(pioneer)} năng lực đạt mức Thành thạo – Chuyên gia.`,
+      reasonEn: `Reached Level ${pioneer.currentLevel}/4 with ${expertOf(pioneer)} proficient/expert skills.`,
+      suggestedBadgeId: 'ai_explorer',
+      learner: pioneer,
+      metricLabel: `Cấp ${pioneer.currentLevel}/4 · ${expertOf(pioneer)} NL cao`,
+    });
+  }
+
+  return nominations;
+}
+

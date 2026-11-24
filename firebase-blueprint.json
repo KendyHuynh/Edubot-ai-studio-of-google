@@ -155,6 +155,101 @@
         "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
       "required": ["id", "workspaceId", "classId", "groupId", "tabletNumber", "groupName", "lessonId", "lessonTitle", "questionId", "competencyId", "userAnswer", "isCorrect", "basePoints", "speedBonus", "totalPoints", "elapsedMs", "submittedAt", "feedbackText", "explanation", "createdAt"]
+    },
+    "LearnerProfile": {
+      "title": "LearnerProfile",
+      "description": "Personal home 24-competency self-assessment learner profile linked to verified personal Google email (owner + admin only).",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "authType": { "type": "string", "enum": ["google", "guest"] },
+        "email": { "type": "string", "maxLength": 200 },
+        "photoUrl": { "type": "string", "maxLength": 500 },
+        "fullName": { "type": "string", "maxLength": 120 },
+        "className": { "type": "string", "maxLength": 60 },
+        "schoolName": { "type": "string", "maxLength": 160 },
+        "gradeBand": { "type": "string", "enum": ["primary", "middle", "high"] },
+        "role": { "type": "string", "enum": ["student"] },
+        "profileCompleted": { "type": "boolean" },
+        "currentLevel": { "type": "integer" },
+        "totalXp": { "type": "integer" },
+        "bestCombo": { "type": "integer" },
+        "totalExercisesDone": { "type": "integer" },
+        "totalCorrect": { "type": "integer" },
+        "masteryByCompetency": { "type": "object" },
+        "lastActiveAt": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["uid", "authType", "fullName", "className", "schoolName", "gradeBand", "role", "profileCompleted", "currentLevel", "totalXp", "bestCombo", "totalExercisesDone", "totalCorrect", "masteryByCompetency", "lastActiveAt", "createdAt", "updatedAt"]
+    },
+    "TeacherAward": {
+      "title": "TeacherAward",
+      "description": "Teacher-issued praise badge and bonus XP for home 24-competency learners.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 80 },
+        "learnerUid": { "type": "string", "maxLength": 128 },
+        "learnerName": { "type": "string", "maxLength": 120 },
+        "className": { "type": "string", "maxLength": 60 },
+        "schoolName": { "type": "string", "maxLength": 160 },
+        "badgeId": { "type": "string", "maxLength": 64 },
+        "badgeTitle": { "type": "string", "maxLength": 140 },
+        "message": { "type": "string", "maxLength": 500 },
+        "bonusXp": { "type": "integer" },
+        "awardedByName": { "type": "string", "maxLength": 120 },
+        "awardedByEmail": { "type": "string", "maxLength": 200 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "learnerUid", "learnerName", "className", "schoolName", "badgeId", "badgeTitle", "message", "bonusXp", "awardedByName", "createdAt"]
+    },
+    "AssessmentSessionAttempt": {
+      "title": "AssessmentSessionAttempt",
+      "description": "Recorded home self-assessment session history for teacher analytics and student timeline.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 80 },
+        "learnerUid": { "type": "string", "maxLength": 128 },
+        "learnerName": { "type": "string", "maxLength": 120 },
+        "className": { "type": "string", "maxLength": 60 },
+        "schoolName": { "type": "string", "maxLength": 160 },
+        "mode": { "type": "string", "enum": ["diagnostic", "level_challenge", "competency_focus", "variety_sprint", "advanced_pack"] },
+        "targetLevel": { "type": "integer" },
+        "targetCompetencyId": { "type": "string", "maxLength": 16 },
+        "totalQuestions": { "type": "integer" },
+        "correctCount": { "type": "integer" },
+        "accuracyPercent": { "type": "integer" },
+        "xpEarned": { "type": "integer" },
+        "maxCombo": { "type": "integer" },
+        "competencyIds": { "type": "array" },
+        "completedAt": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "learnerUid", "learnerName", "className", "schoolName", "mode", "totalQuestions", "correctCount", "accuracyPercent", "xpEarned", "maxCombo", "competencyIds", "completedAt", "createdAt"]
+    },
+    "PublicLearnerHonor": {
+      "title": "PublicLearnerHonor",
+      "description": "Strictly PII-free public honor board entry for home self-assessment learners (no email).",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "fullName": { "type": "string", "maxLength": 120 },
+        "className": { "type": "string", "maxLength": 60 },
+        "schoolName": { "type": "string", "maxLength": 160 },
+        "gradeBand": { "type": "string", "enum": ["primary", "middle", "high"] },
+        "authType": { "type": "string", "enum": ["google", "guest"] },
+        "currentLevel": { "type": "integer" },
+        "totalXp": { "type": "integer" },
+        "masteredCount": { "type": "integer" },
+        "expertCount": { "type": "integer" },
+        "accuracyPercent": { "type": "integer" },
+        "totalExercisesDone": { "type": "integer" },
+        "awardsCount": { "type": "integer" },
+        "latestBadgeTitle": { "type": "string", "maxLength": 140 },
+        "lastActiveAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["uid", "fullName", "className", "schoolName", "gradeBand", "authType", "currentLevel", "totalXp", "masteredCount", "expertCount", "accuracyPercent", "totalExercisesDone", "awardsCount", "lastActiveAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -189,6 +284,30 @@
     "/publicWorkspaces/{workspaceId}/submissions/{submissionId}": {
       "schema": { "$ref": "#/entities/PublicSubmission" },
       "description": "Zero-login student team answer submissions under a published teacher workspace for live leaderboard and teacher analytics."
+    },
+    "/learnerProfiles/{userId}": {
+      "schema": { "$ref": "#/entities/LearnerProfile" },
+      "description": "Personal home 24-competency learner profiles isolated to verified student owner and teacher admin."
+    },
+    "/guestLearnerProfiles/{guestId}": {
+      "schema": { "$ref": "#/entities/LearnerProfile" },
+      "description": "Zero-login home 24-competency learner profiles for young students without personal Gmail, monotonically updated and listable only by teacher admin."
+    },
+    "/teacherAwards/{awardId}": {
+      "schema": { "$ref": "#/entities/TeacherAward" },
+      "description": "Teacher-issued badges, praise notes, and bonus XP for home learners."
+    },
+    "/assessmentAttempts/{attemptId}": {
+      "schema": { "$ref": "#/entities/AssessmentSessionAttempt" },
+      "description": "Home 24-competency self-assessment session history readable by student owner and teacher admin."
+    },
+    "/guestAssessmentAttempts/{attemptId}": {
+      "schema": { "$ref": "#/entities/AssessmentSessionAttempt" },
+      "description": "Zero-login home 24-competency self-assessment session history readable by matching guest profile or teacher admin."
+    },
+    "/publicLearnerHonor/{userId}": {
+      "schema": { "$ref": "#/entities/PublicLearnerHonor" },
+      "description": "PII-free public honor board entries for home 24-competency learners (both Google email and zero-login profiles)."
     }
   }
 }

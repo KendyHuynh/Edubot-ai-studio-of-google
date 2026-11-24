@@ -41,21 +41,26 @@ import {
   AnswerSubmission,
   AssessmentExerciseOutcome,
   AssessmentLevel,
+  AssessmentSessionAttempt,
   AssessmentSessionMode,
   ClassRoom,
   Language,
   LearnerGradeBand,
+  LearnerProfile,
   Lesson,
   OfflineQueueItem,
   PushNotification,
   Question,
   QuestionType,
+  TeacherAward,
 } from './src/shared/types';
 import {
   createTeacherAwardInStore,
   deleteTeacherAwardInStore,
   ensureLearnerCollections,
   getPublicHonorFromStore,
+  hydrateLearnerProfileInStore,
+  isValidGuestLearnerUid,
   recordAssessmentAttemptInStore,
   upsertLearnerProfileInStore,
 } from './src/shared/learnerStoreOps';
@@ -1581,10 +1586,11 @@ async function startServer() {
   // PERSONAL HOME 24-COMPETENCY SELF-ASSESSMENT & TEACHER REWARDS API
   // =========================================================================
 
-  // POST /api/learners/profile — Register/update personal learner profile (Google Sign-In mandatory)
+  // POST /api/learners/profile — Register/update personal learner profile (Google email OR zero-login guestUid)
   app.post('/api/learners/profile', async (req, res) => {
     const body = req.body as {
       idToken?: string;
+      guestUid?: string;
       photoUrl?: string;
       fullName?: string;
       className?: string;
@@ -1603,32 +1609,42 @@ async function startServer() {
       return;
     }
 
-    if (!body.idToken) {
+    let resolvedUid = '';
+    let resolvedAuthType: 'google' | 'guest' = 'google';
+    let resolvedEmail: string | undefined;
+
+    if (body.idToken) {
+      const cfg = readFirebaseConfig();
+      const verified = await verifyFirebaseIdTokenViaRest(
+        String(body.idToken),
+        cfg.apiKey || '',
+      );
+      if (!verified || !verified.emailVerified) {
+        res.status(401).json({
+          error: 'Không thể xác thực tài khoản Google của học sinh. Vui lòng đăng nhập lại.',
+        });
+        return;
+      }
+      resolvedUid = verified.uid;
+      resolvedAuthType = 'google';
+      resolvedEmail = verified.email;
+    } else if (isValidGuestLearnerUid(body.guestUid)) {
+      resolvedUid = body.guestUid.trim();
+      resolvedAuthType = 'guest';
+    } else {
       res.status(401).json({
         error:
-          'Tự đánh giá ở nhà bắt buộc đăng nhập Google để lưu tiến độ và đảm bảo công bằng (tránh xem trước câu hỏi và đáp án).',
-      });
-      return;
-    }
-
-    const cfg = readFirebaseConfig();
-    const verified = await verifyFirebaseIdTokenViaRest(
-      String(body.idToken),
-      cfg.apiKey || '',
-    );
-    if (!verified || !verified.emailVerified) {
-      res.status(401).json({
-        error: 'Không thể xác thực tài khoản Google của học sinh. Vui lòng đăng nhập lại.',
+          'Vui lòng đăng nhập bằng Email cá nhân (Google) hoặc tạo Hồ sơ Tự đánh giá không cần đăng nhập hợp lệ.',
       });
       return;
     }
 
     const store = loadStore();
     const profile = upsertLearnerProfileInStore(store, {
-      uid: verified.uid,
-      authType: 'google',
-      email: verified.email,
-      photoUrl: body.photoUrl,
+      uid: resolvedUid,
+      authType: resolvedAuthType,
+      email: resolvedEmail,
+      photoUrl: resolvedAuthType === 'google' ? body.photoUrl : undefined,
       fullName,
       className,
       schoolName,
@@ -1644,25 +1660,30 @@ async function startServer() {
     });
   });
 
-  // GET /api/learners/me — Fetch authenticated Google learner profile, recent attempts, and teacher awards
+  // GET /api/learners/me — Fetch learner profile (Google token OR valid guestUid)
   app.get('/api/learners/me', async (req, res) => {
     const idToken =
       typeof req.headers['x-learner-token'] === 'string'
         ? req.headers['x-learner-token'].trim()
         : '';
+    const requestedUid = typeof req.query.uid === 'string' ? req.query.uid.trim() : '';
 
-    if (!idToken) {
+    let resolvedUid = '';
+    if (idToken) {
+      const cfg = readFirebaseConfig();
+      const verified = await verifyFirebaseIdTokenViaRest(idToken, cfg.apiKey || '');
+      if (!verified?.uid || !verified.emailVerified) {
+        res.status(401).json({
+          error: 'Phiên đăng nhập Google không hợp lệ. Vui lòng đăng nhập lại.',
+        });
+        return;
+      }
+      resolvedUid = verified.uid;
+    } else if (isValidGuestLearnerUid(requestedUid)) {
+      resolvedUid = requestedUid;
+    } else {
       res.status(401).json({
-        error: 'Cần đăng nhập tài khoản Google để xem hồ sơ Tự đánh giá ở nhà.',
-      });
-      return;
-    }
-
-    const cfg = readFirebaseConfig();
-    const verified = await verifyFirebaseIdTokenViaRest(idToken, cfg.apiKey || '');
-    if (!verified?.uid || !verified.emailVerified) {
-      res.status(401).json({
-        error: 'Phiên đăng nhập Google không hợp lệ. Vui lòng đăng nhập lại.',
+        error: 'Cần đăng nhập Email cá nhân hoặc cung cấp Mã hồ sơ hợp lệ để xem tiến độ.',
       });
       return;
     }
@@ -1670,7 +1691,7 @@ async function startServer() {
     const store = loadStore();
     const { learnerProfiles, assessmentAttempts, teacherAwards } =
       ensureLearnerCollections(store);
-    const profile = learnerProfiles.find((p) => p.uid === verified.uid) ?? null;
+    const profile = learnerProfiles.find((p) => p.uid === resolvedUid) ?? null;
 
     res.json({
       profile,
@@ -1681,14 +1702,81 @@ async function startServer() {
     });
   });
 
-  // POST /api/learners/assessment-submit — Record self-assessment session (Google-verified & retry-capped)
+  // POST /api/learners/hydrate — Sync Cloud Firestore learner bundle into server store monotonically
+  app.post('/api/learners/hydrate', async (req, res) => {
+    const body = req.body as {
+      idToken?: string;
+      guestUid?: string;
+      profile?: LearnerProfile;
+      attempts?: AssessmentSessionAttempt[];
+      awards?: TeacherAward[];
+    };
+    if (!body.profile) {
+      res.status(400).json({ error: 'Thiếu dữ liệu đồng bộ hồ sơ học sinh.' });
+      return;
+    }
+
+    let resolvedUid = '';
+    let resolvedAuthType: 'google' | 'guest' = 'google';
+    let resolvedEmail: string | undefined;
+
+    if (body.idToken) {
+      const cfg = readFirebaseConfig();
+      const verified = await verifyFirebaseIdTokenViaRest(
+        String(body.idToken),
+        cfg.apiKey || '',
+      );
+      if (!verified?.uid || !verified.emailVerified || body.profile.uid !== verified.uid) {
+        res.status(401).json({
+          error: 'Không thể xác thực tài khoản Google để đồng bộ hồ sơ.',
+        });
+        return;
+      }
+      resolvedUid = verified.uid;
+      resolvedAuthType = 'google';
+      resolvedEmail = verified.email;
+    } else if (
+      isValidGuestLearnerUid(body.guestUid) &&
+      body.profile.uid === body.guestUid.trim()
+    ) {
+      resolvedUid = body.guestUid.trim();
+      resolvedAuthType = 'guest';
+    } else {
+      res.status(401).json({ error: 'Không thể xác thực phiên đồng bộ hồ sơ học sinh.' });
+      return;
+    }
+
+    const store = loadStore();
+    const merged = hydrateLearnerProfileInStore(
+      store,
+      {
+        ...body.profile,
+        uid: resolvedUid,
+        authType: resolvedAuthType,
+        email: resolvedEmail || (resolvedAuthType === 'google' ? body.profile.email : undefined),
+      },
+      Array.isArray(body.attempts) ? body.attempts : [],
+      Array.isArray(body.awards) ? body.awards : [],
+    );
+    saveStore(store);
+    const { assessmentAttempts, teacherAwards } = ensureLearnerCollections(store);
+    res.json({
+      profile: merged,
+      attempts: assessmentAttempts.filter((a) => a.learnerUid === merged.uid).slice(0, 30),
+      awards: teacherAwards.filter((a) => a.learnerUid === merged.uid),
+    });
+  });
+
+  // POST /api/learners/assessment-submit — Record self-assessment session (Google OR valid guestUid, retry-capped)
   app.post('/api/learners/assessment-submit', async (req, res) => {
     const body = req.body as {
       idToken?: string;
+      guestUid?: string;
       learnerName?: string;
       className?: string;
       schoolName?: string;
       gradeBand?: LearnerGradeBand;
+      baseProfile?: LearnerProfile;
       mode?: AssessmentSessionMode;
       targetLevel?: AssessmentLevel;
       targetCompetencyId?: string;
@@ -1696,34 +1784,48 @@ async function startServer() {
       maxCombo?: number;
     };
 
-    if (!body.idToken) {
-      res.status(401).json({
-        error: 'Cần đăng nhập Google để lưu kết quả Tự đánh giá 24 Năng lực.',
-      });
-      return;
-    }
+    let resolvedUid = '';
+    let resolvedAuthType: 'google' | 'guest' = 'google';
+    let resolvedEmail: string | undefined;
 
-    const cfg = readFirebaseConfig();
-    const verified = await verifyFirebaseIdTokenViaRest(
-      String(body.idToken),
-      cfg.apiKey || '',
-    );
-    if (!verified?.uid || !verified.emailVerified) {
+    if (body.idToken) {
+      const cfg = readFirebaseConfig();
+      const verified = await verifyFirebaseIdTokenViaRest(
+        String(body.idToken),
+        cfg.apiKey || '',
+      );
+      if (!verified?.uid || !verified.emailVerified) {
+        res.status(401).json({
+          error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.',
+        });
+        return;
+      }
+      resolvedUid = verified.uid;
+      resolvedAuthType = 'google';
+      resolvedEmail = verified.email;
+    } else if (isValidGuestLearnerUid(body.guestUid)) {
+      resolvedUid = body.guestUid.trim();
+      resolvedAuthType = 'guest';
+    } else {
       res.status(401).json({
-        error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.',
+        error: 'Cần đăng nhập Email cá nhân hoặc dùng Hồ sơ Tự đánh giá hợp lệ để lưu kết quả.',
       });
       return;
     }
 
     const store = loadStore();
     const { profile, attempt } = recordAssessmentAttemptInStore(store, {
-      learnerUid: verified.uid,
+      learnerUid: resolvedUid,
       learnerName: body.learnerName,
       className: body.className,
       schoolName: body.schoolName,
-      authType: 'google',
-      email: verified.email,
+      authType: resolvedAuthType,
+      email: resolvedEmail,
       gradeBand: body.gradeBand,
+      baseProfile:
+        body.baseProfile && body.baseProfile.uid === resolvedUid
+          ? body.baseProfile
+          : undefined,
       mode: body.mode || 'variety_sprint',
       targetLevel: body.targetLevel,
       targetCompetencyId: body.targetCompetencyId,
@@ -1768,6 +1870,7 @@ async function startServer() {
     const authPayload = getAuthenticatedTeacher(req);
     const body = req.body as {
       learnerUid?: string;
+      learnerSnapshot?: LearnerProfile;
       badgeId?: string;
       badgeTitle?: string;
       message?: string;
@@ -1783,6 +1886,7 @@ async function startServer() {
     const store = loadStore();
     const result = createTeacherAwardInStore(store, {
       learnerUid: body.learnerUid,
+      learnerSnapshot: body.learnerSnapshot,
       badgeId: body.badgeId || 'custom',
       badgeTitle: body.badgeTitle.trim(),
       message: body.message || '',

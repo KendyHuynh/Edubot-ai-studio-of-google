@@ -1,16 +1,21 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   Award,
+  Crown,
   Download,
   GraduationCap,
   Lock,
   Medal,
+  RefreshCw,
   School,
   ShieldCheck,
   Sparkles,
   Trophy,
 } from 'lucide-react';
-import { getLevelMeta } from '../shared/assessmentEngine';
+import {
+  buildPublicLearnerHonorList,
+  getLevelMeta,
+} from '../shared/assessmentEngine';
 import { COMPETENCY_DOMAINS } from '../shared/competencies';
 import { CopyDict } from '../shared/i18n';
 import { DomainHonorAward } from '../shared/scoring';
@@ -23,11 +28,17 @@ import {
 } from '../shared/types';
 import { apiRequestJson } from '../utils/apiClient';
 import { isLessonAssignedToClass } from '../utils/firestoreHelpers';
+import {
+  fetchAllLearnersFromFirestore,
+  fetchPublicLearnerHonorFromFirestore,
+} from '../utils/firestoreSync';
+import { auth } from '../utils/googleDrive';
 
 interface HonorBoardProps {
   classes: ClassRoom[];
   selectedClassId: string;
   lockedClassId?: string | null;
+  isTeacherPortal?: boolean;
   initialBoardMode?: 'classroom' | 'self_learners';
   onChangeClass: (classId: string) => void;
   lessons?: Lesson[];
@@ -43,6 +54,7 @@ export function HonorBoard({
   classes,
   selectedClassId,
   lockedClassId = null,
+  isTeacherPortal = false,
   initialBoardMode = 'classroom',
   onChangeClass,
   lessons = [],
@@ -67,23 +79,70 @@ export function HonorBoard({
     }
   }, [lockedClassId, initialBoardMode]);
 
+  const loadLearnerHonor = useCallback(async () => {
+    setLoadingLearners(true);
+    try {
+      const [apiRes, publicCloudEntries, teacherCloud] = await Promise.all([
+        apiRequestJson<{ entries?: PublicLearnerHonorEntry[] }>(
+          '/api/learners/honor',
+          {},
+          lang,
+        ).catch(() => null),
+        fetchPublicLearnerHonorFromFirestore().catch(() => [] as PublicLearnerHonorEntry[]),
+        isTeacherPortal && auth.currentUser?.emailVerified
+          ? fetchAllLearnersFromFirestore().catch(() => ({
+              learners: [],
+              attempts: [],
+              awards: [],
+            }))
+          : Promise.resolve({ learners: [], attempts: [], awards: [] }),
+      ]);
+
+      const teacherEntries =
+        teacherCloud.learners.length > 0
+          ? buildPublicLearnerHonorList(teacherCloud.learners, teacherCloud.awards)
+          : [];
+
+      const merged = new Map<string, PublicLearnerHonorEntry>();
+      for (const row of [
+        ...(apiRes?.ok ? apiRes.data.entries ?? [] : []),
+        ...publicCloudEntries,
+        ...teacherEntries,
+      ]) {
+        if (!row?.uid) continue;
+        const prev = merged.get(row.uid);
+        if (
+          !prev ||
+          row.totalXp > prev.totalXp ||
+          (row.totalXp === prev.totalXp && row.masteredCount > prev.masteredCount) ||
+          (row.totalXp === prev.totalXp &&
+            row.masteredCount === prev.masteredCount &&
+            row.awardsCount > prev.awardsCount)
+        ) {
+          merged.set(row.uid, {
+            ...prev,
+            ...row,
+            awardsCount: Math.max(prev?.awardsCount ?? 0, row.awardsCount ?? 0),
+            latestBadgeTitle: row.latestBadgeTitle || prev?.latestBadgeTitle,
+          });
+        }
+      }
+
+      const sorted = Array.from(merged.values()).sort((a, b) => {
+        if (b.totalXp !== a.totalXp) return b.totalXp - a.totalXp;
+        if (b.masteredCount !== a.masteredCount) return b.masteredCount - a.masteredCount;
+        return b.accuracyPercent - a.accuracyPercent;
+      });
+      setLearnerHonor(sorted);
+    } finally {
+      setLoadingLearners(false);
+    }
+  }, [isTeacherPortal, lang]);
+
   useEffect(() => {
     if (boardMode !== 'self_learners' || lockedClassId) return;
-    let active = true;
-    setLoadingLearners(true);
-    apiRequestJson<{ entries?: PublicLearnerHonorEntry[] }>('/api/learners/honor', {}, lang)
-      .then((res) => {
-        if (active && res.ok) {
-          setLearnerHonor(res.data.entries ?? []);
-        }
-      })
-      .finally(() => {
-        if (active) setLoadingLearners(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [boardMode, lockedClassId, lang]);
+    void loadLearnerHonor();
+  }, [boardMode, lockedClassId, loadLearnerHonor]);
 
   const effectiveClassId = lockedClassId || selectedClassId;
   const activeClassObj = classes.find((c) => c.id === effectiveClassId);
@@ -118,6 +177,7 @@ export function HonorBoard({
   };
 
   const topThree = leaderboard.slice(0, 3);
+  const topThreeLearners = learnerHonor.slice(0, 3);
 
   if (boardMode === 'self_learners' && !lockedClassId) {
     return (
@@ -126,8 +186,8 @@ export function HonorBoard({
           <div className="space-y-1">
             <p className="text-xs font-semibold text-emerald-700">
               {lang === 'vi'
-                ? 'Vinh danh Cá nhân · Tự đánh giá 24 Năng lực ở nhà'
-                : 'Personal Self-Assessment Honor Board'}
+                ? 'Vinh danh Cá nhân · Tự đánh giá 24 Năng lực ở nhà (Đồng bộ Đám mây)'
+                : 'Personal Self-Assessment Honor Board (Cloud Synced)'}
             </p>
             <h1 className="text-2xl font-bold text-slate-900">
               {lang === 'vi'
@@ -136,23 +196,94 @@ export function HonorBoard({
             </h1>
           </div>
 
-          <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl text-xs sm:text-sm font-semibold">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              onClick={() => setBoardMode('classroom')}
-              className="px-3.5 py-1.5 rounded-lg text-slate-600 hover:text-slate-900 cursor-pointer"
+              disabled={loadingLearners}
+              onClick={() => void loadLearnerHonor()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 cursor-pointer"
             >
-              {lang === 'vi' ? 'Vinh danh Lớp học' : 'Class Board'}
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingLearners ? 'animate-spin' : ''}`} />
+              <span>{lang === 'vi' ? 'Cập nhật' : 'Refresh'}</span>
             </button>
-            <button
-              type="button"
-              onClick={() => setBoardMode('self_learners')}
-              className="px-3.5 py-1.5 rounded-lg bg-white text-emerald-700 shadow-xs cursor-pointer"
-            >
-              {lang === 'vi' ? 'Vinh danh Tự học ở nhà' : 'Home Self-Study'}
-            </button>
+            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl text-xs sm:text-sm font-semibold">
+              <button
+                type="button"
+                onClick={() => setBoardMode('classroom')}
+                className="px-3.5 py-1.5 rounded-lg text-slate-600 hover:text-slate-900 cursor-pointer"
+              >
+                {lang === 'vi' ? 'Vinh danh Lớp học' : 'Class Board'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setBoardMode('self_learners')}
+                className="px-3.5 py-1.5 rounded-lg bg-white text-emerald-700 shadow-xs cursor-pointer"
+              >
+                {lang === 'vi' ? 'Vinh danh Tự học ở nhà' : 'Home Self-Study'}
+              </button>
+            </div>
           </div>
         </div>
+
+        {/* Top 3 Home Self-Assessment Podium */}
+        {topThreeLearners.length > 0 && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {topThreeLearners.map((entry, idx) => {
+              const lvl = getLevelMeta(entry.currentLevel);
+              const rankStyles =
+                idx === 0
+                  ? 'border-amber-300 bg-amber-50/50'
+                  : idx === 1
+                    ? 'border-slate-300 bg-slate-50/70'
+                    : 'border-orange-200 bg-orange-50/40';
+              return (
+                <div
+                  key={entry.uid}
+                  className={`bg-white border rounded-2xl p-5 space-y-3 ${rankStyles}`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="inline-flex items-center gap-1.5 text-sm font-bold text-slate-900">
+                      {idx === 0 ? (
+                        <Crown className="w-5 h-5 text-amber-500" />
+                      ) : (
+                        <Medal className="w-5 h-5 text-slate-500" />
+                      )}
+                      <span>
+                        {lang === 'vi' ? `Hạng #${idx + 1}` : `Rank #${idx + 1}`}
+                      </span>
+                    </span>
+                    <span className="font-mono-num text-xl font-extrabold text-sky-700">
+                      {entry.totalXp} XP
+                    </span>
+                  </div>
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-900 truncate">
+                      {entry.fullName}
+                    </h2>
+                    <p className="text-xs text-slate-600 truncate">
+                      {entry.className} · {entry.schoolName}
+                    </p>
+                    {entry.latestBadgeTitle && (
+                      <p className="text-xs font-bold text-amber-700 mt-1">
+                        ★ {entry.latestBadgeTitle}
+                      </p>
+                    )}
+                  </div>
+                  <div className="pt-2.5 border-t border-slate-200/70 flex items-center justify-between text-xs tabular-nums">
+                    <span
+                      className={`inline-flex items-center px-2 py-0.5 rounded-full font-bold border ${lvl.badgeClass}`}
+                    >
+                      {lang === 'vi' ? lvl.nameVi : lvl.nameEn}
+                    </span>
+                    <span className="font-mono-num font-bold text-slate-800">
+                      {entry.masteredCount}/24 NL · {entry.accuracyPercent}%
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
           {loadingLearners ? (
