@@ -1062,7 +1062,7 @@ test('localStoreApi awards partial credit for fuzzy fill_blank near-match and al
   );
 });
 
-test('localStoreApi isolates Google accounts (401 without token), enforces anti-farming retry XP caps, and supports zero-login guestUid end-to-end', async () => {
+test('localStoreApi enforces mandatory verified Gmail login (rejects ALL guest/unauthenticated access with 401), anti-farming retry XP caps, and public honor board visibility', async () => {
   const storage = createMemoryStorage();
   await withMockFetch(
     async (input, init) => {
@@ -1087,35 +1087,35 @@ test('localStoreApi isolates Google accounts (401 without token), enforces anti-
       return new Response(JSON.stringify({}), { status: 404 });
     },
     async () => {
-      // 1) Unauthenticated calls without idToken or valid guestUid MUST still be rejected with 401
-      const spoofProfileRes = await handleLocalApi(
+      // 1) ALL guest / unauthenticated calls (even with guestUid) MUST be rejected with 401 to prevent peeking at questions!
+      const guestProfileRes = await handleLocalApi(
         '/api/learners/profile',
         {
           method: 'POST',
           body: JSON.stringify({
-            uid: 'uid-google-student-2',
-            fullName: 'Giả mạo Google UID',
+            guestUid: 'guest-5a-minh-khoi-test1',
+            fullName: 'Khách xem trước đề',
             className: '5A',
             schoolName: 'TH Test',
           }),
         },
         storage,
       );
-      assert.equal(spoofProfileRes.status, 401);
+      assert.equal(guestProfileRes.status, 401);
 
-      const spoofMeRes = await handleLocalApi(
-        '/api/learners/me?uid=uid-google-student-2',
+      const guestMeRes = await handleLocalApi(
+        '/api/learners/me?uid=guest-5a-minh-khoi-test1',
         { method: 'GET' },
         storage,
       );
-      assert.equal(spoofMeRes.status, 401);
+      assert.equal(guestMeRes.status, 401);
 
-      const spoofSubmitRes = await handleLocalApi(
+      const guestSubmitRes = await handleLocalApi(
         '/api/learners/assessment-submit',
         {
           method: 'POST',
           body: JSON.stringify({
-            uid: 'uid-google-student-2',
+            guestUid: 'guest-5a-minh-khoi-test1',
             mode: 'diagnostic',
             maxCombo: 1,
             outcomes: [
@@ -1125,25 +1125,16 @@ test('localStoreApi isolates Google accounts (401 without token), enforces anti-
         },
         storage,
       );
-      assert.equal(spoofSubmitRes.status, 401);
+      assert.equal(guestSubmitRes.status, 401);
 
-      // Invalid short guestUid must also be rejected with 401
-      const invalidGuestRes = await handleLocalApi(
-        '/api/learners/profile',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            guestUid: 'bad-id',
-            fullName: 'Sai định dạng',
-            className: '5A',
-            schoolName: 'TH Test',
-          }),
-        },
+      const spoofGoogleRes = await handleLocalApi(
+        '/api/learners/me?uid=uid-google-student-2',
+        { method: 'GET' },
         storage,
       );
-      assert.equal(invalidGuestRes.status, 401);
+      assert.equal(spoofGoogleRes.status, 401);
 
-      // 2) Verified Google student completes profile
+      // 2) Verified Gmail student completes profile
       const profileRes = await handleLocalApi(
         '/api/learners/profile',
         {
@@ -1159,6 +1150,8 @@ test('localStoreApi isolates Google accounts (401 without token), enforces anti-
         storage,
       );
       assert.equal(profileRes.ok, true);
+      assert.equal((profileRes.data as { profile: { authType: string; email: string } }).profile.authType, 'google');
+      assert.equal((profileRes.data as { profile: { email: string } }).profile.email, 'baochau@gmail.com');
 
       // 3) 1st submission: ex-1.1-l2 correct (40 XP), ex-4.2-l2 wrong (+5 effort XP)
       const run1 = await handleLocalApi(
@@ -1234,62 +1227,17 @@ test('localStoreApi isolates Google accounts (401 without token), enforces anti-
       assert.equal(run3Data.attempt.outcomes[0].retryTier, 'practice_no_xp');
       assert.equal(run3Data.profile.totalXp, 87);
 
-      // 6) Zero-login student (valid guestUid) creates profile, submits 24-skill assessment, appears on Honor Board, and receives Teacher Award!
-      const guestUid = 'guest-5a-minh-khoi-test1';
-      const guestCreate = await handleLocalApi(
-        '/api/learners/profile',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            guestUid,
-            fullName: 'Trần Minh Khôi',
-            className: '5A',
-            schoolName: 'TH Nguyễn Du',
-            gradeBand: 'primary',
-          }),
-        },
-        storage,
-      );
-      assert.equal(guestCreate.ok, true);
-      assert.equal((guestCreate.data as { profile: { authType: string } }).profile.authType, 'guest');
-
-      const guestRun1 = await handleLocalApi(
-        '/api/learners/assessment-submit',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            guestUid,
-            mode: 'diagnostic',
-            maxCombo: 2,
-            outcomes: [
-              { exerciseId: 'ex-1.1-l1', competencyId: '1.1', level: 1, type: 'scenario_choice', isCorrect: true, xpEarned: 25 },
-              { exerciseId: 'ex-4.1-l1', competencyId: '4.1', level: 1, type: 'scenario_choice', isCorrect: true, xpEarned: 25 },
-            ],
-          }),
-        },
-        storage,
-      );
-      assert.equal(guestRun1.ok, true);
-      assert.equal((guestRun1.data as { profile: { totalXp: number } }).profile.totalXp, 50);
-
-      // Zero-login student can resume via GET /api/learners/me?uid=guest-...
-      const guestMe = await handleLocalApi(
-        `/api/learners/me?uid=${encodeURIComponent(guestUid)}`,
-        { method: 'GET' },
-        storage,
-      );
-      assert.equal(guestMe.ok, true);
-      assert.equal((guestMe.data as { profile: { totalXp: number; fullName: string } }).profile.totalXp, 50);
-
-      // Both Google student and Zero-Login student appear on public Honor Board with zero PII leaked
+      // 6) Verified Gmail student's achievement is PUBLICLY readable on /api/learners/honor (no login needed, no email PII leaked)
       const honorRes = await handleLocalApi('/api/learners/honor', { method: 'GET' }, storage);
       assert.equal(honorRes.ok, true);
-      const honorEntries = (honorRes.data as { entries: Array<{ uid: string; email?: string; authType: string }> }).entries;
-      assert.equal(honorEntries.length, 2);
-      assert.ok(honorEntries.some((h) => h.uid === guestUid && h.authType === 'guest'));
-      assert.ok(honorEntries.every((h) => h.email === undefined));
+      const honorEntries = (honorRes.data as { entries: Array<{ uid: string; fullName: string; totalXp: number; email?: string; authType: string }> }).entries;
+      assert.equal(honorEntries.length, 1);
+      assert.equal(honorEntries[0].fullName, 'Nguyễn Bảo Châu');
+      assert.equal(honorEntries[0].totalXp, 87);
+      assert.equal(honorEntries[0].authType, 'google');
+      assert.equal(honorEntries[0].email, undefined);
 
-      // Teacher sees BOTH students and can award bonus XP to the Zero-Login student
+      // 7) Teacher sees verified Gmail student and awards badge + bonus XP -> reflected on public honor board!
       const teacherToken = await seedAuthenticatedTeacherToken(storage);
       const teacherList = await handleLocalApi(
         '/api/teacher/learners',
@@ -1297,7 +1245,7 @@ test('localStoreApi isolates Google accounts (401 without token), enforces anti-
         storage,
       );
       assert.equal(teacherList.ok, true);
-      assert.equal((teacherList.data as { learners: unknown[] }).learners.length, 2);
+      assert.equal((teacherList.data as { learners: unknown[] }).learners.length, 1);
 
       const awardRes = await handleLocalApi(
         '/api/teacher/awards',
@@ -1305,23 +1253,22 @@ test('localStoreApi isolates Google accounts (401 without token), enforces anti-
           method: 'POST',
           authToken: teacherToken,
           body: JSON.stringify({
-            learnerUid: guestUid,
+            learnerUid: 'uid-google-student-2',
             badgeId: 'digital_star',
             badgeTitle: 'Ngôi sao Tự học ở nhà',
             bonusXp: 100,
-            message: 'Tuyên dương em Minh Khôi tự học rất tốt!',
+            message: 'Tuyên dương em Bảo Châu tự học rất tốt!',
           }),
         },
         storage,
       );
       assert.equal(awardRes.ok, true);
-      const guestAfterAward = await handleLocalApi(
-        `/api/learners/me?uid=${encodeURIComponent(guestUid)}`,
-        { method: 'GET' },
-        storage,
-      );
-      assert.equal((guestAfterAward.data as { profile: { totalXp: number }; awards: unknown[] }).profile.totalXp, 150);
-      assert.equal((guestAfterAward.data as { awards: unknown[] }).awards.length, 1);
+
+      const honorAfter = await handleLocalApi('/api/learners/honor', { method: 'GET' }, storage);
+      const afterEntries = (honorAfter.data as { entries: Array<{ totalXp: number; awardsCount: number; latestBadgeTitle?: string }> }).entries;
+      assert.equal(afterEntries[0].totalXp, 187);
+      assert.equal(afterEntries[0].awardsCount, 1);
+      assert.equal(afterEntries[0].latestBadgeTitle, 'Ngôi sao Tự học ở nhà');
     },
   );
 });

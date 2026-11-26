@@ -371,12 +371,12 @@ service cloud.firestore {
       }
     }
 
-    // Personal Home Self-Assessment Learner Profiles (PII-isolated: owner + admin only)
+    // Personal Home Self-Assessment Learner Profiles (Verified Google Gmail only: owner + admin)
     function isValidLearnerProfile(data, userId) {
       return data.keys().hasAll(['uid', 'authType', 'fullName', 'className', 'schoolName', 'gradeBand', 'role', 'profileCompleted', 'currentLevel', 'totalXp', 'bestCombo', 'totalExercisesDone', 'totalCorrect', 'masteryByCompetency', 'lastActiveAt', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['uid', 'authType', 'email', 'photoUrl', 'fullName', 'className', 'schoolName', 'gradeBand', 'role', 'profileCompleted', 'currentLevel', 'totalXp', 'bestCombo', 'totalExercisesDone', 'totalCorrect', 'masteryByCompetency', 'lastActiveAt', 'createdAt', 'updatedAt'])
         && data.uid is string && data.uid == userId && data.uid.size() <= 128
-        && data.authType in ['google', 'guest']
+        && data.authType == 'google'
         && (!('email' in data) || (data.email is string && data.email.size() <= 200))
         && (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 500))
         && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120
@@ -413,10 +413,6 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
-    function isValidGuestId(id) {
-      return id is string && id.size() >= 10 && id.size() <= 96 && id.matches('^guest-[A-Za-z0-9_\\-]+$');
-    }
-
     match /learnerProfiles/{userId} {
       allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
       allow list: if isAdmin();
@@ -437,43 +433,13 @@ service cloud.firestore {
       allow delete: if isValidId(userId) && isAdmin();
     }
 
-    // Zero-login Home Self-Assessment Learner Profiles (for young students without personal Gmail)
-    // Strictly separated from verified Google learnerProfiles; monotonic XP guard prevents resets; list is Admin-only.
-    match /guestLearnerProfiles/{guestId} {
-      allow get: if isValidGuestId(guestId);
-      allow list: if isAdmin();
-      allow create: if isValidGuestId(guestId)
-        && incoming().authType == 'guest'
-        && isValidLearnerProfile(incoming(), guestId)
-        && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
-      allow update: if isValidGuestId(guestId)
-        && incoming().authType == 'guest'
-        && existing().authType == 'guest'
-        && isValidLearnerProfile(incoming(), guestId)
-        && incoming().uid == existing().uid
-        && incoming().role == 'student'
-        && incoming().createdAt == existing().createdAt
-        && incoming().updatedAt == request.time
-        && (
-          isAdmin()
-          || (
-            incoming().totalXp >= existing().totalXp
-            && incoming().totalExercisesDone >= existing().totalExercisesDone
-          )
-        );
-      allow delete: if isValidGuestId(guestId) && isAdmin();
-    }
-
     match /teacherAwards/{awardId} {
       allow get: if isValidId(awardId) && (
         isAdmin()
         || (isVerifiedUser() && existing().learnerUid == request.auth.uid)
-        || isValidGuestId(existing().learnerUid)
       );
       allow list: if isAdmin()
-        || (isVerifiedUser() && resource.data.learnerUid == request.auth.uid)
-        || (isValidGuestId(resource.data.learnerUid) && request.query.limit <= 50);
+        || (isVerifiedUser() && resource.data.learnerUid == request.auth.uid);
       allow create: if isValidId(awardId)
         && isAdmin()
         && isValidTeacherAward(incoming(), awardId)
@@ -516,18 +482,7 @@ service cloud.firestore {
       allow delete: if isValidId(attemptId) && isAdmin();
     }
 
-    match /guestAssessmentAttempts/{attemptId} {
-      allow get: if isValidId(attemptId) && (isAdmin() || isValidGuestId(existing().learnerUid));
-      allow list: if isAdmin() || (isValidGuestId(resource.data.learnerUid) && request.query.limit <= 40);
-      allow create: if isValidId(attemptId)
-        && isValidGuestId(incoming().learnerUid)
-        && isValidAssessmentAttempt(incoming(), attemptId)
-        && incoming().createdAt == request.time;
-      allow update: if false;
-      allow delete: if isValidId(attemptId) && isAdmin();
-    }
-
-    // Strictly PII-free Public Home Self-Assessment Honor Entry (NO email or photoUrl permitted!)
+    // Public Home Self-Assessment Honor Board (Publicly readable by classmates/parents/teachers; strictly written by verified Google learners or Admin; NO email/photoUrl PII!)
     function isValidPublicLearnerHonor(data, userId) {
       return data.keys().hasAll(['uid', 'fullName', 'className', 'schoolName', 'gradeBand', 'authType', 'currentLevel', 'totalXp', 'masteredCount', 'expertCount', 'accuracyPercent', 'totalExercisesDone', 'awardsCount', 'lastActiveAt', 'updatedAt'])
         && data.keys().hasOnly(['uid', 'fullName', 'className', 'schoolName', 'gradeBand', 'authType', 'currentLevel', 'totalXp', 'masteredCount', 'expertCount', 'accuracyPercent', 'totalExercisesDone', 'awardsCount', 'latestBadgeTitle', 'lastActiveAt', 'updatedAt'])
@@ -536,7 +491,7 @@ service cloud.firestore {
         && data.className is string && data.className.size() >= 1 && data.className.size() <= 60
         && data.schoolName is string && data.schoolName.size() >= 1 && data.schoolName.size() <= 160
         && data.gradeBand in ['primary', 'middle', 'high']
-        && data.authType in ['google', 'guest']
+        && data.authType == 'google'
         && data.currentLevel is int && data.currentLevel >= 1 && data.currentLevel <= 4
         && data.totalXp is int && data.totalXp >= 0 && data.totalXp <= 1000000
         && data.masteredCount is int && data.masteredCount >= 0 && data.masteredCount <= 24
@@ -553,24 +508,15 @@ service cloud.firestore {
       allow get: if isValidId(userId);
       allow list: if request.query.limit <= 200;
       allow create: if isValidId(userId)
+        && isVerifiedUser()
+        && (isOwner(userId) || isAdmin())
         && isValidPublicLearnerHonor(incoming(), userId)
-        && incoming().updatedAt == request.time
-        && (
-          (isVerifiedUser() && (isOwner(userId) || isAdmin()))
-          || (isValidGuestId(userId) && incoming().authType == 'guest')
-        );
+        && incoming().updatedAt == request.time;
       allow update: if isValidId(userId)
+        && isVerifiedUser()
+        && (isOwner(userId) || isAdmin())
         && isValidPublicLearnerHonor(incoming(), userId)
-        && incoming().updatedAt == request.time
-        && (
-          (isVerifiedUser() && (isOwner(userId) || isAdmin()))
-          || (
-            isValidGuestId(userId)
-            && incoming().authType == 'guest'
-            && existing().authType == 'guest'
-            && incoming().totalXp >= existing().totalXp
-          )
-        );
+        && incoming().updatedAt == request.time;
       allow delete: if isValidId(userId) && isAdmin();
     }
   }

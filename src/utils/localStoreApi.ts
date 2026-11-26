@@ -42,7 +42,6 @@ import {
   ensureLearnerCollections,
   getPublicHonorFromStore,
   hydrateLearnerProfileInStore,
-  isValidGuestLearnerUid,
   recordAssessmentAttemptInStore,
   upsertLearnerProfileInStore,
 } from '../shared/learnerStoreOps';
@@ -1559,11 +1558,10 @@ export async function handleLocalApi(
     };
   }
 
-  // POST /api/learners/profile (Verified Google email OR zero-login guestUid for young students)
+  // POST /api/learners/profile (Verified Google Gmail REQUIRED)
   if (pathname === '/api/learners/profile' && method === 'POST') {
     const pBody = body as {
       idToken?: string;
-      guestUid?: string;
       photoUrl?: string;
       fullName?: string;
       className?: string;
@@ -1581,42 +1579,32 @@ export async function handleLocalApi(
       };
     }
 
-    let resolvedUid = '';
-    let resolvedAuthType: 'google' | 'guest' = 'google';
-    let resolvedEmail: string | undefined;
-
-    if (pBody.idToken) {
-      const verified = await verifyGoogleIdTokenStatic(String(pBody.idToken));
-      if (!verified || !verified.emailVerified) {
-        return {
-          ok: false,
-          status: 401,
-          data: { error: 'Không thể xác thực tài khoản Google của học sinh.' },
-        };
-      }
-      resolvedUid = verified.uid;
-      resolvedAuthType = 'google';
-      resolvedEmail = verified.email;
-    } else if (isValidGuestLearnerUid(pBody.guestUid)) {
-      resolvedUid = pBody.guestUid.trim();
-      resolvedAuthType = 'guest';
-    } else {
+    if (!pBody.idToken) {
       return {
         ok: false,
         status: 401,
         data: {
           error:
-            'Vui lòng đăng nhập bằng Email cá nhân (Google) hoặc tạo Hồ sơ Tự đánh giá không cần đăng nhập hợp lệ.',
+            'Bắt buộc đăng nhập bằng Gmail cá nhân (Google) để tham gia Tự đánh giá 24 Năng lực (chống xem trước đề).',
         },
+      };
+    }
+
+    const verified = await verifyGoogleIdTokenStatic(String(pBody.idToken));
+    if (!verified || !verified.emailVerified) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Không thể xác thực tài khoản Gmail (Google) của học sinh.' },
       };
     }
 
     const store = loadLocalStore(storage);
     const profile = upsertLearnerProfileInStore(store, {
-      uid: resolvedUid,
-      authType: resolvedAuthType,
-      email: resolvedEmail,
-      photoUrl: resolvedAuthType === 'google' ? pBody.photoUrl : undefined,
+      uid: verified.uid,
+      authType: 'google',
+      email: verified.email,
+      photoUrl: pBody.photoUrl,
       fullName,
       className,
       schoolName,
@@ -1635,35 +1623,29 @@ export async function handleLocalApi(
     };
   }
 
-  // GET /api/learners/me (Verified Google email OR valid guestUid)
+  // GET /api/learners/me (Verified Google Gmail REQUIRED)
   if (pathname === '/api/learners/me' && method === 'GET') {
-    let resolvedUid = '';
-    const requestedUid = parsedUrl.searchParams.get('uid')?.trim() || '';
-
-    if (options.learnerToken) {
-      const verified = await verifyGoogleIdTokenStatic(options.learnerToken);
-      if (!verified?.uid || !verified.emailVerified) {
-        return {
-          ok: false,
-          status: 401,
-          data: { error: 'Phiên đăng nhập Google không hợp lệ. Vui lòng đăng nhập lại.' },
-        };
-      }
-      resolvedUid = verified.uid;
-    } else if (isValidGuestLearnerUid(requestedUid)) {
-      resolvedUid = requestedUid;
-    } else {
+    if (!options.learnerToken) {
       return {
         ok: false,
         status: 401,
-        data: { error: 'Cần đăng nhập Email cá nhân hoặc cung cấp Mã hồ sơ hợp lệ để xem tiến độ.' },
+        data: { error: 'Bắt buộc đăng nhập bằng Gmail cá nhân (Google) để xem tiến độ cá nhân.' },
+      };
+    }
+
+    const verified = await verifyGoogleIdTokenStatic(options.learnerToken);
+    if (!verified?.uid || !verified.emailVerified) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Phiên đăng nhập Google không hợp lệ. Vui lòng đăng nhập lại.' },
       };
     }
 
     const store = loadLocalStore(storage);
     const { learnerProfiles, assessmentAttempts, teacherAwards } =
       ensureLearnerCollections(store);
-    const profile = learnerProfiles.find((p) => p.uid === resolvedUid) ?? null;
+    const profile = learnerProfiles.find((p) => p.uid === verified.uid) ?? null;
     return {
       ok: true,
       status: 200,
@@ -1677,11 +1659,10 @@ export async function handleLocalApi(
     };
   }
 
-  // POST /api/learners/hydrate (Sync Cloud Firestore learner bundle into local store without data loss)
+  // POST /api/learners/hydrate (Sync Cloud Firestore learner bundle into local store without data loss; Verified Google Gmail REQUIRED)
   if (pathname === '/api/learners/hydrate' && method === 'POST') {
     const hBody = body as {
       idToken?: string;
-      guestUid?: string;
       profile?: LearnerProfile;
       attempts?: AssessmentSessionAttempt[];
       awards?: TeacherAward[];
@@ -1693,34 +1674,20 @@ export async function handleLocalApi(
         data: { error: 'Thiếu dữ liệu đồng bộ hồ sơ học sinh.' },
       };
     }
-
-    let resolvedUid = '';
-    let resolvedAuthType: 'google' | 'guest' = 'google';
-    let resolvedEmail: string | undefined;
-
-    if (hBody.idToken) {
-      const verified = await verifyGoogleIdTokenStatic(String(hBody.idToken));
-      if (!verified?.uid || !verified.emailVerified || hBody.profile.uid !== verified.uid) {
-        return {
-          ok: false,
-          status: 401,
-          data: { error: 'Không thể xác thực tài khoản Google để đồng bộ hồ sơ.' },
-        };
-      }
-      resolvedUid = verified.uid;
-      resolvedAuthType = 'google';
-      resolvedEmail = verified.email;
-    } else if (
-      isValidGuestLearnerUid(hBody.guestUid) &&
-      hBody.profile.uid === hBody.guestUid.trim()
-    ) {
-      resolvedUid = hBody.guestUid.trim();
-      resolvedAuthType = 'guest';
-    } else {
+    if (!hBody.idToken) {
       return {
         ok: false,
         status: 401,
-        data: { error: 'Không thể xác thực phiên đồng bộ hồ sơ học sinh.' },
+        data: { error: 'Bắt buộc đăng nhập Gmail cá nhân (Google) để đồng bộ hồ sơ.' },
+      };
+    }
+
+    const verified = await verifyGoogleIdTokenStatic(String(hBody.idToken));
+    if (!verified?.uid || !verified.emailVerified || hBody.profile.uid !== verified.uid) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Không thể xác thực tài khoản Google để đồng bộ hồ sơ.' },
       };
     }
 
@@ -1729,9 +1696,9 @@ export async function handleLocalApi(
       store,
       {
         ...hBody.profile,
-        uid: resolvedUid,
-        authType: resolvedAuthType,
-        email: resolvedEmail || (resolvedAuthType === 'google' ? hBody.profile.email : undefined),
+        uid: verified.uid,
+        authType: 'google',
+        email: verified.email || hBody.profile.email,
       },
       Array.isArray(hBody.attempts) ? hBody.attempts : [],
       Array.isArray(hBody.awards) ? hBody.awards : [],
@@ -1749,11 +1716,10 @@ export async function handleLocalApi(
     };
   }
 
-  // POST /api/learners/assessment-submit (Google email OR zero-login guestUid, retry-capped)
+  // POST /api/learners/assessment-submit (Verified Google Gmail REQUIRED, retry-capped)
   if (pathname === '/api/learners/assessment-submit' && method === 'POST') {
     const aBody = body as {
       idToken?: string;
-      guestUid?: string;
       learnerName?: string;
       className?: string;
       schoolName?: string;
@@ -1766,44 +1732,34 @@ export async function handleLocalApi(
       maxCombo?: number;
     };
 
-    let resolvedUid = '';
-    let resolvedAuthType: 'google' | 'guest' = 'google';
-    let resolvedEmail: string | undefined;
-
-    if (aBody.idToken) {
-      const verified = await verifyGoogleIdTokenStatic(String(aBody.idToken));
-      if (!verified?.uid || !verified.emailVerified) {
-        return {
-          ok: false,
-          status: 401,
-          data: { error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.' },
-        };
-      }
-      resolvedUid = verified.uid;
-      resolvedAuthType = 'google';
-      resolvedEmail = verified.email;
-    } else if (isValidGuestLearnerUid(aBody.guestUid)) {
-      resolvedUid = aBody.guestUid.trim();
-      resolvedAuthType = 'guest';
-    } else {
+    if (!aBody.idToken) {
       return {
         ok: false,
         status: 401,
-        data: { error: 'Cần đăng nhập Email cá nhân hoặc dùng Hồ sơ Tự đánh giá hợp lệ để lưu kết quả.' },
+        data: { error: 'Bắt buộc đăng nhập Gmail cá nhân (Google) để lưu kết quả tự đánh giá.' },
+      };
+    }
+
+    const verified = await verifyGoogleIdTokenStatic(String(aBody.idToken));
+    if (!verified?.uid || !verified.emailVerified) {
+      return {
+        ok: false,
+        status: 401,
+        data: { error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.' },
       };
     }
 
     const store = loadLocalStore(storage);
     const { profile, attempt } = recordAssessmentAttemptInStore(store, {
-      learnerUid: resolvedUid,
+      learnerUid: verified.uid,
       learnerName: aBody.learnerName,
       className: aBody.className,
       schoolName: aBody.schoolName,
-      authType: resolvedAuthType,
-      email: resolvedEmail,
+      authType: 'google',
+      email: verified.email,
       gradeBand: aBody.gradeBand,
       baseProfile:
-        aBody.baseProfile && aBody.baseProfile.uid === resolvedUid
+        aBody.baseProfile && aBody.baseProfile.uid === verified.uid
           ? aBody.baseProfile
           : undefined,
       mode: aBody.mode || 'variety_sprint',

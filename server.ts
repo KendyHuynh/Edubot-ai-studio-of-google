@@ -60,7 +60,6 @@ import {
   ensureLearnerCollections,
   getPublicHonorFromStore,
   hydrateLearnerProfileInStore,
-  isValidGuestLearnerUid,
   recordAssessmentAttemptInStore,
   upsertLearnerProfileInStore,
 } from './src/shared/learnerStoreOps';
@@ -1586,11 +1585,10 @@ async function startServer() {
   // PERSONAL HOME 24-COMPETENCY SELF-ASSESSMENT & TEACHER REWARDS API
   // =========================================================================
 
-  // POST /api/learners/profile — Register/update personal learner profile (Google email OR zero-login guestUid)
+  // POST /api/learners/profile — Register/update personal learner profile (Verified Google Gmail REQUIRED)
   app.post('/api/learners/profile', async (req, res) => {
     const body = req.body as {
       idToken?: string;
-      guestUid?: string;
       photoUrl?: string;
       fullName?: string;
       className?: string;
@@ -1609,42 +1607,32 @@ async function startServer() {
       return;
     }
 
-    let resolvedUid = '';
-    let resolvedAuthType: 'google' | 'guest' = 'google';
-    let resolvedEmail: string | undefined;
-
-    if (body.idToken) {
-      const cfg = readFirebaseConfig();
-      const verified = await verifyFirebaseIdTokenViaRest(
-        String(body.idToken),
-        cfg.apiKey || '',
-      );
-      if (!verified || !verified.emailVerified) {
-        res.status(401).json({
-          error: 'Không thể xác thực tài khoản Google của học sinh. Vui lòng đăng nhập lại.',
-        });
-        return;
-      }
-      resolvedUid = verified.uid;
-      resolvedAuthType = 'google';
-      resolvedEmail = verified.email;
-    } else if (isValidGuestLearnerUid(body.guestUid)) {
-      resolvedUid = body.guestUid.trim();
-      resolvedAuthType = 'guest';
-    } else {
+    if (!body.idToken) {
       res.status(401).json({
         error:
-          'Vui lòng đăng nhập bằng Email cá nhân (Google) hoặc tạo Hồ sơ Tự đánh giá không cần đăng nhập hợp lệ.',
+          'Bắt buộc đăng nhập bằng Gmail cá nhân (Google) để tham gia Tự đánh giá 24 Năng lực (chống xem trước đề).',
+      });
+      return;
+    }
+
+    const cfg = readFirebaseConfig();
+    const verified = await verifyFirebaseIdTokenViaRest(
+      String(body.idToken),
+      cfg.apiKey || '',
+    );
+    if (!verified || !verified.emailVerified) {
+      res.status(401).json({
+        error: 'Không thể xác thực tài khoản Gmail (Google) của học sinh. Vui lòng đăng nhập lại.',
       });
       return;
     }
 
     const store = loadStore();
     const profile = upsertLearnerProfileInStore(store, {
-      uid: resolvedUid,
-      authType: resolvedAuthType,
-      email: resolvedEmail,
-      photoUrl: resolvedAuthType === 'google' ? body.photoUrl : undefined,
+      uid: verified.uid,
+      authType: 'google',
+      email: verified.email,
+      photoUrl: body.photoUrl,
       fullName,
       className,
       schoolName,
@@ -1660,30 +1648,25 @@ async function startServer() {
     });
   });
 
-  // GET /api/learners/me — Fetch learner profile (Google token OR valid guestUid)
+  // GET /api/learners/me — Fetch personal learner profile (Verified Google Gmail token REQUIRED)
   app.get('/api/learners/me', async (req, res) => {
     const idToken =
       typeof req.headers['x-learner-token'] === 'string'
         ? req.headers['x-learner-token'].trim()
         : '';
-    const requestedUid = typeof req.query.uid === 'string' ? req.query.uid.trim() : '';
 
-    let resolvedUid = '';
-    if (idToken) {
-      const cfg = readFirebaseConfig();
-      const verified = await verifyFirebaseIdTokenViaRest(idToken, cfg.apiKey || '');
-      if (!verified?.uid || !verified.emailVerified) {
-        res.status(401).json({
-          error: 'Phiên đăng nhập Google không hợp lệ. Vui lòng đăng nhập lại.',
-        });
-        return;
-      }
-      resolvedUid = verified.uid;
-    } else if (isValidGuestLearnerUid(requestedUid)) {
-      resolvedUid = requestedUid;
-    } else {
+    if (!idToken) {
       res.status(401).json({
-        error: 'Cần đăng nhập Email cá nhân hoặc cung cấp Mã hồ sơ hợp lệ để xem tiến độ.',
+        error: 'Bắt buộc đăng nhập bằng Gmail cá nhân (Google) để xem tiến độ cá nhân.',
+      });
+      return;
+    }
+
+    const cfg = readFirebaseConfig();
+    const verified = await verifyFirebaseIdTokenViaRest(idToken, cfg.apiKey || '');
+    if (!verified?.uid || !verified.emailVerified) {
+      res.status(401).json({
+        error: 'Phiên đăng nhập Google không hợp lệ. Vui lòng đăng nhập lại.',
       });
       return;
     }
@@ -1691,7 +1674,7 @@ async function startServer() {
     const store = loadStore();
     const { learnerProfiles, assessmentAttempts, teacherAwards } =
       ensureLearnerCollections(store);
-    const profile = learnerProfiles.find((p) => p.uid === resolvedUid) ?? null;
+    const profile = learnerProfiles.find((p) => p.uid === verified.uid) ?? null;
 
     res.json({
       profile,
@@ -1702,11 +1685,10 @@ async function startServer() {
     });
   });
 
-  // POST /api/learners/hydrate — Sync Cloud Firestore learner bundle into server store monotonically
+  // POST /api/learners/hydrate — Sync Cloud Firestore learner bundle into server store monotonically (Verified Google Gmail REQUIRED)
   app.post('/api/learners/hydrate', async (req, res) => {
     const body = req.body as {
       idToken?: string;
-      guestUid?: string;
       profile?: LearnerProfile;
       attempts?: AssessmentSessionAttempt[];
       awards?: TeacherAward[];
@@ -1715,34 +1697,20 @@ async function startServer() {
       res.status(400).json({ error: 'Thiếu dữ liệu đồng bộ hồ sơ học sinh.' });
       return;
     }
+    if (!body.idToken) {
+      res.status(401).json({ error: 'Bắt buộc đăng nhập Gmail cá nhân (Google) để đồng bộ hồ sơ.' });
+      return;
+    }
 
-    let resolvedUid = '';
-    let resolvedAuthType: 'google' | 'guest' = 'google';
-    let resolvedEmail: string | undefined;
-
-    if (body.idToken) {
-      const cfg = readFirebaseConfig();
-      const verified = await verifyFirebaseIdTokenViaRest(
-        String(body.idToken),
-        cfg.apiKey || '',
-      );
-      if (!verified?.uid || !verified.emailVerified || body.profile.uid !== verified.uid) {
-        res.status(401).json({
-          error: 'Không thể xác thực tài khoản Google để đồng bộ hồ sơ.',
-        });
-        return;
-      }
-      resolvedUid = verified.uid;
-      resolvedAuthType = 'google';
-      resolvedEmail = verified.email;
-    } else if (
-      isValidGuestLearnerUid(body.guestUid) &&
-      body.profile.uid === body.guestUid.trim()
-    ) {
-      resolvedUid = body.guestUid.trim();
-      resolvedAuthType = 'guest';
-    } else {
-      res.status(401).json({ error: 'Không thể xác thực phiên đồng bộ hồ sơ học sinh.' });
+    const cfg = readFirebaseConfig();
+    const verified = await verifyFirebaseIdTokenViaRest(
+      String(body.idToken),
+      cfg.apiKey || '',
+    );
+    if (!verified?.uid || !verified.emailVerified || body.profile.uid !== verified.uid) {
+      res.status(401).json({
+        error: 'Không thể xác thực tài khoản Google để đồng bộ hồ sơ.',
+      });
       return;
     }
 
@@ -1751,9 +1719,9 @@ async function startServer() {
       store,
       {
         ...body.profile,
-        uid: resolvedUid,
-        authType: resolvedAuthType,
-        email: resolvedEmail || (resolvedAuthType === 'google' ? body.profile.email : undefined),
+        uid: verified.uid,
+        authType: 'google',
+        email: verified.email || body.profile.email,
       },
       Array.isArray(body.attempts) ? body.attempts : [],
       Array.isArray(body.awards) ? body.awards : [],
@@ -1767,11 +1735,10 @@ async function startServer() {
     });
   });
 
-  // POST /api/learners/assessment-submit — Record self-assessment session (Google OR valid guestUid, retry-capped)
+  // POST /api/learners/assessment-submit — Record self-assessment session (Verified Google Gmail REQUIRED, retry-capped)
   app.post('/api/learners/assessment-submit', async (req, res) => {
     const body = req.body as {
       idToken?: string;
-      guestUid?: string;
       learnerName?: string;
       className?: string;
       schoolName?: string;
@@ -1784,46 +1751,36 @@ async function startServer() {
       maxCombo?: number;
     };
 
-    let resolvedUid = '';
-    let resolvedAuthType: 'google' | 'guest' = 'google';
-    let resolvedEmail: string | undefined;
-
-    if (body.idToken) {
-      const cfg = readFirebaseConfig();
-      const verified = await verifyFirebaseIdTokenViaRest(
-        String(body.idToken),
-        cfg.apiKey || '',
-      );
-      if (!verified?.uid || !verified.emailVerified) {
-        res.status(401).json({
-          error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.',
-        });
-        return;
-      }
-      resolvedUid = verified.uid;
-      resolvedAuthType = 'google';
-      resolvedEmail = verified.email;
-    } else if (isValidGuestLearnerUid(body.guestUid)) {
-      resolvedUid = body.guestUid.trim();
-      resolvedAuthType = 'guest';
-    } else {
+    if (!body.idToken) {
       res.status(401).json({
-        error: 'Cần đăng nhập Email cá nhân hoặc dùng Hồ sơ Tự đánh giá hợp lệ để lưu kết quả.',
+        error: 'Bắt buộc đăng nhập Gmail cá nhân (Google) để lưu kết quả tự đánh giá.',
+      });
+      return;
+    }
+
+    const cfg = readFirebaseConfig();
+    const verified = await verifyFirebaseIdTokenViaRest(
+      String(body.idToken),
+      cfg.apiKey || '',
+    );
+    if (!verified?.uid || !verified.emailVerified) {
+      res.status(401).json({
+        error: 'Không thể xác thực tài khoản Google. Vui lòng đăng nhập lại.',
       });
       return;
     }
 
     const store = loadStore();
     const { profile, attempt } = recordAssessmentAttemptInStore(store, {
-      learnerUid: resolvedUid,
+      learnerUid: verified.uid,
       learnerName: body.learnerName,
       className: body.className,
       schoolName: body.schoolName,
-      authType: resolvedAuthType,
-      email: resolvedEmail,
+      authType: 'google',
+      email: verified.email,
       gradeBand: body.gradeBand,
       baseProfile:
-        body.baseProfile && body.baseProfile.uid === resolvedUid
+        body.baseProfile && body.baseProfile.uid === verified.uid
           ? body.baseProfile
           : undefined,
       mode: body.mode || 'variety_sprint',

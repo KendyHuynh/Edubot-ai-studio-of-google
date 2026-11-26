@@ -162,7 +162,7 @@
       "type": "object",
       "properties": {
         "uid": { "type": "string", "maxLength": 128 },
-        "authType": { "type": "string", "enum": ["google", "guest"] },
+        "authType": { "type": "string", "enum": ["google"] },
         "email": { "type": "string", "maxLength": 200 },
         "photoUrl": { "type": "string", "maxLength": 500 },
         "fullName": { "type": "string", "maxLength": 120 },
@@ -229,7 +229,7 @@
     },
     "PublicLearnerHonor": {
       "title": "PublicLearnerHonor",
-      "description": "Strictly PII-free public honor board entry for home self-assessment learners (no email).",
+      "description": "Publicly readable, PII-free honor board entry for verified Google Gmail home self-assessment learners (no email).",
       "type": "object",
       "properties": {
         "uid": { "type": "string", "maxLength": 128 },
@@ -237,7 +237,7 @@
         "className": { "type": "string", "maxLength": 60 },
         "schoolName": { "type": "string", "maxLength": 160 },
         "gradeBand": { "type": "string", "enum": ["primary", "middle", "high"] },
-        "authType": { "type": "string", "enum": ["google", "guest"] },
+        "authType": { "type": "string", "enum": ["google"] },
         "currentLevel": { "type": "integer" },
         "totalXp": { "type": "integer" },
         "masteredCount": { "type": "integer" },
@@ -287,27 +287,19 @@
     },
     "/learnerProfiles/{userId}": {
       "schema": { "$ref": "#/entities/LearnerProfile" },
-      "description": "Personal home 24-competency learner profiles isolated to verified student owner and teacher admin."
-    },
-    "/guestLearnerProfiles/{guestId}": {
-      "schema": { "$ref": "#/entities/LearnerProfile" },
-      "description": "Zero-login home 24-competency learner profiles for young students without personal Gmail, monotonically updated and listable only by teacher admin."
+      "description": "Personal home 24-competency learner profiles linked to verified Google Gmail, isolated to student owner and teacher admin."
     },
     "/teacherAwards/{awardId}": {
       "schema": { "$ref": "#/entities/TeacherAward" },
-      "description": "Teacher-issued badges, praise notes, and bonus XP for home learners."
+      "description": "Teacher-issued badges, praise notes, and bonus XP for verified Gmail home learners."
     },
     "/assessmentAttempts/{attemptId}": {
       "schema": { "$ref": "#/entities/AssessmentSessionAttempt" },
-      "description": "Home 24-competency self-assessment session history readable by student owner and teacher admin."
-    },
-    "/guestAssessmentAttempts/{attemptId}": {
-      "schema": { "$ref": "#/entities/AssessmentSessionAttempt" },
-      "description": "Zero-login home 24-competency self-assessment session history readable by matching guest profile or teacher admin."
+      "description": "Home 24-competency self-assessment session history readable by verified student owner and teacher admin."
     },
     "/publicLearnerHonor/{userId}": {
       "schema": { "$ref": "#/entities/PublicLearnerHonor" },
-      "description": "PII-free public honor board entries for home 24-competency learners (both Google email and zero-login profiles)."
+      "description": "Publicly readable, PII-free honor board entries written strictly by verified Google Gmail learners and teacher admin."
     }
   }
 }

@@ -31,7 +31,6 @@ import {
   computeOverallLevel,
   sanitizeMasteryForFirestore,
 } from '../shared/assessmentEngine';
-import { isValidGuestLearnerUid } from '../shared/learnerStoreOps';
 import {
   hasStrippedAnswers,
   recoverMissingCorrectAnswers,
@@ -1007,10 +1006,9 @@ export async function savePublicLearnerHonorToFirestore(
   awardsCount = 0,
   latestBadgeTitle?: string,
 ): Promise<boolean> {
-  const isGuest = profile.authType === 'guest' && isValidGuestLearnerUid(profile.uid);
-  if (!isGuest && !isSignedInVerified()) return false;
+  if (!isSignedInVerified()) return false;
   try {
-    const docId = isGuest ? profile.uid.trim() : toFirestoreDocId(profile.uid, 128);
+    const docId = toFirestoreDocId(profile.uid, 128);
     const cleanMastery = sanitizeMasteryForFirestore(profile.masteryByCompetency);
     const records = Object.values(cleanMastery);
     const masteredCount = Math.min(
@@ -1026,7 +1024,7 @@ export async function savePublicLearnerHonorToFirestore(
     const accuracyPercent =
       totalDone > 0 ? Math.min(100, Math.round((totalCorrect / totalDone) * 100)) : 0;
 
-    // Strictly PII-free payload (NO email or photoUrl!)
+    // Publicly readable honor summary (NO email or photoUrl PII!)
     await setDoc(doc(db, 'publicLearnerHonor', docId), {
       uid: docId,
       fullName: (profile.fullName || 'Học sinh').trim().slice(0, 120) || 'Học sinh',
@@ -1036,7 +1034,7 @@ export async function savePublicLearnerHonorToFirestore(
         profile.gradeBand === 'middle' || profile.gradeBand === 'high'
           ? profile.gradeBand
           : 'primary',
-      authType: isGuest ? 'guest' : 'google',
+      authType: 'google',
       currentLevel: Math.max(1, Math.min(4, Math.round(profile.currentLevel || 1))),
       totalXp: Math.max(0, Math.min(1000000, Math.round(profile.totalXp || 0))),
       masteredCount,
@@ -1064,28 +1062,23 @@ export async function saveLearnerProfileToFirestore(
     latestBadgeTitle?: string;
   } = {},
 ): Promise<LearnerCloudWriteResult> {
-  const isGuest = profile.authType === 'guest' && isValidGuestLearnerUid(profile.uid);
   const current = auth.currentUser;
-
-  if (!isGuest) {
-    if (!current || !current.emailVerified) {
-      return {
-        ok: false,
-        error: 'Chưa đăng nhập tài khoản Google đã xác thực.',
-      };
-    }
-    if (!options.allowAdminWrite && current.uid !== profile.uid) {
-      return {
-        ok: false,
-        error: 'Tài khoản đăng nhập không khớp với hồ sơ học sinh.',
-      };
-    }
+  if (!current || !current.emailVerified) {
+    return {
+      ok: false,
+      error: 'Chưa đăng nhập tài khoản Gmail (Google) đã xác thực.',
+    };
+  }
+  if (!options.allowAdminWrite && current.uid !== profile.uid) {
+    return {
+      ok: false,
+      error: 'Tài khoản Gmail đăng nhập không khớp với hồ sơ học sinh.',
+    };
   }
 
-  const targetCollection = isGuest ? 'guestLearnerProfiles' : 'learnerProfiles';
   try {
-    const docId = isGuest ? profile.uid.trim() : toFirestoreDocId(profile.uid, 128);
-    const ref = doc(db, targetCollection, docId);
+    const docId = toFirestoreDocId(profile.uid, 128);
+    const ref = doc(db, 'learnerProfiles', docId);
     const snap = await getDoc(ref);
     const cleanMastery = sanitizeMasteryForFirestore(profile.masteryByCompetency);
     const cleanFullName = (profile.fullName || 'Học sinh').trim().slice(0, 120) || 'Học sinh';
@@ -1097,11 +1090,9 @@ export async function saveLearnerProfileToFirestore(
 
     const payload = {
       uid: docId,
-      authType: isGuest ? ('guest' as const) : ('google' as const),
-      ...(!isGuest && profile.email?.trim() ? { email: profile.email.trim().slice(0, 200) } : {}),
-      ...(!isGuest && profile.photoUrl?.trim()
-        ? { photoUrl: profile.photoUrl.trim().slice(0, 500) }
-        : {}),
+      authType: 'google' as const,
+      ...(profile.email?.trim() ? { email: profile.email.trim().slice(0, 200) } : {}),
+      ...(profile.photoUrl?.trim() ? { photoUrl: profile.photoUrl.trim().slice(0, 500) } : {}),
       fullName: cleanFullName,
       className: cleanClassName,
       schoolName: cleanSchoolName,
@@ -1126,9 +1117,9 @@ export async function saveLearnerProfileToFirestore(
       await updateDoc(ref, payload);
     }
 
-    // Best-effort sync of PII-free entry for the public Home Self-Study Honor Board
+    // Automatically publish verified achievement summary to publicLearnerHonor so everyone can see it
     const honorSynced = await savePublicLearnerHonorToFirestore(
-      { ...profile, masteryByCompetency: cleanMastery },
+      { ...profile, authType: 'google', masteryByCompetency: cleanMastery },
       options.awardsCount ?? 0,
       options.latestBadgeTitle,
     );
@@ -1145,7 +1136,7 @@ export async function saveLearnerProfileToFirestore(
       ok: false,
       permissionDenied,
       error: permissionDenied
-        ? `Quyền ghi Cloud Firestore cho bộ sưu tập ${targetCollection} bị từ chối. Vui lòng Publish file firestore.rules mới trên Firebase Console.`
+        ? 'Quyền ghi Cloud Firestore cho learnerProfiles bị từ chối. Vui lòng Publish file firestore.rules mới trên Firebase Console.'
         : rawMsg,
     };
   }
@@ -1154,17 +1145,15 @@ export async function saveLearnerProfileToFirestore(
 export async function saveAssessmentAttemptToFirestore(
   attempt: AssessmentSessionAttempt,
 ): Promise<boolean> {
-  const isGuest = isValidGuestLearnerUid(attempt.learnerUid);
   const current = auth.currentUser;
-  if (!isGuest && (!current || !current.emailVerified || current.uid !== attempt.learnerUid)) {
+  if (!current || !current.emailVerified || current.uid !== attempt.learnerUid) {
     return false;
   }
-  const targetCollection = isGuest ? 'guestAssessmentAttempts' : 'assessmentAttempts';
   try {
     const docId = toFirestoreDocId(attempt.id, 80);
-    await setDoc(doc(db, targetCollection, docId), {
+    await setDoc(doc(db, 'assessmentAttempts', docId), {
       id: docId,
-      learnerUid: isGuest ? attempt.learnerUid.trim() : toFirestoreDocId(attempt.learnerUid, 128),
+      learnerUid: toFirestoreDocId(attempt.learnerUid, 128),
       learnerName: (attempt.learnerName || 'Học sinh').slice(0, 120),
       className: (attempt.className || 'Tự học').slice(0, 60),
       schoolName: (attempt.schoolName || 'Trường học').slice(0, 160),
@@ -1197,23 +1186,19 @@ export async function fetchLearnerCloudBundle(uid: string): Promise<{
   error?: string;
   permissionDenied?: boolean;
 }> {
-  const isGuest = isValidGuestLearnerUid(uid);
   const current = auth.currentUser;
-  if (!isGuest && (!current || !current.emailVerified || current.uid !== uid)) {
+  if (!current || !current.emailVerified || current.uid !== uid) {
     return { profile: null, attempts: [], awards: [] };
   }
   try {
-    const docId = isGuest ? uid.trim() : toFirestoreDocId(uid, 128);
-    const profileCollection = isGuest ? 'guestLearnerProfiles' : 'learnerProfiles';
-    const attemptCollection = isGuest ? 'guestAssessmentAttempts' : 'assessmentAttempts';
-
+    const docId = toFirestoreDocId(uid, 128);
     const [profileSnap, awardsSnap, attemptsSnap] = await Promise.all([
-      getDoc(doc(db, profileCollection, docId)),
+      getDoc(doc(db, 'learnerProfiles', docId)),
       getDocs(
-        query(collection(db, 'teacherAwards'), where('learnerUid', '==', docId), limit(50)),
+        query(collection(db, 'teacherAwards'), where('learnerUid', '==', docId)),
       ).catch(() => null),
       getDocs(
-        query(collection(db, attemptCollection), where('learnerUid', '==', docId), limit(40)),
+        query(collection(db, 'assessmentAttempts'), where('learnerUid', '==', docId)),
       ).catch(() => null),
     ]);
 
@@ -1258,44 +1243,26 @@ export async function fetchAllLearnersFromFirestore(): Promise<{
     return { learners: [], attempts: [], awards: [] };
   }
   try {
-    const [profilesSnap, guestProfilesSnap, awardsSnap, attemptsSnap, guestAttemptsSnap] =
-      await Promise.all([
-        getDocs(collection(db, 'learnerProfiles')),
-        getDocs(collection(db, 'guestLearnerProfiles')).catch(() => null),
-        getDocs(collection(db, 'teacherAwards')),
-        getDocs(collection(db, 'assessmentAttempts')).catch(() => null),
-        getDocs(collection(db, 'guestAssessmentAttempts')).catch(() => null),
-      ]);
+    const [profilesSnap, awardsSnap, attemptsSnap] = await Promise.all([
+      getDocs(collection(db, 'learnerProfiles')),
+      getDocs(collection(db, 'teacherAwards')),
+      getDocs(collection(db, 'assessmentAttempts')).catch(() => null),
+    ]);
 
-    const learners: LearnerProfile[] = [
-      ...profilesSnap.docs.map((row) =>
-        parseLearnerDoc(row.id, row.data() as Record<string, unknown>),
-      ),
-      ...(guestProfilesSnap
-        ? guestProfilesSnap.docs.map((row) =>
-            parseLearnerDoc(row.id, row.data() as Record<string, unknown>),
-          )
-        : []),
-    ];
+    const learners: LearnerProfile[] = profilesSnap.docs.map((row) =>
+      parseLearnerDoc(row.id, row.data() as Record<string, unknown>),
+    );
 
     const awards: TeacherAward[] = awardsSnap.docs
       .map((row) => parseAwardDoc(row.id, row.data() as Record<string, unknown>))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
-    const attempts: AssessmentSessionAttempt[] = [
-      ...(attemptsSnap
-        ? attemptsSnap.docs.map((row) =>
-            parseAttemptDoc(row.id, row.data() as Record<string, unknown>),
-          )
-        : []),
-      ...(guestAttemptsSnap
-        ? guestAttemptsSnap.docs.map((row) =>
-            parseAttemptDoc(row.id, row.data() as Record<string, unknown>),
-          )
-        : []),
-    ]
-      .sort((a, b) => b.completedAt.localeCompare(a.completedAt))
-      .slice(0, 300);
+    const attempts: AssessmentSessionAttempt[] = attemptsSnap
+      ? attemptsSnap.docs
+          .map((row) => parseAttemptDoc(row.id, row.data() as Record<string, unknown>))
+          .sort((a, b) => b.completedAt.localeCompare(a.completedAt))
+          .slice(0, 300)
+      : [];
 
     return { learners, attempts, awards };
   } catch (err) {
@@ -1332,7 +1299,7 @@ export async function fetchPublicLearnerHonorFromFirestore(): Promise<
           gradeBand: (
             d.gradeBand === 'middle' || d.gradeBand === 'high' ? d.gradeBand : 'primary'
           ) as PublicLearnerHonorEntry['gradeBand'],
-          authType: (d.authType === 'guest' ? 'guest' : 'google') as PublicLearnerHonorEntry['authType'],
+          authType: 'google' as PublicLearnerHonorEntry['authType'],
           currentLevel: Math.max(1, Math.min(4, Number(d.currentLevel ?? 1))) as 1 | 2 | 3 | 4,
           totalXp: Number(d.totalXp ?? 0),
           masteredCount: Number(d.masteredCount ?? 0),
@@ -1344,7 +1311,7 @@ export async function fetchPublicLearnerHonorFromFirestore(): Promise<
           lastActiveAt: String(d.lastActiveAt ?? normalizeTimestampToIso(d.updatedAt)),
         };
       })
-      .filter((e) => e.fullName.length > 0)
+      .filter((e) => e.fullName.length > 0 && !e.uid.startsWith('guest-'))
       .sort((a, b) => {
         if (b.totalXp !== a.totalXp) return b.totalXp - a.totalXp;
         if (b.masteredCount !== a.masteredCount) return b.masteredCount - a.masteredCount;

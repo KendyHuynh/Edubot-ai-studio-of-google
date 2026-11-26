@@ -459,8 +459,7 @@ export function TeacherLearnersPanel({
   const handleExportCsv = () => {
     const header = [
       'HoTen',
-      'EmailHoacMaHoSo',
-      'HinhThuc',
+      'EmailGmail',
       'Lop',
       'Truong',
       'CapDo',
@@ -492,8 +491,7 @@ export function TeacherLearnersPanel({
       );
       return [
         `"${(l.fullName || '').replace(/"/g, '""')}"`,
-        `"${(l.email || l.uid || '').replace(/"/g, '""')}"`,
-        `"${l.authType === 'google' ? 'Email Google' : 'Khong dang nhap (Cloud)'}"`,
+        `"${(l.email || '').replace(/"/g, '""')}"`,
         `"${(l.className || '').replace(/"/g, '""')}"`,
         `"${(l.schoolName || '').replace(/"/g, '""')}"`,
         l.currentLevel,
@@ -541,8 +539,8 @@ export function TeacherLearnersPanel({
               </p>
               <p className="text-xs text-amber-800 leading-relaxed">
                 {lang === 'vi'
-                  ? 'Học sinh ở nhà (cả đăng nhập Email cá nhân lẫn tự đánh giá nhanh không cần đăng nhập) đều lưu thành tích lên Cloud Firestore. Hãy đăng nhập Google Admin để tải đầy đủ danh sách từ mọi thiết bị.'
-                  : 'Home learners (both Personal Email and Zero-Login profiles) sync to Cloud Firestore. Sign in with Teacher Google to load all remote learners.'}
+                  ? 'Học sinh ở nhà bắt buộc đăng nhập bằng Gmail cá nhân và lưu thành tích lên Cloud Firestore (đồng thời công khai lên Bảng Vinh danh). Hãy đăng nhập Google Admin để xem đầy đủ chi tiết 24 năng lực và trao huy hiệu.'
+                  : 'Home learners sign in with their personal Gmail to sync achievements to Cloud Firestore & the Public Honor Board. Sign in with Teacher Google to inspect all 24 skills and issue awards.'}
               </p>
             </div>
           </div>
@@ -584,14 +582,14 @@ export function TeacherLearnersPanel({
             <Link2 className="w-4 h-4" />
             <span>
               {lang === 'vi'
-                ? 'Link Tự đánh giá 24 Năng lực ở nhà (Hỗ trợ cả Email cá nhân & Không cần đăng nhập)'
-                : 'Home 24-Competency Self-Assessment Link (Personal Email & Zero-Login Supported)'}
+                ? 'Link Tự đánh giá 24 Năng lực ở nhà (Bắt buộc Gmail cá nhân · Thành tích công khai)'
+                : 'Home 24-Competency Self-Assessment Link (Personal Gmail Required · Public Honors)'}
             </span>
           </p>
           <p className="text-xs sm:text-sm text-emerald-950">
             {lang === 'vi'
-              ? 'Gửi đường link này cho học sinh tự luyện 24 năng lực thành phần ở nhà. Các em có thể đăng nhập Email cá nhân (Google) hoặc nhập Tên · Lớp · Trường không cần đăng nhập — thành tích đều đồng bộ lên Đám mây và hiện ngay bên dưới để Thầy/Cô vinh danh.'
-              : 'Share this link for home 24-competency self-assessment. Students can sign in with Google OR start without login — all achievements sync to Cloud Firestore below for review & honors.'}
+              ? 'Gửi đường link này cho học sinh tự luyện 24 năng lực thành phần ở nhà. Các em bắt buộc đăng nhập bằng Gmail cá nhân (không mở chế độ khách xem trước đề), thành tích lưu Cloud Firestore để Thầy/Cô vinh danh và công khai trên Bảng Vinh danh Tự học.'
+              : 'Share this link for home 24-competency self-assessment. Students must sign in with their personal Gmail (no guest peeking); achievements sync to Cloud Firestore and publish to the Public Honor Board.'}
           </p>
           <p className="font-mono-num text-xs text-emerald-900 bg-white/80 border border-emerald-200 rounded-lg px-3 py-1.5 break-all">
             {homeAssessmentLink}
@@ -1132,32 +1130,20 @@ export function TeacherLearnersPanel({
                           <td className="py-3.5 px-4">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <span className="font-bold text-slate-900">{l.fullName}</span>
-                              {l.authType === 'google' ? (
+                              {l.authType === 'google' && (
                                 <span
                                   title={l.email || 'Google verified'}
                                   className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-bold"
                                 >
                                   <ShieldCheck className="w-3 h-3" />
-                                  Email
-                                </span>
-                              ) : (
-                                <span
-                                  title={l.uid}
-                                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 border border-sky-200 text-[10px] font-bold"
-                                >
-                                  <Cloud className="w-3 h-3" />
-                                  {lang === 'vi' ? 'Không đăng nhập' : 'Zero-Login'}
+                                  Gmail
                                 </span>
                               )}
                             </div>
-                            {l.email ? (
+                            {l.email && (
                               <p className="text-[11px] text-slate-500 flex items-center gap-1 mt-0.5 truncate max-w-[230px]">
                                 <Mail className="w-3 h-3 shrink-0 text-slate-400" />
                                 <span className="truncate">{l.email}</span>
-                              </p>
-                            ) : (
-                              <p className="text-[11px] font-mono-num text-slate-500 mt-0.5 truncate max-w-[230px]">
-                                {lang === 'vi' ? 'Mã:' : 'Code:'} {l.uid}
                               </p>
                             )}
                           </td>

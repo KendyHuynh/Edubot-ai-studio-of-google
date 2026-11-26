@@ -70,6 +70,8 @@ export function HonorBoard({
   );
   const [learnerHonor, setLearnerHonor] = useState<PublicLearnerHonorEntry[]>([]);
   const [loadingLearners, setLoadingLearners] = useState(false);
+  const [honorSearch, setHonorSearch] = useState('');
+  const [honorClassFilter, setHonorClassFilter] = useState('ALL');
 
   useEffect(() => {
     if (lockedClassId) {
@@ -109,7 +111,7 @@ export function HonorBoard({
         ...publicCloudEntries,
         ...teacherEntries,
       ]) {
-        if (!row?.uid) continue;
+        if (!row?.uid || row.uid.startsWith('guest-')) continue;
         const prev = merged.get(row.uid);
         if (
           !prev ||
@@ -176,53 +178,111 @@ export function HonorBoard({
     URL.revokeObjectURL(url);
   };
 
+  const honorClasses = Array.from(
+    new Set(learnerHonor.map((e) => e.className).filter(Boolean)),
+  ).sort((a, b) => a.localeCompare(b));
+
+  const filteredLearnerHonor = learnerHonor.filter((row) => {
+    if (honorClassFilter !== 'ALL' && row.className !== honorClassFilter) return false;
+    const q = honorSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      row.fullName.toLowerCase().includes(q) ||
+      row.className.toLowerCase().includes(q) ||
+      row.schoolName.toLowerCase().includes(q)
+    );
+  });
+
   const topThree = leaderboard.slice(0, 3);
-  const topThreeLearners = learnerHonor.slice(0, 3);
+  const topThreeLearners = filteredLearnerHonor.slice(0, 3);
 
   if (boardMode === 'self_learners' && !lockedClassId) {
     return (
       <section className="max-w-6xl mx-auto space-y-6">
-        <div className="bg-white border border-slate-200 rounded-2xl p-6 flex flex-wrap items-center justify-between gap-4">
-          <div className="space-y-1">
-            <p className="text-xs font-semibold text-emerald-700">
-              {lang === 'vi'
-                ? 'Vinh danh Cá nhân · Tự đánh giá 24 Năng lực ở nhà (Đồng bộ Đám mây)'
-                : 'Personal Self-Assessment Honor Board (Cloud Synced)'}
-            </p>
-            <h1 className="text-2xl font-bold text-slate-900">
-              {lang === 'vi'
-                ? 'Bảng Vinh Danh Học Sinh Tự Học 24 Năng Lực'
-                : 'Top Home Self-Assessment Learners'}
-            </h1>
-          </div>
+        <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="space-y-1">
+              <p className="text-xs font-semibold text-emerald-700 flex items-center gap-1.5">
+                <ShieldCheck className="w-4 h-4" />
+                <span>
+                  {lang === 'vi'
+                    ? 'Thành tích Công khai · Lưu theo Gmail cá nhân trên Google Cloud Firestore'
+                    : 'Public Achievements · Verified Gmail Sync on Google Cloud Firestore'}
+                </span>
+              </p>
+              <h1 className="text-2xl font-bold text-slate-900">
+                {lang === 'vi'
+                  ? 'Bảng Vinh Danh Công Khai · 24 Năng Lực Tự Học'
+                  : 'Public 24-Competency Self-Study Honor Board'}
+              </h1>
+              <p className="text-xs text-slate-500">
+                {lang === 'vi'
+                  ? 'Mọi học sinh, phụ huynh và thầy cô đều có thể xem công khai thành tích 24 năng lực (địa chỉ Gmail được ẩn bảo mật; chỉ tài khoản Gmail đã xác thực mới được vào làm bài và ghi điểm).'
+                  : 'Publicly viewable by students, parents, and teachers (personal Gmail addresses are kept private; only verified Gmail learners can record scores).'}
+              </p>
+            </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              disabled={loadingLearners}
-              onClick={() => void loadLearnerHonor()}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 cursor-pointer"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${loadingLearners ? 'animate-spin' : ''}`} />
-              <span>{lang === 'vi' ? 'Cập nhật' : 'Refresh'}</span>
-            </button>
-            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl text-xs sm:text-sm font-semibold">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={() => setBoardMode('classroom')}
-                className="px-3.5 py-1.5 rounded-lg text-slate-600 hover:text-slate-900 cursor-pointer"
+                disabled={loadingLearners}
+                onClick={() => void loadLearnerHonor()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 cursor-pointer"
               >
-                {lang === 'vi' ? 'Vinh danh Lớp học' : 'Class Board'}
+                <RefreshCw className={`w-3.5 h-3.5 ${loadingLearners ? 'animate-spin' : ''}`} />
+                <span>{lang === 'vi' ? 'Cập nhật' : 'Refresh'}</span>
               </button>
-              <button
-                type="button"
-                onClick={() => setBoardMode('self_learners')}
-                className="px-3.5 py-1.5 rounded-lg bg-white text-emerald-700 shadow-xs cursor-pointer"
-              >
-                {lang === 'vi' ? 'Vinh danh Tự học ở nhà' : 'Home Self-Study'}
-              </button>
+              <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl text-xs sm:text-sm font-semibold">
+                <button
+                  type="button"
+                  onClick={() => setBoardMode('classroom')}
+                  className="px-3.5 py-1.5 rounded-lg text-slate-600 hover:text-slate-900 cursor-pointer"
+                >
+                  {lang === 'vi' ? 'Vinh danh Lớp học' : 'Class Board'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBoardMode('self_learners')}
+                  className="px-3.5 py-1.5 rounded-lg bg-white text-emerald-700 shadow-xs cursor-pointer"
+                >
+                  {lang === 'vi' ? 'Vinh danh Tự học ở nhà' : 'Home Self-Study'}
+                </button>
+              </div>
             </div>
           </div>
+
+          {learnerHonor.length > 0 && (
+            <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center gap-3">
+              <input
+                type="text"
+                value={honorSearch}
+                onChange={(e) => setHonorSearch(e.target.value)}
+                placeholder={
+                  lang === 'vi'
+                    ? 'Tìm tên học sinh, lớp hoặc trường...'
+                    : 'Search student name, class, or school...'
+                }
+                className="flex-1 min-w-[220px] px-3.5 py-2 text-xs sm:text-sm border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+              {honorClasses.length > 1 && (
+                <select
+                  aria-label={lang === 'vi' ? 'Lọc theo lớp' : 'Filter by class'}
+                  value={honorClassFilter}
+                  onChange={(e) => setHonorClassFilter(e.target.value)}
+                  className="px-3.5 py-2 text-xs sm:text-sm border border-slate-300 rounded-xl bg-white font-semibold text-slate-700"
+                >
+                  <option value="ALL">
+                    {lang === 'vi' ? `Tất cả lớp (${learnerHonor.length})` : `All Classes (${learnerHonor.length})`}
+                  </option>
+                  {honorClasses.map((cls) => (
+                    <option key={cls} value={cls}>
+                      {lang === 'vi' ? `Lớp ${cls}` : `Class ${cls}`}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Top 3 Home Self-Assessment Podium */}
@@ -290,12 +350,12 @@ export function HonorBoard({
             <div className="p-10 text-center text-sm text-slate-500">
               {lang === 'vi' ? 'Đang tải bảng vinh danh tự học...' : 'Loading self-study board...'}
             </div>
-          ) : learnerHonor.length === 0 ? (
+          ) : filteredLearnerHonor.length === 0 ? (
             <div className="p-10 text-center space-y-2 text-sm text-slate-500">
               <Sparkles className="w-8 h-8 text-emerald-500 mx-auto" />
               <p className="font-semibold text-slate-800">
                 {lang === 'vi'
-                  ? 'Chưa có học sinh nào hoàn thành tự đánh giá 24 năng lực ở nhà.'
+                  ? 'Chưa có học sinh nào hoàn thành tự đánh giá 24 năng lực (hoặc không khớp bộ lọc).'
                   : 'No home self-assessment completions recorded yet.'}
               </p>
             </div>
@@ -314,7 +374,7 @@ export function HonorBoard({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-sm">
-                  {learnerHonor.map((row, idx) => {
+                  {filteredLearnerHonor.map((row, idx) => {
                     const lvl = getLevelMeta(row.currentLevel);
                     return (
                       <tr key={row.uid} className="hover:bg-slate-50/70">
